@@ -7,6 +7,7 @@ import hashlib
 import json
 import math
 import os
+import signal
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -64,11 +65,14 @@ def _require_exact_fields(
 
 
 async def _kill_and_reap(proc: asyncio.subprocess.Process) -> None:
-    """Stop a timed-out child so it cannot outlive this extraction."""
+    """Kill the isolated Pi process group and reap its direct child."""
     if proc.returncode is None:
         try:
-            proc.kill()
-        except ProcessLookupError:
+            if os.name == "posix":
+                os.killpg(proc.pid, signal.SIGKILL)
+            else:
+                proc.kill()
+        except (OSError, ProcessLookupError):
             pass
     try:
         await proc.communicate()
@@ -203,10 +207,17 @@ async def extract_page(
             "--model", model,
             "--no-session",
             "--no-tools",
+            "--no-extensions",
+            "--no-skills",
+            "--no-prompt-templates",
+            "--no-context-files",
+            "--no-approve",
             f"{prompt} @{image_path}",
+            stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env={**os.environ, "PI_OFFLINE": "0"},
+            start_new_session=os.name == "posix",
         )
         stdout_bytes, stderr_bytes = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except asyncio.TimeoutError:
@@ -238,6 +249,41 @@ async def extract_page(
         phash=phash,
         page_number=page_number,
     )
+
+
+def validate_extraction_artifact(extraction: PageExtraction) -> None:
+    """Reject malformed cached/checkpointed canonical source artifacts."""
+    if not isinstance(extraction, PageExtraction):
+        raise ExtractionError("source artifact must be a PageExtraction")
+    if not isinstance(extraction.page_number, int) or extraction.page_number < 1:
+        raise ExtractionError("source artifact has invalid page_number")
+    if not all(isinstance(value, str) and value for value in (
+        extraction.image_path, extraction.sha256, extraction.phash,
+        extraction.source_lang, extraction.model,
+    )):
+        raise ExtractionError("source artifact has invalid identity fields")
+    seen_ids: set[str] = set()
+    seen_orders: set[int] = set()
+    for block in extraction.blocks:
+        if not isinstance(block, SourceBlock) or block.type not in BLOCK_TYPES:
+            raise ExtractionError("source artifact has invalid block")
+        if (not isinstance(block.text, str) or not block.text.strip()
+                or not isinstance(block.reading_order, int) or block.reading_order < 0
+                or block.id != f"page_{extraction.page_number}_block_{block.reading_order}"
+                or block.id in seen_ids or block.reading_order in seen_orders):
+            raise ExtractionError("source artifact has invalid canonical block IDs")
+        seen_ids.add(block.id)
+        seen_orders.add(block.reading_order)
+    if any(
+        not isinstance(mention, TermMention)
+        or not isinstance(mention.term, str) or not mention.term.strip()
+        or mention.block_id not in seen_ids
+        for mention in extraction.term_mentions
+    ):
+        raise ExtractionError("source artifact has invalid term mentions")
+    illustrations = [block.text for block in extraction.blocks if block.type == "illustration"]
+    if extraction.illustrations != illustrations:
+        raise ExtractionError("source artifact has inconsistent illustrations")
 
 
 def legacy_page_text(extraction: PageExtraction) -> str:

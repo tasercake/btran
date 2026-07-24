@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import shutil
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -52,25 +53,86 @@ def _atomic_json(path: Path, value: dict[str, Any]) -> None:
         raise
 
 
-def write_items(directory: Path, items: list[ReviewItem]) -> list[Path]:
-    """Persist one stable, flat JSON object for each review item.
+def _read_item(path: Path) -> ReviewItem:
+    value = json.loads(path.read_text())
+    expected = {"item_id", "kind", "blocking", "evidence", "image_path", "page_number", "status", "resolution"}
+    if not isinstance(value, dict) or set(value) != expected:
+        raise ValueError("invalid review artifact shape")
+    item = ReviewItem.from_dict(value)
+    if (
+        item.item_id != path.stem or not isinstance(item.kind, str) or not item.kind
+        or not isinstance(item.blocking, bool) or not isinstance(item.evidence, dict)
+        or not isinstance(item.image_path, str)
+        or (item.page_number is not None and (isinstance(item.page_number, bool) or not isinstance(item.page_number, int)))
+        or item.status not in {"pending", "resolved"}
+        or (item.resolution is not None and not isinstance(item.resolution, dict))
+    ):
+        raise ValueError("invalid review artifact values")
+    if item.status == "resolved":
+        if not item.resolution or item.resolution.get("action") not in {"accept", "correct"}:
+            raise ValueError("invalid resolved review artifact")
+        if item.resolution["action"] == "accept" and set(item.resolution) != {"action"}:
+            raise ValueError("invalid accept review artifact")
+        if item.resolution["action"] == "correct" and (
+            set(item.resolution) != {"action", "correction"}
+            or not isinstance(item.resolution.get("correction"), str)
+            or not item.resolution["correction"].strip()
+        ):
+            raise ValueError("invalid correction review artifact")
+    elif item.resolution is not None and item.resolution != {"action": "retry"}:
+        raise ValueError("invalid pending review artifact")
+    return item
 
-    Existing resolved artifacts are retained if the same issue recurs, allowing a
-    user decision to survive a resume run.  A retry resolution deliberately
-    becomes pending again, since it requests fresh model work rather than approval.
-    """
+
+def _same_review_subject(existing: ReviewItem, current: ReviewItem) -> bool:
+    """Keep a decision only when it remains bound to the same review subject."""
+    if existing.kind != current.kind or existing.blocking != current.blocking:
+        return False
+    for key in ("concept_id", "source_term"):
+        before = existing.evidence.get(key)
+        after = current.evidence.get(key)
+        if before is not None or after is not None:
+            return isinstance(before, str) and bool(before) and before == after
+    return existing.evidence == current.evidence
+
+
+def _archive_stale(directory: Path, active_ids: set[str]) -> None:
+    archive = directory / "archive"
+    for path in sorted(directory.glob("*.json")):
+        if path.stem in active_ids:
+            continue
+        archive.mkdir(parents=True, exist_ok=True)
+        destination = archive / path.name
+        suffix = 1
+        while destination.exists():
+            destination = archive / f"{path.stem}.{suffix}.json"
+            suffix += 1
+        shutil.move(str(path), str(destination))
+
+
+def write_items(directory: Path, items: list[ReviewItem], *, archive_stale: bool = False) -> list[Path]:
+    """Persist the explicit current review set, preserving stable resolutions."""
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    active_ids = {item.item_id for item in items}
+    if len(active_ids) != len(items):
+        raise ValueError("review item IDs must be unique")
+    if archive_stale:
+        _archive_stale(directory, active_ids)
     paths: list[Path] = []
     for item in items:
-        path = Path(directory) / f"{item.item_id}.json"
+        path = directory / f"{item.item_id}.json"
         value = item.to_dict()
         if path.exists():
             try:
-                existing = ReviewItem.from_dict(json.loads(path.read_text()))
-                if existing.status == "resolved" and existing.resolution and existing.resolution.get("action") != "retry":
-                    value["status"] = existing.status
-                    value["resolution"] = existing.resolution
+                existing = _read_item(path)
             except (OSError, ValueError, TypeError, json.JSONDecodeError):
-                pass
+                # A malformed current artifact is a blocking operator problem.
+                paths.append(path)
+                continue
+            if existing.status == "resolved" and existing.resolution and _same_review_subject(existing, item):
+                value["status"] = existing.status
+                value["resolution"] = existing.resolution
         _atomic_json(path, value)
         paths.append(path)
     return paths
@@ -83,7 +145,7 @@ def resolve_item(path: Path, action: str, correction: str | None = None) -> Revi
     if action == "correct" and (not isinstance(correction, str) or not correction.strip()):
         raise ValueError("correct resolution requires non-empty correction")
     artifact = Path(path)
-    item = ReviewItem.from_dict(json.loads(artifact.read_text()))
+    item = _read_item(artifact)
     resolution = {"action": action}
     if correction is not None:
         resolution["correction"] = correction
@@ -98,7 +160,7 @@ def unresolved_items(directory: Path) -> list[ReviewItem]:
     items: list[ReviewItem] = []
     for path in sorted(Path(directory).glob("*.json")):
         try:
-            item = ReviewItem.from_dict(json.loads(path.read_text()))
+            item = _read_item(path)
         except (OSError, TypeError, ValueError, json.JSONDecodeError):
             # A malformed operator artifact is itself unsafe; leave it pending.
             items.append(ReviewItem(path.stem, "malformed_review_artifact", True, {"path": str(path)}))
@@ -113,7 +175,7 @@ def corrections(directory: Path) -> dict[str, str]:
     result: dict[str, str] = {}
     for path in sorted(Path(directory).glob("*.json")):
         try:
-            item = ReviewItem.from_dict(json.loads(path.read_text()))
+            item = _read_item(path)
             resolution = item.resolution or {}
             concept_id = str(item.evidence.get("concept_id", ""))
             if item.status == "resolved" and resolution.get("action") == "correct" and concept_id:

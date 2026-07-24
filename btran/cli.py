@@ -46,8 +46,15 @@ def main() -> None:
         raise SystemExit(1)
 
     if result.errors:
-        print(
-            f"[btran] {len(result.errors)} page(s) failed — no EPUB produced.",
-            file=sys.stderr,
-        )
+        page_errors = [
+            error for error in result.errors
+            if error.startswith("[btran] page ") or error.startswith("page ")
+        ]
+        if len(page_errors) == len(result.errors):
+            summary = f"[btran] {len(page_errors)} page(s) failed — no EPUB produced."
+        elif page_errors:
+            summary = f"[btran] run failed ({len(page_errors)} page(s) failed) — no EPUB produced."
+        else:
+            summary = "[btran] run failed — no EPUB produced."
+        print(summary, file=sys.stderr)
         raise SystemExit(1)

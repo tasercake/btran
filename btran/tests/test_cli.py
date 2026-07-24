@@ -151,6 +151,18 @@ class TestFailureExit:
         assert "page 2" not in captured.err
         assert "page 5" not in captured.err
 
+    def test_global_error_uses_truthful_run_summary_not_page_count(self, capsys):
+        """Manifest/glossary/EPUB failures are not falsely reported as page failures."""
+        config = Config(input_dir=Path("/tmp"), output_epub=Path("/tmp/out.epub"), source_lang="en", target_lang="es")
+        with patch("btran.cli.load_config", return_value=config), \
+             patch("btran.cli.shutil.which", return_value="/usr/bin/pi"), \
+             patch("btran.cli.orchestrator_run", new=AsyncMock(return_value=RunResult(errors=["[btran] glossary failed: unavailable"]))):
+            with pytest.raises(SystemExit) as exc:
+                main()
+
+        assert exc.value.code == 1
+        assert "run failed — no EPUB produced." in capsys.readouterr().err
+
     def test_no_errors_exits_zero(self):
         """When RunResult has no errors, exit code is 0."""
         config = Config(

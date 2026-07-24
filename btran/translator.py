@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
 import os
+import signal
 import re
 import unicodedata
 
@@ -46,8 +48,25 @@ def _term_in_text(term: str, text: str) -> bool:
     return normalized_term in normalized_text
 
 
-def _glossary_slice(extraction: PageExtraction, glossary: TerminologyMap) -> list[dict]:
-    source_text = "\n".join(block.text for block in extraction.blocks)
+def _boundary(extraction: PageExtraction | None, *, tail: bool) -> dict | None:
+    """Return the one source excerpt that crosses a physical page boundary."""
+    if extraction is None or not extraction.blocks:
+        return None
+    blocks = sorted(extraction.blocks, key=lambda block: block.reading_order)
+    block = blocks[-1] if tail else blocks[0]
+    return {"page_number": extraction.page_number, "block_id": block.id, "text": block.text}
+
+
+def _glossary_slice(
+    extraction: PageExtraction,
+    glossary: TerminologyMap,
+    previous_page: PageExtraction | None = None,
+    next_page: PageExtraction | None = None,
+) -> list[dict]:
+    boundaries = (_boundary(previous_page, tail=True), _boundary(next_page, tail=False))
+    source_text = "\n".join(
+        [*(block.text for block in extraction.blocks), *(item["text"] for item in boundaries if item)]
+    )
     return [
         entry.to_dict()
         for entry in glossary.entries
@@ -55,19 +74,19 @@ def _glossary_slice(extraction: PageExtraction, glossary: TerminologyMap) -> lis
     ]
 
 
-def _translation_context(extraction: PageExtraction, glossary: TerminologyMap) -> dict:
-    blocks = extraction.blocks
+def _translation_context(
+    extraction: PageExtraction,
+    glossary: TerminologyMap,
+    previous_page: PageExtraction | None = None,
+    next_page: PageExtraction | None = None,
+) -> dict:
     return {
-        "source_blocks": [block.to_dict() for block in blocks],
-        "glossary": _glossary_slice(extraction, glossary),
-        "adjacent_source_boundaries": [
-            {
-                "block_id": block.id,
-                "previous": blocks[index - 1].text if index else None,
-                "next": blocks[index + 1].text if index + 1 < len(blocks) else None,
-            }
-            for index, block in enumerate(blocks)
-        ],
+        "source_blocks": [block.to_dict() for block in extraction.blocks],
+        "glossary": _glossary_slice(extraction, glossary, previous_page, next_page),
+        "adjacent_source_boundaries": {
+            "previous_page_tail": _boundary(previous_page, tail=True),
+            "next_page_head": _boundary(next_page, tail=False),
+        },
     }
 
 
@@ -129,15 +148,33 @@ def _translated_blocks(data: object, source_ids: list[str]) -> list[TranslatedBl
     return [by_id[block_id] for block_id in source_ids]
 
 
+async def _signal_process_group(proc: asyncio.subprocess.Process, signal_number: int) -> None:
+    """Signal the Pi worker group, falling back to its direct child if needed."""
+    try:
+        if os.name == "posix":
+            os.killpg(proc.pid, signal_number)
+        elif signal_number == signal.SIGKILL:
+            proc.kill()
+        else:
+            proc.terminate()
+    except ProcessLookupError:
+        pass
+    except OSError:
+        if signal_number == signal.SIGKILL:
+            proc.kill()
+        else:
+            proc.terminate()
+
+
 async def _reap_process(proc: asyncio.subprocess.Process) -> None:
-    """Terminate a running child and wait for it so timeout/cancel cannot leak it."""
+    """Terminate the isolated Pi group and reap it after timeout/cancellation."""
     if proc.returncode is not None:
         return
-    proc.terminate()
+    await _signal_process_group(proc, signal.SIGTERM)
     try:
         await asyncio.wait_for(proc.wait(), timeout=_CLEANUP_TIMEOUT_SECONDS)
     except asyncio.TimeoutError:
-        proc.kill()
+        await _signal_process_group(proc, signal.SIGKILL)
         await proc.wait()
 
 
@@ -148,9 +185,18 @@ async def translate_blocks(
     model: str,
     pi_bin: str = "pi",
     timeout: int = 120,
+    previous_page: PageExtraction | None = None,
+    next_page: PageExtraction | None = None,
 ) -> list[TranslatedBlock]:
-    """Translate source blocks in an isolated, tool-less, no-session Pi process."""
-    context = _translation_context(extraction, glossary)
+    """Translate a page independently with only adjacent-page source excerpts."""
+    if (
+        isinstance(timeout, bool)
+        or not isinstance(timeout, (int, float))
+        or not math.isfinite(timeout)
+        or timeout <= 0
+    ):
+        raise TranslationError("timeout must be positive and finite")
+    context = _translation_context(extraction, glossary, previous_page, next_page)
     prompt = TRANSLATION_PROMPT.format(
         source_lang=extraction.source_lang,
         target_lang=glossary.target_lang,
@@ -171,9 +217,11 @@ async def translate_blocks(
             "--no-context-files",
             "--no-approve",
             prompt,
+            stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env={**os.environ, "PI_OFFLINE": "0"},
+            start_new_session=os.name == "posix",
         )
         stdout_bytes, stderr_bytes = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except asyncio.TimeoutError:

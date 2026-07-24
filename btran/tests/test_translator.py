@@ -2,6 +2,8 @@
 
 import asyncio
 import json
+import os
+import signal
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
@@ -157,6 +159,27 @@ def test_translation_cache_identity_changes_for_source_artifact_or_glossary():
     )
 
 
+def test_translation_context_uses_page_neighbors_and_slices_glossary_for_them():
+    """Boundary context is the adjacent pages, and its terminology is included."""
+    from btran.translator import _translation_context
+
+    previous = PageExtraction(
+        6, "page-006.jpg", "previous-sha", "unused", "ja", "extractor",
+        blocks=[SourceBlock("p6_b1", "paragraph", "前の犬", 0)],
+    )
+    following = PageExtraction(
+        8, "page-008.jpg", "next-sha", "unused", "ja", "extractor",
+        blocks=[SourceBlock("p8_b1", "paragraph", "次の犬", 0)],
+    )
+    context = _translation_context(_page(), _glossary(), previous, following)
+
+    assert context["adjacent_source_boundaries"] == {
+        "previous_page_tail": {"page_number": 6, "block_id": "p6_b1", "text": "前の犬"},
+        "next_page_head": {"page_number": 8, "block_id": "p8_b1", "text": "次の犬"},
+    }
+    assert {entry["concept_id"] for entry in context["glossary"]} == {"cat", "dog"}
+
+
 def test_translation_cache_identity_binds_prompt_and_output_schema():
     """Prompt or response-schema changes invalidate text translation cache entries."""
     import btran.translator as translator
@@ -205,6 +228,8 @@ async def test_translate_blocks_isolated_from_tools_and_project_configuration():
     for option in ("--no-session", "--no-tools", "--no-extensions", "--no-skills",
                    "--no-prompt-templates", "--no-context-files", "--no-approve"):
         assert option in args
+    assert exec_mock.call_args.kwargs["stdin"] is asyncio.subprocess.DEVNULL
+    assert exec_mock.call_args.kwargs["start_new_session"] is (os.name == "posix")
 
 
 @pytest.mark.asyncio
@@ -231,14 +256,17 @@ async def test_translate_blocks_terminates_child_on_timeout():
     from btran.translator import TranslationError, translate_blocks
 
     proc = Mock()
+    proc.pid = 123
     proc.returncode = None
     proc.communicate = AsyncMock(side_effect=asyncio.TimeoutError())
     proc.wait = AsyncMock(return_value=None)
-    with patch("btran.translator.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
+    with patch("btran.translator.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)), \
+         patch("btran.translator.os.killpg") as killpg:
         with pytest.raises(TranslationError, match="timed out"):
             await translate_blocks(_page(), _glossary(), model="text-model", timeout=1)
 
-    proc.terminate.assert_called_once_with()
+    killpg.assert_called_once_with(123, signal.SIGTERM)
+    proc.terminate.assert_not_called()
     proc.wait.assert_awaited_once_with()
 
 
@@ -254,14 +282,30 @@ async def test_translate_blocks_terminates_child_on_cancellation():
         await asyncio.Event().wait()
 
     proc = Mock(returncode=None)
+    proc.pid = 123
     proc.communicate = never_finishes
     proc.wait = AsyncMock(return_value=None)
-    with patch("btran.translator.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
+    with patch("btran.translator.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)), \
+         patch("btran.translator.os.killpg") as killpg:
         task = asyncio.create_task(translate_blocks(_page(), _glossary(), model="text-model"))
         await started.wait()
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
 
-    proc.terminate.assert_called_once_with()
+    killpg.assert_called_once_with(123, signal.SIGTERM)
+    proc.terminate.assert_not_called()
     proc.wait.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_translate_blocks_rejects_non_positive_timeout_before_spawning_pi():
+    """A direct caller cannot create an unbounded/instant Pi leaf."""
+    from btran.translator import TranslationError, translate_blocks
+
+    exec_mock = AsyncMock()
+    with patch("btran.translator.asyncio.create_subprocess_exec", exec_mock):
+        with pytest.raises(TranslationError, match="timeout must be positive"):
+            await translate_blocks(_page(), _glossary(), model="text-model", timeout=0)
+
+    exec_mock.assert_not_awaited()
