@@ -177,6 +177,19 @@ def test_glossary_consistency_rejects_missing_required_target_term():
     assert errors == ["block b1 translates glossary term 'engine' without required target 'moteur'"]
 
 
+def test_glossary_consistency_rejects_target_term_as_part_of_a_larger_word():
+    art_glossary = TerminologyMap(
+        version="1", hash="hash", source_lang="en", target_lang="fr",
+        entries=[TerminologyEntry("art", ["art"], "art", ["manual"], 1.0)],
+    )
+
+    assert check_glossary_consistency(
+        source(mentions=[TermMention("art", "b1")]),
+        translation(text="La partie commence."),
+        art_glossary,
+    ) == ["block b1 translates glossary term 'art' without required target 'art'"]
+
+
 def test_glossary_consistency_accepts_a_legitimate_variant_for_the_same_source_term():
     variant_glossary = TerminologyMap(
         version="1", hash="hash", source_lang="en", target_lang="fr",

@@ -182,7 +182,7 @@ def check_glossary_consistency(
         if target_terms is None:
             continue
         translation = translated_by_id.get(mention.block_id, "")
-        if not any(target_term.casefold() in translation.casefold() for target_term in target_terms):
+        if not any(_contains_target_term(translation, target_term) for target_term in target_terms):
             required = "' or '".join(sorted(target_terms, key=str.casefold))
             errors.append(
                 f"block {mention.block_id} translates glossary term '{mention.term}' "
@@ -208,6 +208,15 @@ def validate_page(
         "block_id_correspondence": check_block_id_correspondence(source, result),
         "glossary_consistency": check_glossary_consistency(source, result, glossary),
     }
+
+
+def _contains_target_term(translation: str, target_term: str) -> bool:
+    """Match Latin-script target terms as whole words, not arbitrary substrings."""
+    translation = translation.casefold()
+    target_term = target_term.casefold()
+    if re.search(r"[a-zà-ÿ]", target_term):
+        return re.search(r"(?<!\w)" + re.escape(target_term) + r"(?!\w)", translation) is not None
+    return target_term in translation
 
 
 def _has_text(value: object) -> bool:
