@@ -25,6 +25,14 @@ class Config:
     output_epub: Path = Path("output.epub")
     embed_images: bool = False
     no_resume: bool = False
+    epub_check: bool = False
+    epub_check_path: str = "epubcheck"
+    manifest_path: Path = Path("./manifest.json")
+    glossary_budget: int = 100_000
+    glossary_path: Path = Path("./glossary.json")
+    eval_dir: Path = Path("./eval_corpus")
+    review: bool = False
+    no_preflight: bool = False
 
 
 _ENV_PREFIX = "BTRAN_"
@@ -56,6 +64,14 @@ def _init_field_map() -> None:
         "output_epub": ("OUTPUT_EPUB", Path),
         "embed_images": ("EMBED_IMAGES", _flag_env),
         "no_resume": ("NO_RESUME", _flag_env),
+        "epub_check": ("EPUB_CHECK", _flag_env),
+        "epub_check_path": ("EPUB_CHECK_PATH", str),
+        "manifest_path": ("MANIFEST_PATH", Path),
+        "glossary_budget": ("GLOSSARY_BUDGET", int),
+        "glossary_path": ("GLOSSARY_PATH", Path),
+        "eval_dir": ("EVAL_DIR", Path),
+        "review": ("REVIEW", _flag_env),
+        "no_preflight": ("NO_PREFLIGHT", _flag_env),
     })
 
 
@@ -89,7 +105,10 @@ def load_config(argv: list[str] | None = None) -> Config:
     output_epub = cli_kwargs.pop("OUTPUT_EPUB")
 
     # Merge: env first, then CLI (only non-None values override).
-    path_fields = {"input_dir", "output_epub", "intermediate_dir", "cache_db"}
+    path_fields = {
+        "input_dir", "output_epub", "intermediate_dir", "cache_db", "manifest_path",
+        "glossary_path", "eval_dir",
+    }
     for k, v in cli_kwargs.items():
         if v is not None:
             env_kwargs[k] = Path(v) if k in path_fields else v
@@ -127,6 +146,14 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--embed-images", action="store_true", default=None)
     p.add_argument("--no-resume", action="store_true", default=None)
     p.add_argument("--pi-bin", default=None)
+    p.add_argument("--epub-check", action="store_true", default=None)
+    p.add_argument("--epub-check-path", default=None)
+    p.add_argument("--manifest-path", default=None)
+    p.add_argument("--glossary-budget", type=int, default=None)
+    p.add_argument("--glossary-path", default=None)
+    p.add_argument("--eval-dir", default=None)
+    p.add_argument("--review", action="store_true", default=None)
+    p.add_argument("--no-preflight", action="store_true", default=None)
     return p
 
 
