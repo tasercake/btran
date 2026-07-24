@@ -116,3 +116,85 @@ def test_reconcile_reviews_only_ambiguous_context_conflicts_and_applies_one_glos
         ("cat", "feline")
     ]
     assert result.affected_pages == [1, 3]
+
+
+def test_index_terms_to_pages_uses_alias_word_boundaries_not_substrings():
+    """Aliases match their source sense, not unrelated words containing the alias."""
+    from btran.reconciliation import index_terms_to_pages
+
+    glossary = TerminologyMap(
+        version="1", hash="v1", source_lang="en", target_lang="fr", created_at="fixed",
+        entries=[TerminologyEntry(
+            concept_id="art", source_terms=["art", "craft"], target_term="art",
+            provenance=[], confidence=1.0,
+        )],
+    )
+    party = PageExtraction(
+        page_number=1, image_path="p1.jpg", sha256="1", phash="1", source_lang="en", model="x",
+        blocks=[SourceBlock(id="p1_b1", type="paragraph", text="A party starts.", reading_order=1)],
+    )
+    craft = PageExtraction(
+        page_number=2, image_path="p2.jpg", sha256="2", phash="2", source_lang="en", model="x",
+        blocks=[SourceBlock(id="p2_b1", type="paragraph", text="The CRAFT matters.", reading_order=1)],
+    )
+
+    assert index_terms_to_pages([party, craft], glossary) == {"art": {2}}
+
+
+def test_reconcile_accepts_regular_target_variants_without_false_missing_issue():
+    """Case and regular inflection are legitimate target forms, not defects."""
+    from btran.reconciliation import reconcile
+
+    glossary = _glossary()
+    result = reconcile(
+        glossary=glossary,
+        extractions=[_page(1)],
+        translations={1: [TranslatedBlock(block_id="p1_b1", translated_text="Two CATS sleep.")]},
+    )
+
+    assert result.issues == []
+    assert result.affected_pages == []
+    assert result.glossary_v2 is glossary
+
+
+def test_reconcile_accepts_regular_y_to_ies_target_variant_without_false_missing_issue():
+    """Regular inflection preserves a glossary term even when spelling changes."""
+    from btran.reconciliation import reconcile
+
+    glossary = _glossary(target_term="city")
+    result = reconcile(
+        glossary=glossary,
+        extractions=[_page(1)],
+        translations={1: [TranslatedBlock(block_id="p1_b1", translated_text="Two cities sleep.")]},
+    )
+
+    assert result.issues == []
+
+
+def test_reconcile_reviews_ambiguous_source_alias_instead_of_reporting_missing_terms():
+    """A shared source alias is a sense ambiguity for review, not two definite defects."""
+    from btran.reconciliation import reconcile
+
+    glossary = TerminologyMap(
+        version="1", hash="v1", source_lang="en", target_lang="fr", created_at="fixed",
+        entries=[
+            TerminologyEntry("bank-finance", ["bank"], "banque", [], 1.0),
+            TerminologyEntry("bank-river", ["bank"], "rive", [], 1.0),
+        ],
+    )
+    page = PageExtraction(
+        page_number=1, image_path="p1.jpg", sha256="1", phash="1", source_lang="en", model="x",
+        blocks=[SourceBlock(id="p1_b1", type="paragraph", text="The bank was quiet.", reading_order=1)],
+    )
+    reviewed = []
+
+    result = reconcile(
+        glossary=glossary,
+        extractions=[page],
+        translations={1: [TranslatedBlock(block_id="p1_b1", translated_text="La banque était calme.")]},
+        reviewer=lambda issues: reviewed.extend(issues) or {},
+    )
+
+    assert [(issue.kind, issue.pages) for issue in reviewed] == [("ambiguous_source_sense", (1,))]
+    assert result.affected_pages == [1]
+    assert all(issue.kind != "missing_term" for issue in result.issues)

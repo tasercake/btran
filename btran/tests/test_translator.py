@@ -1,7 +1,8 @@
 """Tests for glossary-aware, text-only block translation."""
 
+import asyncio
 import json
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
@@ -133,3 +134,134 @@ def test_translation_cache_identity_changes_for_source_artifact_or_glossary():
         target_lang="en",
         model="text-model",
     )
+    assert baseline != translation_cache_identity(
+        source_artifact_hash="source-a",
+        glossary_hash="glossary-a",
+        source_lang="ko",
+        target_lang="en",
+        model="text-model",
+    )
+    assert baseline != translation_cache_identity(
+        source_artifact_hash="source-a",
+        glossary_hash="glossary-a",
+        source_lang="ja",
+        target_lang="fr",
+        model="text-model",
+    )
+    assert baseline != translation_cache_identity(
+        source_artifact_hash="source-a",
+        glossary_hash="glossary-a",
+        source_lang="ja",
+        target_lang="en",
+        model="other-text-model",
+    )
+
+
+def test_translation_cache_identity_binds_prompt_and_output_schema():
+    """Prompt or response-schema changes invalidate text translation cache entries."""
+    import btran.translator as translator
+
+    baseline = translator.translation_cache_identity(
+        source_artifact_hash="source-a",
+        glossary_hash="glossary-a",
+        source_lang="ja",
+        target_lang="en",
+        model="text-model",
+    )
+    with patch.object(translator, "TRANSLATION_PROMPT", "different prompt"):
+        assert baseline != translator.translation_cache_identity(
+            source_artifact_hash="source-a",
+            glossary_hash="glossary-a",
+            source_lang="ja",
+            target_lang="en",
+            model="text-model",
+        )
+    with patch.object(translator, "TRANSLATION_OUTPUT_SCHEMA", {"version": "different"}):
+        assert baseline != translator.translation_cache_identity(
+            source_artifact_hash="source-a",
+            glossary_hash="glossary-a",
+            source_lang="ja",
+            target_lang="en",
+            model="text-model",
+        )
+
+
+@pytest.mark.asyncio
+async def test_translate_blocks_isolated_from_tools_and_project_configuration():
+    """Untrusted source text reaches an ephemeral Pi subprocess with no capabilities."""
+    from btran.translator import translate_blocks
+
+    proc = _proc(
+        {"blocks": [
+            {"block_id": "p7_b1", "translated_text": "The cat sleeps."},
+            {"block_id": "p7_b2", "translated_text": "The cat woke up."},
+        ]}
+    )
+    exec_mock = AsyncMock(return_value=proc)
+    with patch("btran.translator.asyncio.create_subprocess_exec", exec_mock):
+        await translate_blocks(_page(), _glossary(), model="text-model")
+
+    args = exec_mock.call_args.args
+    for option in ("--no-session", "--no-tools", "--no-extensions", "--no-skills",
+                   "--no-prompt-templates", "--no-context-files", "--no-approve"):
+        assert option in args
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("payload", [
+    {"blocks": [{"block_id": "p7_b1", "translated_text": "one"},
+                {"block_id": "p7_b2", "translated_text": "two"}], "note": "ignore me"},
+    {"blocks": [{"block_id": "p7_b1", "translated_text": "one", "extra": "ignore me"},
+                {"block_id": "p7_b2", "translated_text": "two"}]},
+    {"blocks": [{"block_id": "p7_b1", "translated_text": ["not text"]},
+                {"block_id": "p7_b2", "translated_text": "two"}]},
+])
+async def test_translate_blocks_rejects_untrusted_non_schema_json(payload):
+    """Only the exact response schema is accepted from Pi output."""
+    from btran.translator import TranslationError, translate_blocks
+
+    with patch("btran.translator.asyncio.create_subprocess_exec", AsyncMock(return_value=_proc(payload))):
+        with pytest.raises(TranslationError, match="schema"):
+            await translate_blocks(_page(), _glossary(), model="text-model")
+
+
+@pytest.mark.asyncio
+async def test_translate_blocks_terminates_child_on_timeout():
+    """A timed out request reaps its Pi child before reporting TranslationError."""
+    from btran.translator import TranslationError, translate_blocks
+
+    proc = Mock()
+    proc.returncode = None
+    proc.communicate = AsyncMock(side_effect=asyncio.TimeoutError())
+    proc.wait = AsyncMock(return_value=None)
+    with patch("btran.translator.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
+        with pytest.raises(TranslationError, match="timed out"):
+            await translate_blocks(_page(), _glossary(), model="text-model", timeout=1)
+
+    proc.terminate.assert_called_once_with()
+    proc.wait.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_translate_blocks_terminates_child_on_cancellation():
+    """Cancellation reaps the child and propagates cancellation to the caller."""
+    from btran.translator import translate_blocks
+
+    started = asyncio.Event()
+
+    async def never_finishes():
+        started.set()
+        await asyncio.Event().wait()
+
+    proc = Mock(returncode=None)
+    proc.communicate = never_finishes
+    proc.wait = AsyncMock(return_value=None)
+    with patch("btran.translator.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
+        task = asyncio.create_task(translate_blocks(_page(), _glossary(), model="text-model"))
+        await started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    proc.terminate.assert_called_once_with()
+    proc.wait.assert_awaited_once_with()
