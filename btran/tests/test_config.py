@@ -284,46 +284,39 @@ class TestDotenvLoading:
 
 
 class TestNewConfigFields:
-    """Gate 0 fields load from defaults, environment, and CLI."""
+    """Production controls load from defaults, environment, and CLI."""
 
     def test_defaults(self):
         cfg = load_config(["in", "out.epub", "--target-lang", "fr"])
         assert cfg.epub_check is False
         assert cfg.epub_check_path == "epubcheck"
-        assert cfg.manifest_path == Path("./manifest.json")
+        assert cfg.manifest_path is None
         assert cfg.glossary_budget == 100_000
-        assert cfg.glossary_path == Path("./glossary.json")
-        assert cfg.eval_dir == Path("./eval_corpus")
         assert cfg.review is False
-        assert cfg.no_preflight is False
+        assert cfg.preflight_only is False
 
-    @pytest.mark.parametrize(("env_name", "value", "field", "expected", "expected_type"), [
-        ("BTRAN_EPUB_CHECK", "true", "epub_check", True, bool),
-        ("BTRAN_EPUB_CHECK_PATH", "/opt/epubcheck", "epub_check_path", "/opt/epubcheck", str),
-        ("BTRAN_MANIFEST_PATH", "/tmp/manifest.json", "manifest_path", Path("/tmp/manifest.json"), Path),
-        ("BTRAN_GLOSSARY_BUDGET", "250000", "glossary_budget", 250000, int),
-        ("BTRAN_GLOSSARY_PATH", "/tmp/glossary.json", "glossary_path", Path("/tmp/glossary.json"), Path),
-        ("BTRAN_EVAL_DIR", "/tmp/evals", "eval_dir", Path("/tmp/evals"), Path),
-        ("BTRAN_REVIEW", "yes", "review", True, bool),
-        ("BTRAN_NO_PREFLIGHT", "1", "no_preflight", True, bool),
-    ])
-    def test_environment_loading_and_type(self, monkeypatch, env_name, value, field, expected, expected_type):
-        monkeypatch.setenv(env_name, value)
+    def test_environment_loading_and_types(self, monkeypatch):
+        monkeypatch.setenv("BTRAN_EPUB_CHECK", "true")
+        monkeypatch.setenv("BTRAN_EPUB_CHECK_PATH", "/opt/epubcheck")
+        monkeypatch.setenv("BTRAN_MANIFEST_PATH", "/tmp/manifest.json")
+        monkeypatch.setenv("BTRAN_GLOSSARY_BUDGET", "120000")
         cfg = load_config(["in", "out.epub", "--target-lang", "fr"])
-        assert getattr(cfg, field) == expected
-        assert isinstance(getattr(cfg, field), expected_type)
+        assert cfg.epub_check is True
+        assert cfg.epub_check_path == "/opt/epubcheck"
+        assert cfg.manifest_path == Path("/tmp/manifest.json")
+        assert cfg.glossary_budget == 120_000
 
-    @pytest.mark.parametrize(("env_name", "env_value", "cli_args", "field", "expected"), [
-        ("BTRAN_EPUB_CHECK", "false", ["--epub-check"], "epub_check", True),
-        ("BTRAN_EPUB_CHECK_PATH", "env-check", ["--epub-check-path", "cli-check"], "epub_check_path", "cli-check"),
-        ("BTRAN_MANIFEST_PATH", "/env/manifest.json", ["--manifest-path", "/cli/manifest.json"], "manifest_path", Path("/cli/manifest.json")),
-        ("BTRAN_GLOSSARY_BUDGET", "100", ["--glossary-budget", "200"], "glossary_budget", 200),
-        ("BTRAN_GLOSSARY_PATH", "/env/glossary.json", ["--glossary-path", "/cli/glossary.json"], "glossary_path", Path("/cli/glossary.json")),
-        ("BTRAN_EVAL_DIR", "/env/evals", ["--eval-dir", "/cli/evals"], "eval_dir", Path("/cli/evals")),
-        ("BTRAN_REVIEW", "false", ["--review"], "review", True),
-        ("BTRAN_NO_PREFLIGHT", "false", ["--no-preflight"], "no_preflight", True),
-    ])
-    def test_cli_overrides_environment(self, monkeypatch, env_name, env_value, cli_args, field, expected):
-        monkeypatch.setenv(env_name, env_value)
-        cfg = load_config(["in", "out.epub", "--target-lang", "fr", *cli_args])
-        assert getattr(cfg, field) == expected
+    def test_cli_overrides_environment(self, monkeypatch):
+        monkeypatch.setenv("BTRAN_MANIFEST_PATH", "/env/manifest.json")
+        monkeypatch.setenv("BTRAN_GLOSSARY_BUDGET", "100")
+        cfg = load_config([
+            "in", "out.epub", "--target-lang", "fr",
+            "--manifest-path", "/cli/manifest.json", "--glossary-budget", "200",
+        ])
+        assert cfg.manifest_path == Path("/cli/manifest.json")
+        assert cfg.glossary_budget == 200
+
+    def test_preflight_only_environment_control(self, monkeypatch):
+        monkeypatch.setenv("BTRAN_PREFLIGHT_ONLY", "true")
+        cfg = load_config(["in", "out.epub", "--target-lang", "fr"])
+        assert cfg.preflight_only is True

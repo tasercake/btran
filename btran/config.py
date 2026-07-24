@@ -1,18 +1,39 @@
-"""Configuration for btran — loads from .env and CLI args."""
+"""Configuration for btran's small production CLI surface."""
+
+from __future__ import annotations
 
 import argparse
 import os
 from dataclasses import dataclass, fields
 from pathlib import Path
+from typing import Callable
 
 from dotenv import find_dotenv, load_dotenv
 
 
+GLOSSARY_BUDGET_DEFAULT = 100_000
+GLOSSARY_BUDGET_MAXIMUM = 120_000
+_ENV_PREFIX = "BTRAN_"
+_UNSUPPORTED_ENV_CONTROLS = {
+    "NO_PREFLIGHT": "preflight is always enabled",
+    "EVAL_DIR": "the evaluation corpus is a developer harness, not a production control",
+    "GLOSSARY_PATH": "glossary output paths are managed by the pipeline",
+    "RECONCILIATION_ROUNDS": "reconciliation always uses one round",
+}
+
+
 @dataclass
 class Config:
+    """Runtime settings passed unchanged to the orchestrator boundary.
+
+    ``manifest_path`` is optional. When omitted, pipeline integration calls
+    ``load_or_generate_manifest(input_dir, None)`` so the manifest belongs to
+    the input directory rather than the caller's current working directory.
+    """
+
     model: str = "gemini-2.5-flash"
     source_lang: str = "en"
-    target_lang: str = ""  # REQUIRED — must be set or error
+    target_lang: str = ""
     concurrency: int = 4
     max_retries: int = 3
     timeout: int = 120
@@ -27,135 +48,153 @@ class Config:
     no_resume: bool = False
     epub_check: bool = False
     epub_check_path: str = "epubcheck"
-    manifest_path: Path = Path("./manifest.json")
-    glossary_budget: int = 100_000
-    glossary_path: Path = Path("./glossary.json")
-    eval_dir: Path = Path("./eval_corpus")
+    manifest_path: Path | None = None
+    glossary_budget: int = GLOSSARY_BUDGET_DEFAULT
     review: bool = False
-    no_preflight: bool = False
+    preflight_only: bool = False
 
 
-_ENV_PREFIX = "BTRAN_"
+def _flag_env(value: str) -> bool:
+    """Parse an explicitly boolean environment value."""
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"expected a boolean value, got {value!r}")
 
-# (field_name, env_suffix, converter)
-_FIELD_MAP: dict[str, tuple[str, type]] = {}
 
-
-def _flag_env(val: str) -> bool:
-    """Parse a boolean env var — truthy strings map to True."""
-    return val.strip().lower() in ("1", "true", "yes")
-
-
-def _init_field_map() -> None:
-    """Populate _FIELD_MAP; called once on import."""
-    _FIELD_MAP.update({
-        "model": ("MODEL", str),
-        "source_lang": ("SOURCE_LANG", str),
-        "target_lang": ("TARGET_LANG", str),
-        "concurrency": ("CONCURRENCY", int),
-        "max_retries": ("MAX_RETRIES", int),
-        "timeout": ("TIMEOUT", int),
-        "intermediate_dir": ("INTERMEDIATE_DIR", Path),
-        "cache_db": ("CACHE_DB", Path),
-        "pi_bin": ("PI_BIN", str),
-        "title": ("TITLE", str),
-        "author": ("AUTHOR", str),
-        "input_dir": ("INPUT_DIR", Path),
-        "output_epub": ("OUTPUT_EPUB", Path),
-        "embed_images": ("EMBED_IMAGES", _flag_env),
-        "no_resume": ("NO_RESUME", _flag_env),
-        "epub_check": ("EPUB_CHECK", _flag_env),
-        "epub_check_path": ("EPUB_CHECK_PATH", str),
-        "manifest_path": ("MANIFEST_PATH", Path),
-        "glossary_budget": ("GLOSSARY_BUDGET", int),
-        "glossary_path": ("GLOSSARY_PATH", Path),
-        "eval_dir": ("EVAL_DIR", Path),
-        "review": ("REVIEW", _flag_env),
-        "no_preflight": ("NO_PREFLIGHT", _flag_env),
-    })
+_ENV_FIELDS: dict[str, tuple[str, Callable[[str], object]]] = {
+    "model": ("MODEL", str),
+    "source_lang": ("SOURCE_LANG", str),
+    "target_lang": ("TARGET_LANG", str),
+    "concurrency": ("CONCURRENCY", int),
+    "max_retries": ("MAX_RETRIES", int),
+    "timeout": ("TIMEOUT", int),
+    "intermediate_dir": ("INTERMEDIATE_DIR", Path),
+    "cache_db": ("CACHE_DB", Path),
+    "pi_bin": ("PI_BIN", str),
+    "title": ("TITLE", str),
+    "author": ("AUTHOR", str),
+    "input_dir": ("INPUT_DIR", Path),
+    "output_epub": ("OUTPUT_EPUB", Path),
+    "embed_images": ("EMBED_IMAGES", _flag_env),
+    "no_resume": ("NO_RESUME", _flag_env),
+    "epub_check": ("EPUB_CHECK", _flag_env),
+    "epub_check_path": ("EPUB_CHECK_PATH", str),
+    "manifest_path": ("MANIFEST_PATH", Path),
+    "glossary_budget": ("GLOSSARY_BUDGET", int),
+    "review": ("REVIEW", _flag_env),
+    "preflight_only": ("PREFLIGHT_ONLY", _flag_env),
+}
+_PATH_FIELDS = {
+    "input_dir",
+    "output_epub",
+    "intermediate_dir",
+    "cache_db",
+    "manifest_path",
+}
 
 
 def load_config(argv: list[str] | None = None) -> Config:
-    """Load configuration from .env file then CLI args.
-
-    Env vars follow the BTRAN_ prefix (e.g. BTRAN_MODEL, BTRAN_TARGET_LANG).
-    CLI args override env vars.  target_lang must be provided somewhere.
-    argv=None uses sys.argv[1:].
-    """
+    """Load ``.env`` values then override them with explicit CLI arguments."""
     load_dotenv(dotenv_path=find_dotenv(usecwd=True))
-
-    # Seed kwargs from env vars (absent env → dataclass default).
-    default_cfg = Config()
-    env_kwargs: dict[str, object] = {}
-    for field in fields(Config):
-        env_suffix, converter = _FIELD_MAP[field.name]
-        raw = os.getenv(_ENV_PREFIX + env_suffix)
-        if raw is not None:
-            env_kwargs[field.name] = converter(raw)
-        else:
-            env_kwargs[field.name] = getattr(default_cfg, field.name)
-
-    # Parse CLI args on top.
     parser = _build_parser()
     cli_ns = parser.parse_args(argv)
-    cli_kwargs = vars(cli_ns).copy()
+    _reject_unsupported_environment_controls()
 
-    # Pull out positional args.
-    input_dir = cli_kwargs.pop("INPUT_DIR")
-    output_epub = cli_kwargs.pop("OUTPUT_EPUB")
+    defaults = Config()
+    values: dict[str, object] = {}
+    for name, (env_suffix, converter) in _ENV_FIELDS.items():
+        raw = os.getenv(_ENV_PREFIX + env_suffix)
+        if raw is None:
+            values[name] = getattr(defaults, name)
+            continue
+        try:
+            values[name] = converter(raw)
+        except ValueError:
+            parser.error(f"BTRAN_{env_suffix} has an invalid value: {raw!r}")
 
-    # Merge: env first, then CLI (only non-None values override).
-    path_fields = {
-        "input_dir", "output_epub", "intermediate_dir", "cache_db", "manifest_path",
-        "glossary_path", "eval_dir",
-    }
-    for k, v in cli_kwargs.items():
-        if v is not None:
-            env_kwargs[k] = Path(v) if k in path_fields else v
+    cli_values = vars(cli_ns).copy()
+    input_dir = cli_values.pop("INPUT_DIR")
+    output_epub = cli_values.pop("OUTPUT_EPUB")
+    for name, value in cli_values.items():
+        if value is not None:
+            values[name] = Path(value) if name in _PATH_FIELDS else value
 
-    env_kwargs["input_dir"] = Path(input_dir)
-    env_kwargs["output_epub"] = Path(output_epub)
+    values["input_dir"] = Path(input_dir)
+    values["output_epub"] = Path(output_epub)
+    config = Config(**{name: values[name] for name in {field.name for field in fields(Config)}})
+    _validate_config(config, parser, cli_ns)
+    return config
 
-    # Filter to only valid Config fields, then construct.
-    valid_keys = {f.name for f in fields(Config)}
-    cfg = Config(**{k: v for k, v in env_kwargs.items() if k in valid_keys})
 
-    if not cfg.target_lang:
+def _reject_unsupported_environment_controls() -> None:
+    for suffix, reason in _UNSUPPORTED_ENV_CONTROLS.items():
+        if os.getenv(_ENV_PREFIX + suffix) is not None:
+            raise ValueError(f"BTRAN_{suffix} is not supported: {reason}.")
+
+
+def _validate_config(
+    config: Config, parser: argparse.ArgumentParser, cli_ns: argparse.Namespace
+) -> None:
+    if not config.target_lang:
         raise ValueError(
             "target_lang is required. Set BTRAN_TARGET_LANG in .env or "
             "pass --target-lang on the command line."
         )
+    for field_name in ("concurrency", "max_retries", "timeout", "glossary_budget"):
+        if getattr(config, field_name) <= 0:
+            parser.error(f"{field_name} must be positive")
+    if config.glossary_budget > GLOSSARY_BUDGET_MAXIMUM:
+        parser.error(f"glossary_budget must not exceed {GLOSSARY_BUDGET_MAXIMUM}")
+    if config.preflight_only and config.review:
+        parser.error("--preflight-only cannot be combined with --review")
+    if config.preflight_only and config.epub_check:
+        parser.error("--preflight-only cannot be combined with --epub-check")
 
-    return cfg
+    explicit_epub_check_path = (
+        cli_ns.epub_check_path is not None or os.getenv("BTRAN_EPUB_CHECK_PATH") is not None
+    )
+    if explicit_epub_check_path and not config.epub_check:
+        parser.error("--epub-check-path requires --epub-check (or BTRAN_EPUB_CHECK=true)")
+    if config.epub_check and not config.epub_check_path.strip():
+        parser.error("epub_check_path must not be empty when --epub-check is enabled")
+
+    manifest_path_value = (
+        cli_ns.manifest_path
+        if cli_ns.manifest_path is not None
+        else os.getenv("BTRAN_MANIFEST_PATH")
+    )
+    if manifest_path_value is not None and not manifest_path_value.strip():
+        parser.error("manifest_path must not be empty")
+    if not cli_ns.INPUT_DIR.strip():
+        parser.error("INPUT_DIR must not be empty")
+    if not cli_ns.OUTPUT_EPUB.strip():
+        parser.error("OUTPUT_EPUB must not be empty")
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="btran — translate book photos to EPUB")
-    p.add_argument("INPUT_DIR", help="Directory containing book page images")
-    p.add_argument("OUTPUT_EPUB", help="Output EPUB file path")
-    p.add_argument("--source-lang", default=None)
-    p.add_argument("--target-lang", default=None)
-    p.add_argument("--model", default=None)
-    p.add_argument("--concurrency", type=int, default=None)
-    p.add_argument("--max-retries", type=int, default=None)
-    p.add_argument("--timeout", type=int, default=None)
-    p.add_argument("--intermediate-dir", default=None)
-    p.add_argument("--cache-db", default=None)
-    p.add_argument("--title", default=None)
-    p.add_argument("--author", default=None)
-    p.add_argument("--embed-images", action="store_true", default=None)
-    p.add_argument("--no-resume", action="store_true", default=None)
-    p.add_argument("--pi-bin", default=None)
-    p.add_argument("--epub-check", action="store_true", default=None)
-    p.add_argument("--epub-check-path", default=None)
-    p.add_argument("--manifest-path", default=None)
-    p.add_argument("--glossary-budget", type=int, default=None)
-    p.add_argument("--glossary-path", default=None)
-    p.add_argument("--eval-dir", default=None)
-    p.add_argument("--review", action="store_true", default=None)
-    p.add_argument("--no-preflight", action="store_true", default=None)
-    return p
-
-
-# Fill the field map at import time.
-_init_field_map()
+    parser = argparse.ArgumentParser(description="btran — translate book photos to EPUB")
+    parser.add_argument("INPUT_DIR", help="Directory containing book page images")
+    parser.add_argument("OUTPUT_EPUB", help="Output EPUB file path")
+    parser.add_argument("--source-lang", default=None)
+    parser.add_argument("--target-lang", default=None)
+    parser.add_argument("--model", default=None)
+    parser.add_argument("--concurrency", type=int, default=None)
+    parser.add_argument("--max-retries", type=int, default=None)
+    parser.add_argument("--timeout", type=int, default=None)
+    parser.add_argument("--intermediate-dir", default=None)
+    parser.add_argument("--cache-db", default=None)
+    parser.add_argument("--title", default=None)
+    parser.add_argument("--author", default=None)
+    parser.add_argument("--embed-images", action="store_true", default=None)
+    parser.add_argument("--no-resume", action="store_true", default=None)
+    parser.add_argument("--pi-bin", default=None)
+    parser.add_argument("--epub-check", action="store_true", default=None)
+    parser.add_argument("--epub-check-path", default=None)
+    parser.add_argument("--manifest-path", default=None)
+    parser.add_argument("--glossary-budget", type=int, default=None)
+    parser.add_argument("--review", action="store_true", default=None)
+    parser.add_argument("--preflight-only", action="store_true", default=None)
+    return parser

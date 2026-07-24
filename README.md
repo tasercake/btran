@@ -14,14 +14,26 @@ pip install -e ".[dev]"
 btran ./photos/ output.epub --target-lang ja --model gemini-2.5-flash
 ```
 
-## Config
+The CLI requires `INPUT_DIR`, `OUTPUT_EPUB`, and a target language (flag or
+`BTRAN_TARGET_LANG`). CLI options override `.env` values. See `.env.example`
+for the complete production configuration surface.
 
-All options via CLI or `.env` (prefix `BTRAN_`). See `.env.example`.
+Useful final-run controls:
+
+- `--manifest-path PATH` selects a manifest explicitly. When omitted, pipeline
+  integration uses `INPUT_DIR/manifest.json`, never a surprise cwd manifest.
+- `--epub-check [--epub-check-path PATH]` strictly validates the generated
+  EPUB; the checker must be resolvable on `PATH` (or supplied explicitly).
+- `--review` enables the one allowed review/resolution pass.
+- `--preflight-only` runs input validation without requiring `pi`.
+- `--glossary-budget N` defaults to 100,000 and is capped at 120,000.
+
+Preflight is always enabled. Reconciliation is fixed to one round, and the eval
+corpus remains a developer harness rather than a production CLI control.
 
 ## How it works
 
-1. Scans input folder for images (`.jpg`, `.png`, `.webp`)
-2. Hashes each image (SHA256 + perceptual phash) → skips cached
-3. Spawns `pi -p --model <model> @image.jpg` per uncached image (concurrency=4)
-4. Parses structured JSON from each pi response
-5. Compiles all results into EPUB with `ebooklib`
+1. Builds or loads an input manifest and preflights every page
+2. Translates pages through `pi` with bounded concurrency and retries
+3. Streams terminal page errors to stderr and fails the run if any page fails
+4. Compiles all successful results into an EPUB with `ebooklib`

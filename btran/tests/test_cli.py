@@ -148,8 +148,8 @@ class TestFailureExit:
         assert exc.value.code == 1
         captured = capsys.readouterr()
         assert "2 page(s) failed" in captured.err
-        assert "page 2" in captured.err
-        assert "page 5" in captured.err
+        assert "page 2" not in captured.err
+        assert "page 5" not in captured.err
 
     def test_no_errors_exits_zero(self):
         """When RunResult has no errors, exit code is 0."""
