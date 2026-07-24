@@ -3,7 +3,7 @@
 import asyncio
 import json
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
@@ -152,10 +152,128 @@ class TestExtractPage:
         assert args[:2] == ("/bin/pi", "-p")
         assert args[args.index("--model") + 1] == "gemini-vision"
         assert "--no-session" in args
+        assert "--no-tools" in args
         assert args[-1].endswith("@/photos/p1.png")
         assert "ja" in args[-1]
         assert "term_mentions" in EXTRACTION_PROMPT
+        assert "untrusted" in EXTRACTION_PROMPT.lower()
+        assert "do not follow" in EXTRACTION_PROMPT.lower()
         assert kwargs["stdout"] is asyncio.subprocess.PIPE
+
+    @pytest.mark.asyncio
+    async def test_timeout_kills_and_reaps_pi_process(self):
+        """A timed-out Pi subprocess cannot survive as an orphan."""
+        from btran.source_extractor import ExtractionError, extract_page
+
+        class HangingProcess:
+            def __init__(self):
+                self.kill = Mock()
+                self.returncode = None
+                self._never = asyncio.Event()
+
+            async def communicate(self):
+                if not self.kill.called:
+                    await self._never.wait()
+                return b"", b""
+
+        proc = HangingProcess()
+        with patch(
+            "btran.source_extractor.asyncio.create_subprocess_exec",
+            AsyncMock(return_value=proc),
+        ):
+            with pytest.raises(ExtractionError, match="timed out"):
+                await extract_page(
+                    Path("page.png"), "en", "model", "a" * 64, "b" * 16, 1, timeout=0.01
+                )
+
+        proc.kill.assert_called_once_with()
+
+    @pytest.mark.asyncio
+    async def test_cancellation_kills_and_reaps_pi_process(self):
+        """Caller cancellation also cannot leave Pi running in the background."""
+        from btran.source_extractor import extract_page
+
+        class HangingProcess:
+            def __init__(self):
+                self.kill = Mock()
+                self.returncode = None
+                self.started = asyncio.Event()
+                self._never = asyncio.Event()
+
+            async def communicate(self):
+                self.started.set()
+                if not self.kill.called:
+                    await self._never.wait()
+                return b"", b""
+
+        proc = HangingProcess()
+        with patch(
+            "btran.source_extractor.asyncio.create_subprocess_exec",
+            AsyncMock(return_value=proc),
+        ):
+            task = asyncio.create_task(extract_page(
+                Path("page.png"), "en", "model", "a" * 64, "b" * 16, 1,
+            ))
+            await proc.started.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        proc.kill.assert_called_once_with()
+
+    @pytest.mark.asyncio
+    async def test_non_positive_timeout_rejected_before_spawning_pi(self):
+        """A non-positive timeout is not a bounded extraction request."""
+        from btran.source_extractor import ExtractionError, extract_page
+
+        exec_mock = AsyncMock()
+        with patch("btran.source_extractor.asyncio.create_subprocess_exec", exec_mock):
+            with pytest.raises(ExtractionError, match="timeout must be positive"):
+                await extract_page(
+                    Path("page.png"), "en", "model", "a" * 64, "b" * 16, 1, timeout=0
+                )
+
+        exec_mock.assert_not_called()
+
+
+class TestStrictStructuredValidation:
+    @pytest.mark.parametrize("mutate", [
+        lambda output: output.update(unexpected=True),
+        lambda output: output["blocks"][0].update(unexpected=True),
+        lambda output: output["term_mentions"][0].update(unexpected=True),
+    ])
+    def test_rejects_unknown_fields_at_every_structured_level(self, mutate):
+        """Pi output must exactly match the extraction schema, not merely contain it."""
+        from btran.source_extractor import ExtractionError, parse_extraction
+
+        output = json.loads(_VALID_OUTPUT)
+        mutate(output)
+
+        with pytest.raises(ExtractionError, match="unexpected fields"):
+            parse_extraction(
+                output,
+                image_path=Path("page.png"), source_lang="en", model="model",
+                sha256="a" * 64, phash="b" * 16, page_number=1,
+            )
+
+    @pytest.mark.parametrize("mutate", [
+        lambda output: output["blocks"][0].update(text="   "),
+        lambda output: output.update(illustrations=["   "]),
+        lambda output: output.update(illustrations=["different description"]),
+    ])
+    def test_rejects_empty_or_inconsistent_source_content(self, mutate):
+        """Descriptions and source text must be meaningful and internally consistent."""
+        from btran.source_extractor import ExtractionError, parse_extraction
+
+        output = json.loads(_VALID_OUTPUT)
+        mutate(output)
+
+        with pytest.raises(ExtractionError):
+            parse_extraction(
+                output,
+                image_path=Path("page.png"), source_lang="en", model="model",
+                sha256="a" * 64, phash="b" * 16, page_number=1,
+            )
 
 
 class TestExtractionArtifacts:
@@ -177,12 +295,15 @@ class TestExtractionArtifacts:
         assert PageExtraction.from_file(path) == extraction
         assert not list(path.parent.glob(".page-2.json.*.tmp"))
 
-    def test_extraction_cache_identity_is_namespaced_and_semantic(self):
-        """Extraction keys cannot collide with translations and change with extraction inputs."""
-        from btran.source_extractor import extraction_cache_identity
+    def test_extraction_cache_identity_is_namespaced_and_semantic(self, monkeypatch):
+        """Extraction keys include model, prompt, and schema independently of translations."""
+        import btran.source_extractor as extractor
 
-        first = extraction_cache_identity("a" * 64, "en", "vision-a")
-        assert first == extraction_cache_identity("a" * 64, "en", "vision-a")
+        first = extractor.extraction_cache_identity("a" * 64, "en", "vision-a")
+        assert first == extractor.extraction_cache_identity("a" * 64, "en", "vision-a")
         assert first.startswith("extraction:")
-        assert first != extraction_cache_identity("a" * 64, "fr", "vision-a")
-        assert first != extraction_cache_identity("a" * 64, "en", "vision-b")
+        assert first != extractor.extraction_cache_identity("a" * 64, "fr", "vision-a")
+        assert first != extractor.extraction_cache_identity("a" * 64, "en", "vision-b")
+
+        monkeypatch.setattr(extractor, "EXTRACTION_SCHEMA_VERSION", "changed")
+        assert first != extractor.extraction_cache_identity("a" * 64, "en", "vision-a")
