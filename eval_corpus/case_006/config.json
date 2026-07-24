@@ -1,8 +1,12 @@
 {
-  "name": "case_001",
+  "name": "case_006",
+  "risk_tags": [
+    "synthetic-fixture",
+    "tables"
+  ],
   "fixture_image": "page.png",
   "source": {
-    "page_number": 1,
+    "page_number": 6,
     "image_path": "page.png",
     "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     "phash": "bbbbbbbbbbbbbbbb",
@@ -10,68 +14,52 @@
     "model": "synthetic-fixture",
     "blocks": [
       {
-        "id": "title",
+        "id": "h1",
         "type": "heading",
-        "text": "Night Signals",
+        "text": "Weather log",
         "reading_order": 0
       },
       {
-        "id": "left",
-        "type": "paragraph",
-        "text": "A signal crossed the river.",
+        "id": "t1",
+        "type": "table",
+        "text": "Day | Wind | Rain; Mon | calm | 2 mm",
         "reading_order": 1
-      },
-      {
-        "id": "right",
-        "type": "paragraph",
-        "text": "The crew answered at dawn.",
-        "reading_order": 2
       }
     ],
     "term_mentions": [],
     "illustrations": []
   },
   "translation": {
-    "page_number": 1,
+    "page_number": 6,
     "image_path": "page.png",
     "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     "phash": "bbbbbbbbbbbbbbbb",
     "source_lang": "en",
     "target_lang": "fr",
-    "page_text": "Night Signals A signal crossed the river. The crew answered at dawn.",
-    "translated_text": "Signaux nocturnes. Un signal a traversé la rivière et l'équipe a répondu à l'aube.",
+    "page_text": "Weather log Day | Wind | Rain; Mon | calm | 2 mm",
+    "translated_text": "Le texte traduit est prêt et clair.",
     "blocks": [
       {
-        "id": "title",
+        "id": "h1",
         "type": "heading",
-        "text": "Night Signals",
+        "text": "Weather log",
         "reading_order": 0
       },
       {
-        "id": "left",
-        "type": "paragraph",
-        "text": "A signal crossed the river.",
+        "id": "t1",
+        "type": "table",
+        "text": "Day | Wind | Rain; Mon | calm | 2 mm",
         "reading_order": 1
-      },
-      {
-        "id": "right",
-        "type": "paragraph",
-        "text": "The crew answered at dawn.",
-        "reading_order": 2
       }
     ],
     "translated_blocks": [
       {
-        "block_id": "title",
-        "translated_text": "Signaux nocturnes"
+        "block_id": "h1",
+        "translated_text": "Journal météo"
       },
       {
-        "block_id": "left",
-        "translated_text": "Un signal a traversé la rivière."
-      },
-      {
-        "block_id": "right",
-        "translated_text": "L'équipe a répondu à l'aube."
+        "block_id": "t1",
+        "translated_text": "Jour | Vent | Pluie; Lun | calme | 2 mm"
       }
     ],
     "image_descriptions": [],
@@ -80,7 +68,7 @@
   },
   "glossary": {
     "version": "1.0",
-    "hash": "synthetic",
+    "hash": "synthetic-006",
     "source_lang": "en",
     "target_lang": "fr",
     "entries": []
@@ -92,9 +80,5 @@
     "illustration_count": true,
     "block_id_correspondence": true,
     "glossary_consistency": true
-  },
-  "risk_tags": [
-    "synthetic-fixture",
-    "headings-paragraphs"
-  ]
+  }
 }

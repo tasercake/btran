@@ -122,5 +122,10 @@
     "illustration_count": true,
     "block_id_correspondence": true,
     "glossary_consistency": true
-  }
+  },
+  "risk_tags": [
+    "synthetic-fixture",
+    "footnotes",
+    "terminology-consistency"
+  ]
 }

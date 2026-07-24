@@ -14,6 +14,7 @@ PNG_1X1 = base64.b64decode(
 def case_config(name, *, target_text="Bonjour le monde et merci", expected=None):
     return {
         "name": name,
+        "risk_tags": ["test-fixture"],
         "fixture_image": "page.png",
         "source": {
             "page_number": 1, "image_path": "page.png", "sha256": "a" * 64,
@@ -53,6 +54,17 @@ def test_load_eval_cases_needs_only_config_json_and_fixture_image(tmp_path):
     assert cases[0].fixture_image == tmp_path / "case_001" / "page.png"
 
 
+def test_load_eval_cases_requires_non_empty_string_risk_tags(tmp_path):
+    config = case_config("case_without_risk_tags")
+    del config["risk_tags"]
+    write_case(tmp_path, config)
+
+    import pytest
+
+    with pytest.raises(ValueError, match="risk_tags"):
+        load_eval_cases(tmp_path)
+
+
 def test_load_eval_cases_requires_an_expectation_for_every_validator_stage(tmp_path):
     config = case_config("case_missing_stage")
     del config["expected"]["glossary_consistency"]
@@ -85,10 +97,18 @@ def test_run_corpus_asserts_expected_stage_results_and_writes_json_report(tmp_pa
     assert report["cases"][1]["stages"]["translation_language"]["passed"] is True
 
 
-def test_repository_corpus_has_at_least_five_cases_and_runs_cleanly():
+def test_repository_corpus_has_reviewed_size_category_coverage_and_runs_cleanly():
     corpus = __import__("pathlib").Path(__file__).parents[2] / "eval_corpus"
 
+    cases = load_eval_cases(corpus)
     report = run_corpus(corpus)
+    tags = {tag for case in cases for tag in case.risk_tags}
 
-    assert len(report["cases"]) >= 5
+    assert 20 <= len(cases) <= 50
+    assert {
+        "headings-paragraphs", "lists", "tables", "footnotes", "captions-illustrations",
+        "columns-reading-order", "mixed-language", "blank-near-blank", "low-content-risk",
+        "low-resolution-risk", "malformed-blocks", "block-id-mismatch", "wrong-target-language",
+        "terminology-consistency", "terminology-aliases", "terminology-context-variants",
+    } <= tags
     assert report["all_passed"] is True

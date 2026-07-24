@@ -20,6 +20,7 @@ class EvalCase:
     translation: PageResult
     glossary: TerminologyMap
     expected: dict[str, bool]
+    risk_tags: list[str]
 
 
 def load_eval_cases(corpus_dir: Path) -> list[EvalCase]:
@@ -32,6 +33,13 @@ def load_eval_cases(corpus_dir: Path) -> list[EvalCase]:
         if not image.is_file():
             raise FileNotFoundError(f"fixture image missing for {config['name']}: {image}")
         expected = config["expected"]
+        risk_tags = config.get("risk_tags")
+        if (
+            not isinstance(risk_tags, list)
+            or not risk_tags
+            or not all(isinstance(tag, str) and tag.strip() for tag in risk_tags)
+        ):
+            raise ValueError(f"case {config['name']} risk_tags must be a non-empty list of strings")
         if not isinstance(expected, dict) or set(expected) != set(VALIDATION_STAGES):
             raise ValueError(
                 f"case {config['name']} expected stages must exactly match "
@@ -46,6 +54,7 @@ def load_eval_cases(corpus_dir: Path) -> list[EvalCase]:
             translation=PageResult.from_dict(config["translation"]),
             glossary=TerminologyMap.from_dict(config["glossary"]),
             expected=expected,
+            risk_tags=risk_tags,
         ))
     return cases
 
@@ -78,6 +87,7 @@ def _run_case(case: EvalCase) -> dict:
     }
     return {
         "name": case.name,
+        "risk_tags": case.risk_tags,
         "passed": all(stage["passed"] for stage in stages.values()),
         "stages": stages,
     }

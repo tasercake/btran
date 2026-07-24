@@ -1,8 +1,12 @@
 {
-  "name": "case_001",
+  "name": "case_008",
+  "risk_tags": [
+    "synthetic-fixture",
+    "columns-reading-order"
+  ],
   "fixture_image": "page.png",
   "source": {
-    "page_number": 1,
+    "page_number": 8,
     "image_path": "page.png",
     "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     "phash": "bbbbbbbbbbbbbbbb",
@@ -10,68 +14,84 @@
     "model": "synthetic-fixture",
     "blocks": [
       {
-        "id": "title",
+        "id": "heading",
         "type": "heading",
-        "text": "Night Signals",
+        "text": "Field notes",
         "reading_order": 0
       },
       {
-        "id": "left",
+        "id": "left-1",
         "type": "paragraph",
-        "text": "A signal crossed the river.",
+        "text": "North path: dry stones.",
         "reading_order": 1
       },
       {
-        "id": "right",
+        "id": "right-1",
         "type": "paragraph",
-        "text": "The crew answered at dawn.",
+        "text": "South path: wet grass.",
         "reading_order": 2
+      },
+      {
+        "id": "left-2",
+        "type": "paragraph",
+        "text": "Meet at the bridge.",
+        "reading_order": 3
       }
     ],
     "term_mentions": [],
     "illustrations": []
   },
   "translation": {
-    "page_number": 1,
+    "page_number": 8,
     "image_path": "page.png",
     "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     "phash": "bbbbbbbbbbbbbbbb",
     "source_lang": "en",
     "target_lang": "fr",
-    "page_text": "Night Signals A signal crossed the river. The crew answered at dawn.",
-    "translated_text": "Signaux nocturnes. Un signal a traversé la rivière et l'équipe a répondu à l'aube.",
+    "page_text": "Field notes North path: dry stones. South path: wet grass. Meet at the bridge.",
+    "translated_text": "Le texte traduit est prêt et clair.",
     "blocks": [
       {
-        "id": "title",
+        "id": "heading",
         "type": "heading",
-        "text": "Night Signals",
+        "text": "Field notes",
         "reading_order": 0
       },
       {
-        "id": "left",
+        "id": "left-1",
         "type": "paragraph",
-        "text": "A signal crossed the river.",
+        "text": "North path: dry stones.",
         "reading_order": 1
       },
       {
-        "id": "right",
+        "id": "right-1",
         "type": "paragraph",
-        "text": "The crew answered at dawn.",
+        "text": "South path: wet grass.",
         "reading_order": 2
+      },
+      {
+        "id": "left-2",
+        "type": "paragraph",
+        "text": "Meet at the bridge.",
+        "reading_order": 3
       }
     ],
     "translated_blocks": [
       {
-        "block_id": "title",
-        "translated_text": "Signaux nocturnes"
+        "block_id": "heading",
+        "translated_text": "Notes de terrain"
       },
       {
-        "block_id": "left",
-        "translated_text": "Un signal a traversé la rivière."
+        "block_id": "left-1",
+        "translated_text": "Chemin nord : pierres sèches."
       },
       {
-        "block_id": "right",
-        "translated_text": "L'équipe a répondu à l'aube."
+        "block_id": "right-1",
+        "translated_text": "Chemin sud : herbe humide."
+      },
+      {
+        "block_id": "left-2",
+        "translated_text": "Retrouvez-vous au pont."
       }
     ],
     "image_descriptions": [],
@@ -80,7 +100,7 @@
   },
   "glossary": {
     "version": "1.0",
-    "hash": "synthetic",
+    "hash": "synthetic-008",
     "source_lang": "en",
     "target_lang": "fr",
     "entries": []
@@ -92,9 +112,5 @@
     "illustration_count": true,
     "block_id_correspondence": true,
     "glossary_consistency": true
-  },
-  "risk_tags": [
-    "synthetic-fixture",
-    "headings-paragraphs"
-  ]
+  }
 }

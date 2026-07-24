@@ -1,0 +1,50 @@
+{
+  "name": "case_015",
+  "risk_tags": [
+    "synthetic-fixture",
+    "empty-blocks",
+    "low-content-risk"
+  ],
+  "fixture_image": "page.png",
+  "source": {
+    "page_number": 15,
+    "image_path": "page.png",
+    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "phash": "bbbbbbbbbbbbbbbb",
+    "source_lang": "en",
+    "model": "synthetic-fixture",
+    "blocks": [],
+    "term_mentions": [],
+    "illustrations": []
+  },
+  "translation": {
+    "page_number": 15,
+    "image_path": "page.png",
+    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "phash": "bbbbbbbbbbbbbbbb",
+    "source_lang": "en",
+    "target_lang": "fr",
+    "page_text": "Synthetic empty extraction marker",
+    "translated_text": "Marqueur synthétique sans bloc.",
+    "blocks": [],
+    "translated_blocks": [],
+    "image_descriptions": [],
+    "term_mentions": [],
+    "illustrations": []
+  },
+  "glossary": {
+    "version": "1.0",
+    "hash": "synthetic-015",
+    "source_lang": "en",
+    "target_lang": "fr",
+    "entries": []
+  },
+  "expected": {
+    "block_schema": true,
+    "non_empty_text": true,
+    "translation_language": true,
+    "illustration_count": true,
+    "block_id_correspondence": true,
+    "glossary_consistency": true
+  }
+}
