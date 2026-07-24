@@ -49,11 +49,13 @@ def _make_config(input_dir: Path, intermediate_dir: Path, cache_db: Path, **kwar
         "output_epub": input_dir / "out.epub",
         "intermediate_dir": intermediate_dir,
         "cache_db": cache_db,
+        "manifest_path": intermediate_dir / "manifest.json",
         "target_lang": "en",
         "source_lang": "ja",
         "concurrency": 4,
         "max_retries": 2,
         "no_resume": False,
+        "no_preflight": True,
     }
     defaults.update(kwargs)
     return Config(**defaults)

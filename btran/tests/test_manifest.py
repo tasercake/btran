@@ -107,5 +107,29 @@ class TestManifestValidation:
             total_pages=1,
         )
 
-        with pytest.raises(ManifestValidationError, match="inside input_dir"):
+        with pytest.raises(ManifestValidationError, match="bare filename"):
+            validate_manifest(manifest)
+
+    def test_read_rejects_non_string_input_directory(self, tmp_path):
+        path = tmp_path / "manifest.json"
+        path.write_text(json.dumps({"input_dir": 42, "pages": [], "total_pages": 0}))
+
+        with pytest.raises(ManifestValidationError, match="input_dir must be a string"):
+            read_manifest(path)
+
+    @pytest.mark.parametrize("filename", ["subdir/../page.png", r"..\\page.png", "{absolute_path}"])
+    def test_validate_rejects_non_filename_references(self, tmp_path, filename):
+        from btran.schema import Manifest
+
+        page = tmp_path / "page.png"
+        _copy_image("hi_res_page.png", page)
+        if filename == "{absolute_path}":
+            filename = str(page)
+        manifest = Manifest(
+            input_dir=str(tmp_path),
+            pages=[{"filename": filename, "page_number": 1, "status": "pending"}],
+            total_pages=1,
+        )
+
+        with pytest.raises(ManifestValidationError, match="bare filename"):
             validate_manifest(manifest)

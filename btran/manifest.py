@@ -73,6 +73,10 @@ def load_or_generate_manifest(
 
 def validate_manifest(manifest: Manifest) -> None:
     """Ensure every page entry is a safe, existing page before model calls."""
+    if not isinstance(manifest.input_dir, str):
+        raise ManifestValidationError("input_dir must be a string")
+    if not manifest.input_dir:
+        raise ManifestValidationError("input_dir must be non-empty")
     input_dir = Path(manifest.input_dir).resolve()
     if not input_dir.is_dir():
         raise ManifestValidationError(f"input_dir is not a directory: {input_dir}")
@@ -95,6 +99,9 @@ def validate_manifest(manifest: Manifest) -> None:
         page_number = page["page_number"]
         if not isinstance(filename, str) or not filename:
             raise ManifestValidationError(f"page {index} filename must be a non-empty string")
+        filename_path = Path(filename)
+        if filename_path.is_absolute() or filename_path.name != filename or "\\" in filename:
+            raise ManifestValidationError(f"page {index} filename must be a bare filename: {filename}")
         if not isinstance(page_number, int) or isinstance(page_number, bool) or page_number < 1:
             raise ManifestValidationError(f"page {index} page_number must be a positive integer")
         if page_number in page_numbers:
