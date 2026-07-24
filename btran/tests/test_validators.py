@@ -82,6 +82,28 @@ def test_block_schema_rejects_unknown_type_duplicate_id_and_negative_order():
     assert any("reading_order" in error for error in errors)
 
 
+def test_block_schema_accepts_source_extractor_block_types():
+    assert check_block_schema([
+        SourceBlock("quote", "pull_quote", "quoted text", 0),
+        SourceBlock("image", "illustration", "diagram", 1),
+    ]) == []
+
+
+def test_block_schema_rejects_reused_reading_order():
+    errors = check_block_schema([
+        SourceBlock("b1", "paragraph", "one", 0),
+        SourceBlock("b2", "paragraph", "two", 0),
+    ])
+
+    assert errors == ["duplicate reading_order: 0"]
+
+
+def test_validate_page_rejects_blank_source_block_text():
+    extraction = source(blocks=[SourceBlock("b1", "paragraph", "", 0)])
+
+    assert "source block b1 text is empty" in validate_page(extraction, translation(), glossary())["non_empty_text"]
+
+
 def test_non_empty_text_rejects_blank_page_and_block_text():
     result = translation(text=" ", blocks=[TranslatedBlock("b1", "")])
     result.page_text = "\t"
@@ -114,6 +136,15 @@ def test_illustration_count_requires_one_description_per_extracted_illustration(
     assert errors == ["expected 2 illustration descriptions, got 1"]
 
 
+def test_illustration_count_rejects_blank_description_references():
+    errors = check_illustration_count(
+        source(illustrations=["map"]),
+        translation(descriptions=[" "]),
+    )
+
+    assert errors == ["illustration description 0 is empty"]
+
+
 def test_block_id_correspondence_rejects_missing_and_extra_ids():
     errors = check_block_id_correspondence(
         source(blocks=[
@@ -127,6 +158,15 @@ def test_block_id_correspondence_rejects_missing_and_extra_ids():
     assert "extra translated block IDs: b3" in errors
 
 
+def test_validate_page_reports_malformed_translated_blocks_without_crashing():
+    result = translation(blocks=[SourceBlock("b1", "paragraph", "not translated", 0)])
+
+    errors = validate_page(source(), result, glossary())
+
+    assert errors["block_schema"] == ["translated block 0 is not a TranslatedBlock"]
+    assert errors["block_id_correspondence"] == ["translated block 0 is not a TranslatedBlock"]
+
+
 def test_glossary_consistency_rejects_missing_required_target_term():
     errors = check_glossary_consistency(
         source(mentions=[TermMention("engine", "b1")]),
@@ -135,3 +175,19 @@ def test_glossary_consistency_rejects_missing_required_target_term():
     )
 
     assert errors == ["block b1 translates glossary term 'engine' without required target 'moteur'"]
+
+
+def test_glossary_consistency_accepts_a_legitimate_variant_for_the_same_source_term():
+    variant_glossary = TerminologyMap(
+        version="1", hash="hash", source_lang="en", target_lang="fr",
+        entries=[
+            TerminologyEntry("engine_metaphor", ["engine"], "machine", ["novel"], 1.0),
+            TerminologyEntry("engine_device", ["engine"], "moteur", ["manual"], 1.0),
+        ],
+    )
+
+    assert check_glossary_consistency(
+        source(mentions=[TermMention("engine", "b1")]),
+        translation(text="La machine démarre."),
+        variant_glossary,
+    ) == []

@@ -15,8 +15,18 @@ from btran.schema import (
 
 
 VALID_BLOCK_TYPES = frozenset({
-    "heading", "paragraph", "caption", "footnote", "table", "list_item", "quote", "page_number",
+    "heading", "paragraph", "caption", "footnote", "table", "list_item",
+    "pull_quote", "illustration", "quote", "page_number",
 })
+
+VALIDATION_STAGES = (
+    "block_schema",
+    "non_empty_text",
+    "translation_language",
+    "illustration_count",
+    "block_id_correspondence",
+    "glossary_consistency",
+)
 
 _COMMON_WORDS = {
     "en": frozenset({"the", "and", "is", "are", "this", "that", "with", "for", "of", "to"}),
@@ -30,6 +40,7 @@ def check_block_schema(blocks: Sequence[SourceBlock]) -> list[str]:
     """Return schema-contract violations for source blocks, in input order."""
     errors: list[str] = []
     seen_ids: set[str] = set()
+    seen_reading_orders: set[int] = set()
     for index, block in enumerate(blocks):
         if not isinstance(block, SourceBlock):
             errors.append(f"block {index} is not a SourceBlock")
@@ -44,21 +55,40 @@ def check_block_schema(blocks: Sequence[SourceBlock]) -> list[str]:
             errors.append(f"block {block.id} has unsupported type: {block.type}")
         if not isinstance(block.reading_order, int) or isinstance(block.reading_order, bool) or block.reading_order < 0:
             errors.append(f"block {block.id} has invalid reading_order")
+        elif block.reading_order in seen_reading_orders:
+            errors.append(f"duplicate reading_order: {block.reading_order}")
+        else:
+            seen_reading_orders.add(block.reading_order)
     return errors
 
 
-def check_non_empty_text_fields(result: PageResult) -> list[str]:
-    """Return errors for required page and block text fields that are blank."""
+def check_translated_block_schema(blocks: Sequence[TranslatedBlock]) -> list[str]:
+    """Return structural violations for translated blocks without raising."""
+    errors: list[str] = []
+    for index, block in enumerate(blocks):
+        if not isinstance(block, TranslatedBlock):
+            errors.append(f"translated block {index} is not a TranslatedBlock")
+        elif not isinstance(block.block_id, str) or not block.block_id.strip():
+            errors.append(f"translated block {index} has an empty block_id")
+    return errors
+
+
+def check_non_empty_text_fields(
+    result: PageResult,
+    source: PageExtraction | None = None,
+) -> list[str]:
+    """Return errors for required page and source/translated block text fields."""
     errors: list[str] = []
     if not _has_text(result.page_text):
         errors.append("page_text is empty")
     if not _has_text(result.translated_text):
         errors.append("translated_text is empty")
-    for block in result.blocks:
-        if not _has_text(block.text):
+    source_blocks = source.blocks if source is not None else result.blocks
+    for index, block in enumerate(source_blocks):
+        if isinstance(block, SourceBlock) and not _has_text(block.text):
             errors.append(f"source block {block.id} text is empty")
     for block in result.translated_blocks:
-        if not _has_text(block.translated_text):
+        if isinstance(block, TranslatedBlock) and not _has_text(block.translated_text):
             errors.append(f"translated block {block.block_id} text is empty")
     return errors
 
@@ -89,16 +119,32 @@ def check_translation_language(result: PageResult) -> list[str]:
 
 
 def check_illustration_count(source: PageExtraction, result: PageResult) -> list[str]:
-    """Require one translated description for every extracted illustration."""
+    """Require one non-empty translated description per extracted illustration."""
     expected = len(source.illustrations)
     actual = len(result.image_descriptions)
     if expected != actual:
         return [f"expected {expected} illustration descriptions, got {actual}"]
-    return []
+    return [
+        f"illustration description {index} is empty"
+        for index, description in enumerate(result.image_descriptions)
+        if not _has_text(description)
+    ]
 
 
 def check_block_id_correspondence(source: PageExtraction, result: PageResult) -> list[str]:
     """Require source and translation block IDs to match exactly."""
+    invalid_source = [
+        f"source block {index} is not a SourceBlock"
+        for index, block in enumerate(source.blocks)
+        if not isinstance(block, SourceBlock)
+    ]
+    invalid_translated = [
+        f"translated block {index} is not a TranslatedBlock"
+        for index, block in enumerate(result.translated_blocks)
+        if not isinstance(block, TranslatedBlock)
+    ]
+    if invalid_source or invalid_translated:
+        return invalid_source + invalid_translated
     source_ids = {block.id for block in source.blocks}
     translated_ids = [block.block_id for block in result.translated_blocks]
     translated_set = set(translated_ids)
@@ -121,22 +167,26 @@ def check_glossary_consistency(
     glossary: TerminologyMap,
 ) -> list[str]:
     """Ensure mentioned glossary terms use their required target term per block."""
-    target_by_source_term = {
-        source_term.casefold(): entry.target_term
-        for entry in glossary.entries
-        for source_term in entry.source_terms
+    target_by_source_term: dict[str, set[str]] = {}
+    for entry in glossary.entries:
+        for source_term in entry.source_terms:
+            target_by_source_term.setdefault(source_term.casefold(), set()).add(entry.target_term)
+    translated_by_id = {
+        block.block_id: block.translated_text
+        for block in result.translated_blocks
+        if isinstance(block, TranslatedBlock)
     }
-    translated_by_id = {block.block_id: block.translated_text for block in result.translated_blocks}
     errors: list[str] = []
     for mention in source.term_mentions:
-        target_term = target_by_source_term.get(mention.term.casefold())
-        if target_term is None:
+        target_terms = target_by_source_term.get(mention.term.casefold())
+        if target_terms is None:
             continue
         translation = translated_by_id.get(mention.block_id, "")
-        if target_term.casefold() not in translation.casefold():
+        if not any(target_term.casefold() in translation.casefold() for target_term in target_terms):
+            required = "' or '".join(sorted(target_terms, key=str.casefold))
             errors.append(
                 f"block {mention.block_id} translates glossary term '{mention.term}' "
-                f"without required target '{target_term}'"
+                f"without required target '{required}'"
             )
     return errors
 
@@ -148,8 +198,11 @@ def validate_page(
 ) -> dict[str, list[str]]:
     """Run every deterministic validation stage and return stage-keyed errors."""
     return {
-        "block_schema": check_block_schema(source.blocks),
-        "non_empty_text": check_non_empty_text_fields(result),
+        "block_schema": (
+            check_block_schema(source.blocks)
+            + check_translated_block_schema(result.translated_blocks)
+        ),
+        "non_empty_text": check_non_empty_text_fields(result, source),
         "translation_language": check_translation_language(result),
         "illustration_count": check_illustration_count(source, result),
         "block_id_correspondence": check_block_id_correspondence(source, result),

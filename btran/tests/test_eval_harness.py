@@ -53,6 +53,17 @@ def test_load_eval_cases_needs_only_config_json_and_fixture_image(tmp_path):
     assert cases[0].fixture_image == tmp_path / "case_001" / "page.png"
 
 
+def test_load_eval_cases_requires_an_expectation_for_every_validator_stage(tmp_path):
+    config = case_config("case_missing_stage")
+    del config["expected"]["glossary_consistency"]
+    write_case(tmp_path, config)
+
+    import pytest
+
+    with pytest.raises(ValueError, match="expected stages"):
+        load_eval_cases(tmp_path)
+
+
 def test_run_corpus_asserts_expected_stage_results_and_writes_json_report(tmp_path):
     write_case(tmp_path, case_config("case_pass"))
     write_case(tmp_path, case_config(

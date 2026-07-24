@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from btran.schema import PageExtraction, PageResult, TerminologyMap
-from btran.validators import validate_page
+from btran.validators import VALIDATION_STAGES, validate_page
 
 
 @dataclass(frozen=True)
@@ -31,13 +31,21 @@ def load_eval_cases(corpus_dir: Path) -> list[EvalCase]:
         image = case_dir / config["fixture_image"]
         if not image.is_file():
             raise FileNotFoundError(f"fixture image missing for {config['name']}: {image}")
+        expected = config["expected"]
+        if not isinstance(expected, dict) or set(expected) != set(VALIDATION_STAGES):
+            raise ValueError(
+                f"case {config['name']} expected stages must exactly match "
+                f"{', '.join(VALIDATION_STAGES)}"
+            )
+        if not all(isinstance(value, bool) for value in expected.values()):
+            raise ValueError(f"case {config['name']} expected stages must be booleans")
         cases.append(EvalCase(
             name=config["name"],
             fixture_image=image,
             source=PageExtraction.from_dict(config["source"]),
             translation=PageResult.from_dict(config["translation"]),
             glossary=TerminologyMap.from_dict(config["glossary"]),
-            expected=config["expected"],
+            expected=expected,
         ))
     return cases
 
