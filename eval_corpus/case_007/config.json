@@ -8,8 +8,8 @@
   "source": {
     "page_number": 7,
     "image_path": "page.png",
-    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    "phash": "bbbbbbbbbbbbbbbb",
+    "sha256": "befd4fe434d8d690e0bc5835a14da10e8b45986d053c6438992f50f687a8916c",
+    "phash": "850f6afe2fe0681c",
     "source_lang": "en",
     "model": "synthetic-fixture",
     "blocks": [
@@ -32,8 +32,8 @@
   "translation": {
     "page_number": 7,
     "image_path": "page.png",
-    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    "phash": "bbbbbbbbbbbbbbbb",
+    "sha256": "befd4fe434d8d690e0bc5835a14da10e8b45986d053c6438992f50f687a8916c",
+    "phash": "850f6afe2fe0681c",
     "source_lang": "en",
     "target_lang": "fr",
     "page_text": "The valve opens at noon. Times use local solar time.",

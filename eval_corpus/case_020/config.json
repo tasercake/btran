@@ -8,8 +8,8 @@
   "source": {
     "page_number": 20,
     "image_path": "page.png",
-    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    "phash": "bbbbbbbbbbbbbbbb",
+    "sha256": "f76e719053a6a02aeb9b8da4da820c986b4947013b45bd2e5742de463dada4c5",
+    "phash": "951f6be06ac66ae0",
     "source_lang": "en",
     "model": "synthetic-fixture",
     "blocks": [
@@ -31,8 +31,8 @@
   "translation": {
     "page_number": 20,
     "image_path": "page.png",
-    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    "phash": "bbbbbbbbbbbbbbbb",
+    "sha256": "f76e719053a6a02aeb9b8da4da820c986b4947013b45bd2e5742de463dada4c5",
+    "phash": "951f6be06ac66ae0",
     "source_lang": "en",
     "target_lang": "fr",
     "page_text": "The engine of the story moves the plot.",

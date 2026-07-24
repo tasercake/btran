@@ -4,8 +4,8 @@
   "source": {
     "page_number": 1,
     "image_path": "page.png",
-    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    "phash": "bbbbbbbbbbbbbbbb",
+    "sha256": "3bde8eb0738b4f434be2e69beed985d4a93aed77fe25100918a9c197266abd8a",
+    "phash": "953fdac06bc06b61",
     "source_lang": "en",
     "model": "synthetic-fixture",
     "blocks": [
@@ -34,8 +34,8 @@
   "translation": {
     "page_number": 1,
     "image_path": "page.png",
-    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    "phash": "bbbbbbbbbbbbbbbb",
+    "sha256": "3bde8eb0738b4f434be2e69beed985d4a93aed77fe25100918a9c197266abd8a",
+    "phash": "953fdac06bc06b61",
     "source_lang": "en",
     "target_lang": "ja",
     "page_text": "Recipe Card Add water slowly. Stir for three minutes.",

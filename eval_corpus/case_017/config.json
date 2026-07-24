@@ -8,8 +8,8 @@
   "source": {
     "page_number": 17,
     "image_path": "page.png",
-    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    "phash": "bbbbbbbbbbbbbbbb",
+    "sha256": "74b0b386cb6243aac128e11c5d8a2366571c3597c128d6de275b2fe6db736fc0",
+    "phash": "950f6ae06ec66af0",
     "source_lang": "en",
     "model": "synthetic-fixture",
     "blocks": [
@@ -26,8 +26,8 @@
   "translation": {
     "page_number": 17,
     "image_path": "page.png",
-    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    "phash": "bbbbbbbbbbbbbbbb",
+    "sha256": "74b0b386cb6243aac128e11c5d8a2366571c3597c128d6de275b2fe6db736fc0",
+    "phash": "950f6ae06ec66af0",
     "source_lang": "en",
     "target_lang": "ja",
     "page_text": "Turn the handle clockwise.",

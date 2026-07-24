@@ -8,8 +8,8 @@
   "source": {
     "page_number": 9,
     "image_path": "page.png",
-    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    "phash": "bbbbbbbbbbbbbbbb",
+    "sha256": "663dd04430e90859d02c0c8e03f4ccbdba255643e006c60545ecfa9f332ec852",
+    "phash": "850f6ae06fe16af0",
     "source_lang": "en",
     "model": "synthetic-fixture",
     "blocks": [
@@ -26,8 +26,8 @@
   "translation": {
     "page_number": 9,
     "image_path": "page.png",
-    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    "phash": "bbbbbbbbbbbbbbbb",
+    "sha256": "663dd04430e90859d02c0c8e03f4ccbdba255643e006c60545ecfa9f332ec852",
+    "phash": "850f6ae06fe16af0",
     "source_lang": "en",
     "target_lang": "ja",
     "page_text": "Press the 開始 button to begin.",

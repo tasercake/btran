@@ -8,8 +8,8 @@
   "source": {
     "page_number": 16,
     "image_path": "page.png",
-    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    "phash": "bbbbbbbbbbbbbbbb",
+    "sha256": "4fec002414991558312e0661bce250e7f9b8172f7d4923dba6d6272d77f5ece5",
+    "phash": "851f7ae26fe06a18",
     "source_lang": "en",
     "model": "synthetic-fixture",
     "blocks": [
@@ -32,8 +32,8 @@
   "translation": {
     "page_number": 16,
     "image_path": "page.png",
-    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    "phash": "bbbbbbbbbbbbbbbb",
+    "sha256": "4fec002414991558312e0661bce250e7f9b8172f7d4923dba6d6272d77f5ece5",
+    "phash": "851f7ae26fe06a18",
     "source_lang": "en",
     "target_lang": "fr",
     "page_text": "The lantern is lit. The path is clear.",

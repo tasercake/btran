@@ -4,8 +4,8 @@
   "source": {
     "page_number": 1,
     "image_path": "page.png",
-    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    "phash": "bbbbbbbbbbbbbbbb",
+    "sha256": "e968ff8243af4c25bdeecb9f184fae14a12edd96ab12c4972a7dfbc8b8da7ebc",
+    "phash": "953fdac06bc06b61",
     "source_lang": "en",
     "model": "synthetic-fixture",
     "blocks": [
@@ -43,8 +43,8 @@
   "translation": {
     "page_number": 1,
     "image_path": "page.png",
-    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    "phash": "bbbbbbbbbbbbbbbb",
+    "sha256": "e968ff8243af4c25bdeecb9f184fae14a12edd96ab12c4972a7dfbc8b8da7ebc",
+    "phash": "953fdac06bc06b61",
     "source_lang": "en",
     "target_lang": "de",
     "page_text": "Engine Notes The engine must cool before service.",

@@ -4,6 +4,7 @@ import base64
 import json
 
 from btran.eval_harness import load_eval_cases, run_corpus
+from btran.hasher import compute_phash, compute_sha256
 
 
 PNG_1X1 = base64.b64decode(
@@ -40,7 +41,11 @@ def case_config(name, *, target_text="Bonjour le monde et merci", expected=None)
 def write_case(root, config):
     case_dir = root / config["name"]
     case_dir.mkdir()
-    (case_dir / "page.png").write_bytes(PNG_1X1)
+    image_path = case_dir / "page.png"
+    image_path.write_bytes(PNG_1X1)
+    for artifact in (config["source"], config["translation"]):
+        artifact["sha256"] = compute_sha256(image_path)
+        artifact["phash"] = compute_phash(image_path)
     (case_dir / "config.json").write_text(json.dumps(config))
 
 
@@ -62,6 +67,20 @@ def test_load_eval_cases_requires_non_empty_string_risk_tags(tmp_path):
     import pytest
 
     with pytest.raises(ValueError, match="risk_tags"):
+        load_eval_cases(tmp_path)
+
+
+def test_load_eval_cases_rejects_fixture_identity_that_does_not_match_its_binary(tmp_path):
+    config = case_config("case_bad_fixture_identity")
+    write_case(tmp_path, config)
+    config_path = tmp_path / config["name"] / "config.json"
+    persisted = json.loads(config_path.read_text())
+    persisted["source"]["sha256"] = "f" * 64
+    config_path.write_text(json.dumps(persisted))
+
+    import pytest
+
+    with pytest.raises(ValueError, match="fixture sha256"):
         load_eval_cases(tmp_path)
 
 
@@ -95,20 +114,33 @@ def test_run_corpus_asserts_expected_stage_results_and_writes_json_report(tmp_pa
     assert report["failed"] == 0
     assert json.loads(report_path.read_text()) == report
     assert report["cases"][1]["stages"]["translation_language"]["passed"] is True
+    assert report["risk_tag_counts"] == {"test-fixture": 2}
+    assert report["validator_outcomes"]["translation_language"] == {
+        "expected_valid": 1,
+        "expected_invalid": 1,
+        "actual_valid": 1,
+        "actual_invalid": 1,
+    }
 
 
-def test_repository_corpus_has_reviewed_size_category_coverage_and_runs_cleanly():
+def test_repository_corpus_has_reviewed_size_category_and_outcome_coverage_and_runs_cleanly():
     corpus = __import__("pathlib").Path(__file__).parents[2] / "eval_corpus"
 
     cases = load_eval_cases(corpus)
     report = run_corpus(corpus)
-    tags = {tag for case in cases for tag in case.risk_tags}
+
+    fixture_sizes = [case.fixture_image.stat().st_size for case in cases]
 
     assert 20 <= len(cases) <= 50
+    assert max(fixture_sizes) <= 16 * 1024
+    assert sum(fixture_sizes) <= 200 * 1024
     assert {
         "headings-paragraphs", "lists", "tables", "footnotes", "captions-illustrations",
         "columns-reading-order", "mixed-language", "blank-near-blank", "low-content-risk",
         "low-resolution-risk", "malformed-blocks", "block-id-mismatch", "wrong-target-language",
         "terminology-consistency", "terminology-aliases", "terminology-context-variants",
-    } <= tags
+    } <= set(report["risk_tag_counts"])
     assert report["all_passed"] is True
+    for stage_counts in report["validator_outcomes"].values():
+        assert stage_counts["actual_valid"] > 0
+        assert stage_counts["actual_invalid"] > 0

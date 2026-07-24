@@ -8,8 +8,8 @@
   "source": {
     "page_number": 18,
     "image_path": "page.png",
-    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    "phash": "bbbbbbbbbbbbbbbb",
+    "sha256": "7ea5fc08ff7dcb296f1153732798e6ab7f03171c38f07270e5ff3f568085a2d9",
+    "phash": "951f6ae06ec26af0",
     "source_lang": "en",
     "model": "synthetic-fixture",
     "blocks": [
@@ -31,8 +31,8 @@
   "translation": {
     "page_number": 18,
     "image_path": "page.png",
-    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    "phash": "bbbbbbbbbbbbbbbb",
+    "sha256": "7ea5fc08ff7dcb296f1153732798e6ab7f03171c38f07270e5ff3f568085a2d9",
+    "phash": "951f6ae06ec26af0",
     "source_lang": "en",
     "target_lang": "fr",
     "page_text": "The engine starts after inspection.",

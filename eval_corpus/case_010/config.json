@@ -9,8 +9,8 @@
   "source": {
     "page_number": 10,
     "image_path": "page.png",
-    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    "phash": "bbbbbbbbbbbbbbbb",
+    "sha256": "85e9da87be70647c084dc7da5e7b5ecae9cd3dfb642c03adb426ad2da21dc45c",
+    "phash": "850f2be06ae07ef8",
     "source_lang": "en",
     "model": "synthetic-fixture",
     "blocks": [
@@ -27,8 +27,8 @@
   "translation": {
     "page_number": 10,
     "image_path": "page.png",
-    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    "phash": "bbbbbbbbbbbbbbbb",
+    "sha256": "85e9da87be70647c084dc7da5e7b5ecae9cd3dfb642c03adb426ad2da21dc45c",
+    "phash": "850f2be06ae07ef8",
     "source_lang": "en",
     "target_lang": "fr",
     "page_text": "Blank source test",

@@ -8,8 +8,8 @@
   "source": {
     "page_number": 19,
     "image_path": "page.png",
-    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    "phash": "bbbbbbbbbbbbbbbb",
+    "sha256": "3c029de005da5d6ad6f755d9c1a5d91de835fcff05d90289738d4ac7366e505b",
+    "phash": "951f6be07ac163e0",
     "source_lang": "en",
     "model": "synthetic-fixture",
     "blocks": [
@@ -35,8 +35,8 @@
   "translation": {
     "page_number": 19,
     "image_path": "page.png",
-    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    "phash": "bbbbbbbbbbbbbbbb",
+    "sha256": "3c029de005da5d6ad6f755d9c1a5d91de835fcff05d90289738d4ac7366e505b",
+    "phash": "951f6be07ac163e0",
     "source_lang": "en",
     "target_lang": "fr",
     "page_text": "The harbor is quiet; the port gate is closed.",

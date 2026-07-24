@@ -8,8 +8,8 @@
   "source": {
     "page_number": 6,
     "image_path": "page.png",
-    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    "phash": "bbbbbbbbbbbbbbbb",
+    "sha256": "1c363d7cccbda583e5e287b4fcef7f20de81e294b8154d4625f5977f60f1595a",
+    "phash": "850f6a3e2fe07a1c",
     "source_lang": "en",
     "model": "synthetic-fixture",
     "blocks": [
@@ -32,8 +32,8 @@
   "translation": {
     "page_number": 6,
     "image_path": "page.png",
-    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    "phash": "bbbbbbbbbbbbbbbb",
+    "sha256": "1c363d7cccbda583e5e287b4fcef7f20de81e294b8154d4625f5977f60f1595a",
+    "phash": "850f6a3e2fe07a1c",
     "source_lang": "en",
     "target_lang": "fr",
     "page_text": "Weather log Day | Wind | Rain; Mon | calm | 2 mm",

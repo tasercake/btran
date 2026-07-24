@@ -4,8 +4,8 @@
   "source": {
     "page_number": 1,
     "image_path": "page.png",
-    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    "phash": "bbbbbbbbbbbbbbbb",
+    "sha256": "5d4d163992e6dfa26436b31be0cde12ed27480c61bc7b9ba79cc77a9eae74959",
+    "phash": "953fdac06bc06b61",
     "source_lang": "fr",
     "model": "synthetic-fixture",
     "blocks": [
@@ -35,13 +35,15 @@
       }
     ],
     "term_mentions": [],
-    "illustrations": []
+    "illustrations": [
+      "sundial sketch"
+    ]
   },
   "translation": {
     "page_number": 1,
     "image_path": "page.png",
-    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    "phash": "bbbbbbbbbbbbbbbb",
+    "sha256": "5d4d163992e6dfa26436b31be0cde12ed27480c61bc7b9ba79cc77a9eae74959",
+    "phash": "953fdac06bc06b61",
     "source_lang": "fr",
     "target_lang": "en",
     "page_text": "Journal de bord La mer est calme. Nous partirons après le lever du soleil.",
@@ -92,7 +94,9 @@
     ],
     "image_descriptions": [],
     "term_mentions": [],
-    "illustrations": []
+    "illustrations": [
+      "sundial sketch"
+    ]
   },
   "glossary": {
     "version": "1.0",
@@ -105,12 +109,13 @@
     "block_schema": true,
     "non_empty_text": true,
     "translation_language": true,
-    "illustration_count": true,
+    "illustration_count": false,
     "block_id_correspondence": true,
     "glossary_consistency": true
   },
   "risk_tags": [
     "synthetic-fixture",
-    "headings-paragraphs"
+    "captions-illustrations",
+    "illustration-count-mismatch"
   ]
 }
