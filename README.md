@@ -18,7 +18,7 @@ The CLI requires `INPUT_DIR`, `OUTPUT_EPUB`, and a target language (flag or
 `BTRAN_TARGET_LANG`). CLI options override `.env` values. See `.env.example`
 for the complete production configuration surface.
 
-Useful final-run controls:
+Useful final-run controls (consumed by the Gate 1 orchestration integration):
 
 - `--manifest-path PATH` selects a manifest explicitly. The default is
   `INPUT_DIR/manifest.json`; relative paths also resolve beneath `INPUT_DIR`,
@@ -35,7 +35,12 @@ Resource bounds: concurrency is 1–32, `--max-retries` is 1–10 total attempts
 Preflight is always enabled. Reconciliation is fixed to one round, and the eval
 corpus remains a developer harness rather than a production CLI control.
 
-## How it works
+This CLI/configuration boundary intentionally does not alter orchestration.
+The WP-7 runner consumes these controls; until that runner is integrated, the
+legacy runner does not implement manifest, preflight-only, review, or EPUBCheck
+behavior.
+
+## Pipeline behavior after WP-7 integration
 
 1. Builds or loads an input manifest and preflights every page
 2. Translates pages through `pi` with bounded concurrency and attempts
