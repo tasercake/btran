@@ -1,6 +1,5 @@
 """Behavior tests for the semantic EPUB 3 renderer."""
 
-import subprocess
 import zipfile
 from pathlib import Path
 from xml.etree import ElementTree as ET
@@ -19,6 +18,7 @@ def make_page(
     page_number: int,
     *,
     page_text: str = "",
+    translated_text: str = "",
     blocks: list[SourceBlock] | None = None,
     translated_blocks: list[TranslatedBlock] | None = None,
     image_path: str = "",
@@ -32,6 +32,7 @@ def make_page(
         source_lang="en",
         target_lang="fr",
         page_text=page_text,
+        translated_text=translated_text,
         blocks=blocks or [],
         translated_blocks=translated_blocks or [],
         illustrations=illustrations or [],
@@ -203,6 +204,13 @@ def test_epubcheck_reports_zero_errors_for_semantic_epub(tmp_path):
                     block("h", "heading_1", "Checked", 1),
                     block("section", "heading_2", "Checked section", 2),
                     block("p", "paragraph", "A valid EPUB 3 document.", 3),
+                    block("item-one", "list_item", "First item", 4),
+                    block("item-two", "list_item", "Second item", 5),
+                    block("table", "table", "Name\tValue\nOne\t1", 6),
+                    block("caption", "caption", "A figure caption", 7),
+                    block("note", "footnote", "A footnote", 8),
+                    block("quote", "pull_quote", "A pull quote", 9),
+                    block("illustration", "illustration", "A diagram", 10),
                 ],
             )
         ],
@@ -210,12 +218,122 @@ def test_epubcheck_reports_zero_errors_for_semantic_epub(tmp_path):
         title="EPUBCheck fixture",
         author="btran",
         target_lang="en",
+        epub_check=True,
+        epub_check_path="/home/exedev/.local/bin/epubcheck",
     )
 
-    result = subprocess.run(
-        ["/home/exedev/.local/bin/epubcheck", str(output)],
-        text=True,
-        capture_output=True,
-        check=False,
+
+def test_flat_text_fallback_preserves_legacy_translation(tmp_path):
+    output = tmp_path / "legacy-translation.epub"
+    build_epub(
+        [make_page(1, page_text="Original", translated_text="Translated & <safe>")],
+        output,
+        target_lang="fr",
     )
-    assert result.returncode == 0, result.stdout + result.stderr
+
+    chapter = chapter_documents(output)[0]
+    assert "Original" in chapter
+    assert "Translated &amp; &lt;safe&gt;" in chapter
+
+
+def test_supported_blocks_render_semantic_list_quote_and_illustration(tmp_path):
+    output = tmp_path / "supported-blocks.epub"
+    build_epub(
+        [
+            make_page(
+                1,
+                blocks=[
+                    block("heading", "heading", "Chapter", 0),
+                    block("one", "list_item", "Source one", 1),
+                    block("two", "list_item", "Source two", 2),
+                    block("quote", "pull_quote", "Source quote", 3),
+                    block("illustration", "illustration", "Source diagram", 4),
+                ],
+                # Join by source block IDs, not translation list position.
+                translated_blocks=[
+                    translated("illustration", "Translated diagram"),
+                    translated("quote", "Translated quote"),
+                    translated("two", "Translated two"),
+                    translated("heading", "Chapter"),
+                    translated("one", "Translated one"),
+                ],
+            )
+        ],
+        output,
+    )
+
+    chapter = chapter_documents(output)[0]
+    assert "<ul><li>Translated one</li><li>Translated two</li></ul>" in chapter
+    assert "<blockquote>Translated quote</blockquote>" in chapter
+    assert "<figure><figcaption>Translated diagram</figcaption></figure>" in chapter
+
+
+def test_each_level_one_heading_starts_a_chapter_even_within_one_page(tmp_path):
+    output = tmp_path / "two-headings.epub"
+    build_epub(
+        [
+            make_page(
+                1,
+                blocks=[
+                    block("first", "heading_1", "First", 0),
+                    block("first-text", "paragraph", "First text", 1),
+                    block("second", "heading_1", "Second", 2),
+                    block("second-text", "paragraph", "Second text", 3),
+                ],
+            )
+        ],
+        output,
+    )
+
+    chapters = chapter_documents(output)
+    assert len(chapters) == 2
+    assert "First text" in chapters[0] and "Second text" not in chapters[0]
+    assert "Second text" in chapters[1] and "First text" not in chapters[1]
+
+
+def test_untrusted_control_characters_are_replaced_before_xhtml_serialization(tmp_path):
+    output = tmp_path / "safe-xhtml.epub"
+    build_epub(
+        [make_page(1, blocks=[block("p", "paragraph", "bad\x08text", 0)])],
+        output,
+        target_lang="en\x08",
+    )
+
+    chapter = chapter_documents(output)[0]
+    assert "\x08" not in chapter
+    assert "bad\ufffdtext" in chapter
+    ET.fromstring(chapter)
+
+
+def test_untrusted_heading_text_is_safe_in_toc_metadata(tmp_path):
+    output = tmp_path / "safe-toc.epub"
+    build_epub(
+        [make_page(1, blocks=[block("h", "heading", "bad\x08heading", 0)])],
+        output,
+    )
+
+    documents = epub_files(output)
+    assert "bad\ufffdheading" in next(
+        content for name, content in documents.items() if name.endswith("nav.xhtml")
+    )
+    for document in documents.values():
+        ET.fromstring(document)
+
+
+def test_epubcheck_failure_keeps_existing_output_unchanged(tmp_path, monkeypatch):
+    output = tmp_path / "existing.epub"
+    output.write_bytes(b"known-good-output")
+
+    def fail_check(path, executable):
+        assert path != output
+        raise RuntimeError("invalid epub")
+
+    monkeypatch.setattr("btran.epub_builder.check_epub", fail_check, raising=False)
+    with pytest.raises(RuntimeError, match="invalid epub"):
+        build_epub(
+            [make_page(1, blocks=[block("h", "heading", "Chapter", 0)])],
+            output,
+            epub_check=True,
+        )
+
+    assert output.read_bytes() == b"known-good-output"

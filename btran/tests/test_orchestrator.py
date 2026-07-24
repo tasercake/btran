@@ -405,3 +405,27 @@ class TestPartialFailureSummary:
         captured = capsys.readouterr()
         assert "1/2 pages translated" in captured.out
         assert "1 failed" in captured.out
+
+
+def test_compile_epub_passes_epubcheck_configuration_to_builder(tmp_path: Path):
+    """The Gate 0 EPUBCheck options reach the semantic EPUB writer."""
+    from btran.orchestrator import _compile_epub
+
+    input_dir = tmp_path / "scans"
+    input_dir.mkdir()
+    intermediate_dir = tmp_path / "intermediate"
+    intermediate_dir.mkdir()
+    config = _make_config(
+        input_dir,
+        intermediate_dir,
+        tmp_path / "cache.db",
+        epub_check=True,
+        epub_check_path="/opt/epubcheck",
+    )
+    _make_page_result().to_file(intermediate_dir / "page_0001.json")
+
+    with patch("btran.orchestrator.build_epub") as build:
+        _compile_epub(config, [1], [])
+
+    assert build.call_args.kwargs["epub_check"] is True
+    assert build.call_args.kwargs["epub_check_path"] == "/opt/epubcheck"

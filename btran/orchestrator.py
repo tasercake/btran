@@ -308,6 +308,8 @@ def _compile_epub(
         source_lang=config.source_lang,
         target_lang=config.target_lang,
         embed_images=config.embed_images,
+        epub_check=config.epub_check,
+        epub_check_path=config.epub_check_path,
     )
     print(f"EPUB written to {config.output_epub}")
 
