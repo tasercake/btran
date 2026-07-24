@@ -201,8 +201,18 @@ class TestImageCache:
                 phash="b" * 16,
                 image_path="/tmp/img.png",
                 result=result,
+                source_lang="en",
+                target_lang="fr",
+                model="gpt-5",
+                prompt_version="v1",
             )
-            cached = cache.lookup("a" * 64)
+            cached = cache.lookup(
+                "a" * 64,
+                source_lang="en",
+                target_lang="fr",
+                model="gpt-5",
+                prompt_version="v1",
+            )
             assert cached is not None
             assert cached.page_number == 3
             assert cached.page_text == "hello world"
@@ -215,7 +225,13 @@ class TestImageCache:
         db = tmp_path / "cache.db"
         cache = ImageCache(db)
         try:
-            assert cache.lookup("0" * 64) is None
+            assert cache.lookup(
+                "0" * 64,
+                source_lang="en",
+                target_lang="fr",
+                model="gpt-5",
+                prompt_version="v1",
+            ) is None
         finally:
             cache.close()
 
@@ -233,9 +249,15 @@ class TestImageCache:
         cache = ImageCache(db)
         try:
             result = _make_result(page_number=1, page_text="first page")
-            cache.store("a" * 64, phash1, str(p1), result)
+            cache.store(
+                "a" * 64, phash1, str(p1), result,
+                source_lang="en", target_lang="fr", model="gpt-5", prompt_version="v1",
+            )
 
-            found = cache.lookup_perceptual(phash2, threshold=30)
+            found = cache.lookup_perceptual(
+                phash2, threshold=30,
+                source_lang="en", target_lang="fr", model="gpt-5", prompt_version="v1",
+            )
             assert found is not None
             assert found.page_number == 1
             assert found.page_text == "first page"
@@ -256,9 +278,15 @@ class TestImageCache:
         cache = ImageCache(db)
         try:
             result = _make_result(page_number=1, page_text="noise a page")
-            cache.store("a" * 64, phash1, str(p1), result)
+            cache.store(
+                "a" * 64, phash1, str(p1), result,
+                source_lang="en", target_lang="fr", model="gpt-5", prompt_version="v1",
+            )
 
-            found = cache.lookup_perceptual(phash2, threshold=5)
+            found = cache.lookup_perceptual(
+                phash2, threshold=5,
+                source_lang="en", target_lang="fr", model="gpt-5", prompt_version="v1",
+            )
             assert found is None
         finally:
             cache.close()
@@ -284,21 +312,33 @@ class TestImageCache:
         db = tmp_path / "cache.db"
         cache = ImageCache(db)
         try:
-            cache.store(sha, ph, str(p), result)
+            cache.store(
+                sha, ph, str(p), result,
+                source_lang="en", target_lang="fr", model="gpt-5", prompt_version="v1",
+            )
 
             # Exact lookup
-            cached = cache.lookup(sha)
+            cached = cache.lookup(
+                sha,
+                source_lang="en", target_lang="fr", model="gpt-5", prompt_version="v1",
+            )
             assert cached is not None
             assert cached.page_number == 7
             assert cached.page_text == "gradient translated"
 
             # Perceptual lookup on the same hash
-            cached2 = cache.lookup_perceptual(ph, threshold=0)
+            cached2 = cache.lookup_perceptual(
+                ph, threshold=0,
+                source_lang="en", target_lang="fr", model="gpt-5", prompt_version="v1",
+            )
             assert cached2 is not None
             assert cached2.page_number == 7
 
             # Non-existent exact lookup
-            assert cache.lookup("f" * 64) is None
+            assert cache.lookup(
+                "f" * 64,
+                source_lang="en", target_lang="fr", model="gpt-5", prompt_version="v1",
+            ) is None
         finally:
             cache.close()
 
@@ -308,12 +348,18 @@ class TestImageCache:
 
         db = tmp_path / "cache.db"
         cache1 = ImageCache(db)
-        cache1.store("a" * 64, "b" * 16, "/tmp/x.png", _make_result(page_text="hi"))
+        cache1.store(
+            "a" * 64, "b" * 16, "/tmp/x.png", _make_result(page_text="hi"),
+            source_lang="en", target_lang="fr", model="gpt-5", prompt_version="v1",
+        )
         cache1.close()
 
         cache2 = ImageCache(db)
         try:
-            cached = cache2.lookup("a" * 64)
+            cached = cache2.lookup(
+                "a" * 64,
+                source_lang="en", target_lang="fr", model="gpt-5", prompt_version="v1",
+            )
             assert cached is not None
             assert cached.page_text == "hi"
         finally:
@@ -326,12 +372,18 @@ class TestImageCache:
         cache = ImageCache(db)
         try:
             cache.store(
-                "a" * 64, "b" * 16, "/tmp/x.png", _make_result(page_text="v1")
+                "a" * 64, "b" * 16, "/tmp/x.png", _make_result(page_text="v1"),
+                source_lang="en", target_lang="fr", model="gpt-5", prompt_version="v1",
             )
             cache.store(
-                "a" * 64, "c" * 16, "/tmp/y.png", _make_result(page_number=2, page_text="v2")
+                "a" * 64, "c" * 16, "/tmp/y.png",
+                _make_result(page_number=2, page_text="v2"),
+                source_lang="en", target_lang="fr", model="gpt-5", prompt_version="v1",
             )
-            cached = cache.lookup("a" * 64)
+            cached = cache.lookup(
+                "a" * 64,
+                source_lang="en", target_lang="fr", model="gpt-5", prompt_version="v1",
+            )
             assert cached is not None
             assert cached.page_number == 2
             assert cached.page_text == "v2"

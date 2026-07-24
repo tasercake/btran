@@ -13,9 +13,14 @@ from typing import Callable
 
 from btran.config import Config
 from btran.epub_builder import build_epub
-from btran.hasher import ImageCache, compute_sha256, compute_phash
+from btran.hasher import (
+    ImageCache,
+    compute_phash,
+    compute_prompt_fingerprint,
+    compute_sha256,
+)
 from btran.schema import ErrorResult, PageResult
-from btran.translator import TranslationError, translate_image
+from btran.translator import TRANSLATION_PROMPT, TranslationError, translate_image
 
 
 @dataclass
@@ -84,13 +89,22 @@ async def run(
         if pn not in expected_pages:
             existing.unlink(missing_ok=True)
 
-    # 3. Open ImageCache
+    # 3. Compute semantic cache context
+    prompt_version = compute_prompt_fingerprint(TRANSLATION_PROMPT)
+    cache_ctx = dict(
+        source_lang=config.source_lang,
+        target_lang=config.target_lang,
+        model=config.model,
+        prompt_version=prompt_version,
+    )
+
+    # 4. Open ImageCache
     cache = ImageCache(config.cache_db)
 
     total = len(image_files)
     errors: list[str] = []
 
-    # 4. For each image: hash it, check cache, build pending list
+    # 5. For each image: hash it, check cache, build pending list
     pending: list[tuple[int, Path, str, str]] = []  # (page_number, path, sha256, phash)
     completed = 0
     failed = 0
@@ -101,17 +115,21 @@ async def run(
         phash = compute_phash(image_path)
 
         if not config.no_resume:
-            cached = cache.lookup(sha256)
+            cached = cache.lookup(sha256, **cache_ctx)
             if cached is not None:
-                _write_intermediate(cached, config.intermediate_dir, page_number)
+                _write_intermediate(
+                    cached, config.intermediate_dir, page_number, image_path
+                )
                 completed += 1
                 pct = int(completed / total * 100)
                 print(f"✓ page {page_number}/{total} ({pct}%)")
                 continue
 
-            cached = cache.lookup_perceptual(phash)
+            cached = cache.lookup_perceptual(phash, **cache_ctx)
             if cached is not None:
-                _write_intermediate(cached, config.intermediate_dir, page_number)
+                _write_intermediate(
+                    cached, config.intermediate_dir, page_number, image_path
+                )
                 completed += 1
                 pct = int(completed / total * 100)
                 print(f"✓ page {page_number}/{total} ({pct}%)")
@@ -175,7 +193,7 @@ async def run(
 
             if isinstance(result, PageResult):
                 async with cache_lock:
-                    cache.store(sha, ph, str(img_path), result)
+                    cache.store(sha, ph, str(img_path), result, **cache_ctx)
 
             async with results_lock:
                 if isinstance(result, ErrorResult):
@@ -192,7 +210,7 @@ async def run(
                 pct = int(completed / total * 100)
                 print(f"{symbol} page {pn}/{total} ({pct}%)")
 
-    # 6. Run all pending tasks
+    # 7. Run all pending tasks
     if pending:
         tasks = [asyncio.create_task(process_one(pn, ip, sha, ph)) for pn, ip, sha, ph in pending]
 
@@ -295,10 +313,18 @@ def _compile_epub(
 
 
 def _write_intermediate(
-    cached: PageResult, intermediate_dir: Path, page_number: int
+    cached: PageResult,
+    intermediate_dir: Path,
+    page_number: int,
+    current_image_path: Path,
 ) -> None:
-    """Write a cached result to an intermediate JSON file (atomic)."""
+    """Write a cached result to an intermediate JSON file (atomic).
+
+    Updates page_number and image_path to reflect the current run so that
+    cached rows never retain a stale source-image/page association.
+    """
     out_path = intermediate_dir / f"page_{page_number:04d}.json"
     cached.page_number = page_number
+    cached.image_path = str(current_image_path)
     result_json = json.dumps(cached.to_dict(), indent=2, ensure_ascii=False) + "\n"
     _atomic_write(out_path, result_json)

@@ -314,7 +314,10 @@ class TestRunManifest:
         img1 = input_dir / "a.png"
         _make_test_image(img1, color=(255, 0, 0))
 
-        from btran.hasher import compute_sha256, compute_phash
+        from btran.hasher import compute_phash, compute_prompt_fingerprint, compute_sha256
+        from btran.translator import TRANSLATION_PROMPT
+
+        prompt_v = compute_prompt_fingerprint(TRANSLATION_PROMPT)
         sha1 = compute_sha256(img1)
         ph1 = compute_phash(img1)
         cached = PageResult(
@@ -323,7 +326,11 @@ class TestRunManifest:
             page_text="cached", translated_text="cached",
         )
         icache = ImageCache(cache_db)
-        icache.store(sha1, ph1, str(img1), cached)
+        icache.store(
+            sha1, ph1, str(img1), cached,
+            source_lang="ja", target_lang="en", model=config.model,
+            prompt_version=prompt_v,
+        )
         icache.close()
 
         mock_translate = AsyncMock()
