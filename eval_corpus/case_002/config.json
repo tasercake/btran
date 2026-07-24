@@ -1,0 +1,102 @@
+{
+  "name": "case_002",
+  "fixture_image": "page.png",
+  "source": {
+    "page_number": 1,
+    "image_path": "page.png",
+    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "phash": "bbbbbbbbbbbbbbbb",
+    "source_lang": "en",
+    "model": "synthetic-fixture",
+    "blocks": [
+      {
+        "id": "h1",
+        "type": "heading",
+        "text": "A Map for the Crossing",
+        "reading_order": 0
+      },
+      {
+        "id": "p1",
+        "type": "paragraph",
+        "text": "Follow the northern road.",
+        "reading_order": 1
+      },
+      {
+        "id": "cap",
+        "type": "caption",
+        "text": "Map showing the northern road.",
+        "reading_order": 2
+      }
+    ],
+    "term_mentions": [],
+    "illustrations": [
+      "map diagram"
+    ]
+  },
+  "translation": {
+    "page_number": 1,
+    "image_path": "page.png",
+    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "phash": "bbbbbbbbbbbbbbbb",
+    "source_lang": "en",
+    "target_lang": "es",
+    "page_text": "A Map for the Crossing Follow the northern road.",
+    "translated_text": "Un mapa para el cruce. Sigue el camino del norte y usa la brújula.",
+    "blocks": [
+      {
+        "id": "h1",
+        "type": "heading",
+        "text": "A Map for the Crossing",
+        "reading_order": 0
+      },
+      {
+        "id": "p1",
+        "type": "paragraph",
+        "text": "Follow the northern road.",
+        "reading_order": 1
+      },
+      {
+        "id": "cap",
+        "type": "caption",
+        "text": "Map showing the northern road.",
+        "reading_order": 2
+      }
+    ],
+    "translated_blocks": [
+      {
+        "block_id": "h1",
+        "translated_text": "Un mapa para el cruce"
+      },
+      {
+        "block_id": "p1",
+        "translated_text": "Sigue el camino del norte."
+      },
+      {
+        "block_id": "cap",
+        "translated_text": "Mapa que muestra el camino del norte."
+      }
+    ],
+    "image_descriptions": [
+      "A map with a marked northern road."
+    ],
+    "term_mentions": [],
+    "illustrations": [
+      "map diagram"
+    ]
+  },
+  "glossary": {
+    "version": "1.0",
+    "hash": "synthetic",
+    "source_lang": "en",
+    "target_lang": "es",
+    "entries": []
+  },
+  "expected": {
+    "block_schema": true,
+    "non_empty_text": true,
+    "translation_language": true,
+    "illustration_count": true,
+    "block_id_correspondence": true,
+    "glossary_consistency": true
+  }
+}
