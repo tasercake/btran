@@ -13,6 +13,7 @@ from btran.terminology import (
     batch_term_groups,
     cache_identity_with_glossary,
     consolidate_terminology,
+    estimate_tokens,
     freeze_terminology,
     group_term_mentions,
     make_pi_consolidation_call,
@@ -45,15 +46,20 @@ def test_grouping_preserves_original_source_spelling_while_normalizing_its_key()
     assert groups[0].provenance == ("p1-b1",)
 
 
+def test_token_measurement_is_a_conservative_utf8_bound():
+    assert estimate_tokens("a b c") == 5
+    assert estimate_tokens("猫") == 3
+
+
 def test_batching_respects_requested_token_budget_and_rejects_oversized_budget():
     groups = group_term_mentions(
         [TermMention(term=f"term-{number}-with-text", block_id=f"p1-b{number}") for number in range(8)]
     )
 
-    batches = batch_term_groups(groups, token_budget=120)
+    batches = batch_term_groups(groups, token_budget=600)
 
     assert len(batches) > 1
-    assert all(batch.token_count <= 120 for batch in batches)
+    assert all(batch.token_count <= 600 for batch in batches)
     with pytest.raises(ValueError, match="120000"):
         batch_term_groups(groups, token_budget=120_001)
     assert HARD_TOKEN_CAP == 200_000
@@ -210,7 +216,7 @@ def test_consolidation_fails_when_multiple_batches_do_not_reduce_without_target_
             source_lang="en",
             target_lang="fr",
             pi_call=pi_call,
-            token_budget=120,
+            token_budget=500,
         )
 
 
@@ -255,7 +261,7 @@ def test_stable_sharding_builds_alias_index_for_oversized_map():
         target_lang="fr",
     )
 
-    sharded = shard_terminology_map(glossary, token_budget=25)
+    sharded = shard_terminology_map(glossary, token_budget=50)
 
     assert len(sharded.shards) > 1
     assert sharded.alias_index["alias 2"] == ("c2",)

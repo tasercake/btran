@@ -55,8 +55,13 @@ def normalize_term(term: str) -> str:
 
 
 def estimate_tokens(text: str) -> int:
-    """A deliberately simple, deterministic token estimate (about four chars/token)."""
-    return (len(text) + 3) // 4
+    """Return a deterministic conservative bound for UTF-8 tokenizer input.
+
+    A model tokenizer can split text differently by model and language, but it
+    cannot need more byte pieces than the UTF-8 input has bytes.  Counting bytes
+    avoids under-measuring short, CJK, and punctuation-heavy terminology.
+    """
+    return len(text.encode("utf-8"))
 
 
 def _validate_budget(token_budget: int) -> None:
