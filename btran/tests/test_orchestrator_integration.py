@@ -159,6 +159,81 @@ async def test_reconciliation_retranslates_only_affected_pages_once(tmp_path: Pa
 
 
 @pytest.mark.asyncio
+async def test_source_failure_callback_arrives_before_another_page_finishes(tmp_path: Path):
+    """A terminal page failure streams immediately; it does not wait for the extraction gate."""
+    cfg = config(tmp_path)
+    cfg.input_dir.mkdir(); image(cfg.input_dir / "a.png", (1, 2, 3)); image(cfg.input_dir / "b.png", (4, 5, 6))
+    reported = asyncio.Event()
+    failed_in_leaf = asyncio.Event()
+    release_second_page = asyncio.Event()
+
+    async def extract(_path, _source_lang, _model, _sha, _phash, page_number, _pi_bin, _timeout):
+        if page_number == 1:
+            failed_in_leaf.set()
+            raise RuntimeError("bad OCR")
+        await release_second_page.wait()
+        return extraction(page_number, cfg.input_dir / "b.png")
+
+    with patch("btran.orchestrator.extract_page", side_effect=extract):
+        task = asyncio.create_task(run(cfg, on_page_error=lambda _page, _message: reported.set()))
+        try:
+            await asyncio.wait_for(failed_in_leaf.wait(), timeout=2)
+            await asyncio.wait_for(reported.wait(), timeout=0.1)
+        finally:
+            release_second_page.set()
+            result = await task
+
+    assert result.errors and "page 1" in result.errors[0]
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_exception_is_reported_without_replacing_existing_epub(tmp_path: Path):
+    """A reconciliation leaf exception is a terminal gate failure, not an escaped task error."""
+    cfg = config(tmp_path)
+    cfg.input_dir.mkdir(); image(cfg.input_dir / "a.png", (1, 2, 3)); cfg.output_epub.write_bytes(b"old EPUB")
+    source = extraction(1, cfg.input_dir / "a.png")
+    with patch("btran.orchestrator.extract_page", AsyncMock(return_value=source)), \
+         patch("btran.orchestrator.translate_blocks", AsyncMock(return_value=translations(source))), \
+         patch("btran.orchestrator.reconcile", side_effect=RuntimeError("reconcile crashed")), \
+         patch("btran.orchestrator.build_epub") as epub:
+        result = await run(cfg)
+
+    assert result.errors == ["[btran] reconciliation failed: RuntimeError: reconcile crashed"]
+    assert cfg.output_epub.read_bytes() == b"old EPUB"
+    epub.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_resolved_glossary_correction_freezes_v2_before_translation(tmp_path: Path):
+    """A reviewed correction changes the frozen glossary and translation cache semantic input."""
+    cfg = config(tmp_path)
+    cfg.input_dir.mkdir(); image(cfg.input_dir / "a.png", (1, 2, 3))
+    source = extraction(1, cfg.input_dir / "a.png", "島")
+    from btran.orchestrator import _review_id
+    from btran.review import ReviewItem, write_items
+    write_items(cfg.intermediate_dir / "needs_review", [ReviewItem(
+        _review_id("low-confidence", "island", 1), "low_confidence", True,
+        {"concept_id": "island"}, status="resolved",
+        resolution={"action": "correct", "correction": "isle"},
+    )])
+
+    async def translate(extracted, frozen, **_):
+        assert frozen.version == "2"
+        assert frozen.entries[0].target_term == "isle"
+        return translations(extracted, "isle")
+
+    with patch("btran.orchestrator.extract_page", AsyncMock(return_value=source)), \
+         patch("btran.orchestrator.make_pi_consolidation_call", return_value=lambda _: json.dumps({"entries": [{"concept_id": "island", "source_terms": ["島"], "target_term": "island", "provenance": [source.blocks[0].id], "confidence": .2}]})), \
+         patch("btran.orchestrator.translate_blocks", side_effect=translate), \
+         patch("btran.orchestrator.build_epub") as epub:
+        result = await run(cfg)
+
+    assert result.errors == []
+    assert json.loads((cfg.intermediate_dir / "glossary.v2.json").read_text())["entries"][0]["target_term"] == "isle"
+    epub.assert_called_once()
+
+
+@pytest.mark.asyncio
 async def test_unresolved_review_item_blocks_epub_and_epubcheck_is_wired(tmp_path: Path):
     cfg = config(tmp_path, epub_check=True)
     cfg.input_dir.mkdir(); image(cfg.input_dir / "a.png", (1, 2, 3))

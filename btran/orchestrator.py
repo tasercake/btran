@@ -8,6 +8,7 @@ import os
 import tempfile
 import uuid
 from collections.abc import Awaitable, Callable
+from dataclasses import replace
 from pathlib import Path
 from typing import TypeVar
 
@@ -25,6 +26,7 @@ from btran.terminology import (
     HARD_TOKEN_CAP,
     MAX_TOKEN_BUDGET,
     consolidate_terminology,
+    freeze_terminology,
     make_pi_consolidation_call,
 )
 from btran.translator import translate_blocks, translation_cache_identity
@@ -104,6 +106,31 @@ def _review_id(kind: str, key: str, page: int | None = None) -> str:
     return f"{kind}-{digest}"
 
 
+def _next_glossary_version(version: str) -> str:
+    if version.isdigit():
+        return str(int(version) + 1)
+    parts = version.split(".")
+    if parts and parts[0].isdigit():
+        return ".".join([str(int(parts[0]) + 1), *(["0"] * (len(parts) - 1))])
+    return f"{version}-v2"
+
+
+def _apply_review_corrections(glossary: TerminologyMap, reviewed: dict[str, str]) -> TerminologyMap:
+    """Freeze operator-approved terminology changes before any translation call."""
+    unknown = set(reviewed) - {entry.concept_id for entry in glossary.entries}
+    if unknown:
+        raise ValueError(f"review corrections reference unknown concepts: {sorted(unknown)}")
+    entries = [replace(entry, target_term=reviewed.get(entry.concept_id, entry.target_term)) for entry in glossary.entries]
+    if all(before.target_term == after.target_term for before, after in zip(glossary.entries, entries)):
+        return glossary
+    return freeze_terminology(
+        entries,
+        source_lang=glossary.source_lang,
+        target_lang=glossary.target_lang,
+        version=_next_glossary_version(glossary.version),
+    )
+
+
 def _initial_review_items(glossary: TerminologyMap, paths: dict[int, Path]) -> list[ReviewItem]:
     items: list[ReviewItem] = []
     aliases: dict[str, list[str]] = {}
@@ -142,6 +169,7 @@ def _reconciliation_review_items(result: ReconciliationResult, paths: dict[int, 
 async def _parallel_pages(
     pages: list[tuple[int, Path]], concurrency: int,
     operation: Callable[[int, Path], Awaitable[T]],
+    on_terminal_failure: PageErrorCallback | None = None,
 ) -> tuple[dict[int, T], dict[int, str]]:
     """Run independent page operations with bounded concurrency and collect failures."""
     semaphore = asyncio.Semaphore(max(1, concurrency))
@@ -151,7 +179,10 @@ async def _parallel_pages(
             async with semaphore:
                 return number, await operation(number, path), None
         except Exception as exc:  # per-page containment is a workflow requirement
-            return number, None, f"{type(exc).__name__}: {exc}"
+            failure = f"{type(exc).__name__}: {exc}"
+            if on_terminal_failure is not None:
+                on_terminal_failure(number, failure)
+            return number, None, failure
 
     completed = await asyncio.gather(*(one(number, path) for number, path in pages))
     successes = {number: value for number, value, failure in completed if failure is None and value is not None}
@@ -238,10 +269,10 @@ async def run(config: Config, on_page_error: PageErrorCallback | None = None) ->
         to_file(result, work / "source" / f"page_{number:04d}.json")
         return result
 
-    extracted, failures = await _parallel_pages(processed, config.concurrency, extract)
+    extracted, failures = await _parallel_pages(processed, config.concurrency, extract, on_page_error)
     for number in sorted(failures):
         _atomic_json(work / "source" / f"page_{number:04d}.error.json", ErrorResult(number, str(original_paths[number]), failures[number], config.max_retries, config.model).to_dict())
-        _error(errors, number, failures[number], on_page_error)
+        _error(errors, number, failures[number], None)
     if failures or set(extracted) != set(state["expected_pages"]):
         _record_stage(state, checkpoint, "source_extraction", "failed", failed_pages=sorted(failures))
         _record_stage(state, checkpoint, "epub", "skipped", reason="source extraction gate")
@@ -270,9 +301,9 @@ async def run(config: Config, on_page_error: PageErrorCallback | None = None) ->
             pi_call = make_pi_consolidation_call(pi_bin=config.pi_bin, model=config.model, timeout=config.timeout)
             glossary = consolidate_terminology(mentions, source_lang=config.source_lang, target_lang=config.target_lang, pi_call=pi_call, token_budget=config.glossary_budget)
         else:
-            from btran.terminology import freeze_terminology
             glossary = freeze_terminology([], source_lang=config.source_lang, target_lang=config.target_lang)
-        _atomic_json(Path(config.glossary_path) if Path(config.glossary_path).is_absolute() else work / Path(config.glossary_path), glossary.to_dict())
+        glossary_file = Path(config.glossary_path) if Path(config.glossary_path).is_absolute() else work / Path(config.glossary_path)
+        _atomic_json(glossary_file, glossary.to_dict())
     except Exception as exc:
         errors.append(f"[btran] glossary failed: {type(exc).__name__}: {exc}")
         _record_stage(state, checkpoint, "glossary", "failed", reason=str(exc))
@@ -287,6 +318,18 @@ async def run(config: Config, on_page_error: PageErrorCallback | None = None) ->
         _record_stage(state, checkpoint, "review", "blocked", count=len(unresolved_items(reviews)))
         _record_stage(state, checkpoint, "epub", "skipped", reason="review gate")
         return RunResult(errors)
+    try:
+        glossary = _apply_review_corrections(glossary, corrections(reviews))
+    except Exception as exc:
+        errors.append(f"[btran] review failed: {type(exc).__name__}: {exc}")
+        _record_stage(state, checkpoint, "review", "failed", reason=str(exc))
+        _record_stage(state, checkpoint, "epub", "skipped", reason="review gate")
+        return RunResult(errors)
+    if glossary.hash != state["glossary"]["hash"]:
+        _atomic_json(work / "glossary.v2.json", glossary.to_dict())
+        _atomic_json(glossary_file, glossary.to_dict())
+        state["glossary"] = {"version": glossary.version, "hash": glossary.hash}
+        _record_stage(state, checkpoint, "review", "applied", glossary_hash=glossary.hash)
 
     async def translate(number: int, _: Path, frozen: TerminologyMap) -> list[TranslatedBlock]:
         source = extracted[number]
@@ -300,9 +343,9 @@ async def run(config: Config, on_page_error: PageErrorCallback | None = None) ->
         return value
 
     _record_stage(state, checkpoint, "translation", "running", glossary_hash=glossary.hash)
-    translated, failures = await _parallel_pages(pages, config.concurrency, lambda n, p: translate(n, p, glossary))
+    translated, failures = await _parallel_pages(pages, config.concurrency, lambda n, p: translate(n, p, glossary), on_page_error)
     for number in sorted(failures):
-        _error(errors, number, failures[number], on_page_error)
+        _error(errors, number, failures[number], None)
     if failures or set(translated) != set(state["expected_pages"]):
         _record_stage(state, checkpoint, "translation", "failed", failed_pages=sorted(failures))
         _record_stage(state, checkpoint, "epub", "skipped", reason="translation gate")
@@ -322,20 +365,25 @@ async def run(config: Config, on_page_error: PageErrorCallback | None = None) ->
         return RunResult(errors)
     _record_stage(state, checkpoint, "translation", "succeeded", glossary_hash=glossary.hash)
 
-    # One and only one reconciliation inspection. Pre-existing reviewed corrections may revise it.
-    reviewed = corrections(reviews)
-    reviewer = (lambda _: reviewed) if reviewed else None
-    reconciliation = reconcile(glossary=glossary, extractions=[extracted[n] for n in state["expected_pages"]], translations=translated, reviewer=reviewer)
+    # One and only one reconciliation inspection. Reviewed forms were frozen before translation.
+    try:
+        reconciliation = reconcile(glossary=glossary, extractions=[extracted[n] for n in state["expected_pages"]], translations=translated)
+    except Exception as exc:
+        errors.append(f"[btran] reconciliation failed: {type(exc).__name__}: {exc}")
+        _record_stage(state, checkpoint, "reconciliation", "failed", reason=str(exc))
+        _record_stage(state, checkpoint, "epub", "skipped", reason="reconciliation gate")
+        return RunResult(errors)
     write_items(reviews, _reconciliation_review_items(reconciliation, original_paths))
     if reconciliation.glossary_diff:
         glossary = reconciliation.glossary_v2
         state["glossary"] = {"version": glossary.version, "hash": glossary.hash}
         _atomic_json(work / "glossary.v2.json", glossary.to_dict())
+        _atomic_json(glossary_file, glossary.to_dict())
         affected = [(number, original_paths[number]) for number in reconciliation.affected_pages]
-        retried, failures = await _parallel_pages(affected, config.concurrency, lambda n, p: translate(n, p, glossary))
+        retried, failures = await _parallel_pages(affected, config.concurrency, lambda n, p: translate(n, p, glossary), on_page_error)
         translated.update(retried)
         for number in sorted(failures):
-            _error(errors, number, failures[number], on_page_error)
+            _error(errors, number, failures[number], None)
     state["reconciliation"] = {"issues": [issue.__dict__ for issue in reconciliation.issues], "affected_pages": reconciliation.affected_pages, "glossary_changes": [change.__dict__ for change in reconciliation.glossary_diff]}
     _record_stage(state, checkpoint, "reconciliation", "succeeded", affected_pages=reconciliation.affected_pages)
     if failures or unresolved_items(reviews):
