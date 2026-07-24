@@ -10,10 +10,14 @@ from btran.config import Config, load_config
 _ARGS = ["photos", "book.epub", "--target-lang", "fr"]
 
 
-def test_manifest_is_optional_so_integration_uses_input_directory_default():
+def test_manifest_default_is_resolved_by_integration_under_input_directory():
     config = load_config(_ARGS)
 
-    assert config.manifest_path is None
+    assert config.manifest_path == Path("manifest.json")
+
+
+def test_config_preserves_internal_glossary_path_for_wp7_swap_compatibility():
+    assert Config(target_lang="fr").glossary_path == Path("glossary.json")
 
 
 def test_explicit_manifest_cli_value_overrides_environment(monkeypatch):
@@ -56,18 +60,40 @@ def test_glossary_budget_defaults_to_100k_and_accepts_120k_cap():
 
 
 @pytest.mark.parametrize(
-    "args",
+    ("flag", "value", "message"),
     [
-        ["--preflight-only", "--review"],
-        ["--epub-check-path", "/opt/epubcheck"],
+        ("--concurrency", "33", "concurrency must not exceed 32"),
+        ("--max-retries", "11", "max_retries must not exceed 10"),
+        ("--timeout", "3601", "timeout must not exceed 3600"),
     ],
 )
-def test_conflicting_or_incomplete_production_modes_are_rejected(args, capsys):
+def test_resource_controls_have_safe_upper_bounds(flag, value, message, capsys):
+    with pytest.raises(SystemExit) as exc:
+        load_config([*_ARGS, flag, value])
+
+    assert exc.value.code == 2
+    assert message in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "args",
+    [["--preflight-only", "--review"]],
+)
+def test_conflicting_production_modes_are_rejected(args, capsys):
     with pytest.raises(SystemExit) as exc:
         load_config([*_ARGS, *args])
 
     assert exc.value.code == 2
     assert "error:" in capsys.readouterr().err
+
+
+def test_epubcheck_path_can_be_configured_before_strict_check_is_enabled(monkeypatch):
+    monkeypatch.setenv("BTRAN_EPUB_CHECK_PATH", "/opt/epubcheck")
+
+    config = load_config(_ARGS)
+
+    assert config.epub_check is False
+    assert config.epub_check_path == "/opt/epubcheck"
 
 
 def test_strict_epubcheck_accepts_an_explicit_path_when_enabled():
@@ -112,4 +138,7 @@ def test_unsafe_legacy_preflight_environment_is_rejected(monkeypatch):
 def test_config_has_no_production_eval_or_bypass_fields():
     config_fields = set(Config.__dataclass_fields__)
 
-    assert {"eval_dir", "no_preflight", "glossary_path"}.isdisjoint(config_fields)
+    assert {"eval_dir", "no_preflight"}.isdisjoint(config_fields)
+    # Kept only as an internal artifact location required by the WP-7 runner;
+    # it has no CLI or environment control.
+    assert "glossary_path" in config_fields

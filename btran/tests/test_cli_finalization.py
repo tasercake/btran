@@ -81,10 +81,25 @@ def test_preflight_only_does_not_require_pi_binary():
                 main()
 
 
-def test_enabled_epubcheck_requires_a_resolvable_executable(capsys):
+def test_input_path_must_be_a_directory(tmp_path, capsys):
+    input_file = tmp_path / "not-a-directory"
+    input_file.write_text("not images")
+
+    with patch("btran.cli.load_config", return_value=_config(input_dir=input_file)):
+        with pytest.raises(SystemExit) as exc:
+            main()
+
+    assert exc.value.code == 1
+    assert "input_dir is not a directory" in capsys.readouterr().err
+
+
+def test_epubcheck_executable_is_left_to_the_epub_stage_that_uses_it():
     config = _config(epub_check=True, epub_check_path="missing-epubcheck")
+    called = False
 
     async def fake_runner(config: Config, on_page_error=None) -> RunResult:
+        nonlocal called
+        called = True
         return RunResult(errors=[])
 
     with patch("btran.cli.load_config", return_value=config):
@@ -93,8 +108,6 @@ def test_enabled_epubcheck_requires_a_resolvable_executable(capsys):
             side_effect=lambda executable: "/usr/bin/pi" if executable == "pi" else None,
         ):
             with patch("btran.cli.orchestrator_run", new=fake_runner):
-                with pytest.raises(SystemExit) as exc:
-                    main()
+                main()
 
-    assert exc.value.code == 1
-    assert "epubcheck not found" in capsys.readouterr().err
+    assert called is True

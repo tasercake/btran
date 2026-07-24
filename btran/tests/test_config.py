@@ -290,7 +290,8 @@ class TestNewConfigFields:
         cfg = load_config(["in", "out.epub", "--target-lang", "fr"])
         assert cfg.epub_check is False
         assert cfg.epub_check_path == "epubcheck"
-        assert cfg.manifest_path is None
+        assert cfg.manifest_path == Path("manifest.json")
+        assert cfg.glossary_path == Path("glossary.json")
         assert cfg.glossary_budget == 100_000
         assert cfg.review is False
         assert cfg.preflight_only is False

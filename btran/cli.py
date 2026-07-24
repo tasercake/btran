@@ -27,13 +27,12 @@ def main() -> None:
     if not config.input_dir.exists():
         print(f"Error: input_dir does not exist: {config.input_dir}", file=sys.stderr)
         raise SystemExit(1)
+    if not config.input_dir.is_dir():
+        print(f"Error: input_dir is not a directory: {config.input_dir}", file=sys.stderr)
+        raise SystemExit(1)
     if not config.preflight_only and not shutil.which(config.pi_bin):
         print(f"Error: pi_bin not found: {config.pi_bin}", file=sys.stderr)
         raise SystemExit(1)
-    if config.epub_check and not shutil.which(config.epub_check_path):
-        print(f"Error: epubcheck not found: {config.epub_check_path}", file=sys.stderr)
-        raise SystemExit(1)
-
     try:
         image_count = sum(
             1

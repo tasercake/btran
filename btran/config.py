@@ -13,6 +13,9 @@ from dotenv import find_dotenv, load_dotenv
 
 GLOSSARY_BUDGET_DEFAULT = 100_000
 GLOSSARY_BUDGET_MAXIMUM = 120_000
+CONCURRENCY_MAXIMUM = 32
+MAX_RETRIES_MAXIMUM = 10
+TIMEOUT_MAXIMUM = 3_600
 _ENV_PREFIX = "BTRAN_"
 _UNSUPPORTED_ENV_CONTROLS = {
     "NO_PREFLIGHT": "preflight is always enabled",
@@ -26,9 +29,8 @@ _UNSUPPORTED_ENV_CONTROLS = {
 class Config:
     """Runtime settings passed unchanged to the orchestrator boundary.
 
-    ``manifest_path`` is optional. When omitted, pipeline integration calls
-    ``load_or_generate_manifest(input_dir, None)`` so the manifest belongs to
-    the input directory rather than the caller's current working directory.
+    A relative ``manifest_path`` is resolved by pipeline integration beneath
+    ``input_dir``, so the default is always ``INPUT_DIR/manifest.json``.
     """
 
     model: str = "gemini-2.5-flash"
@@ -48,7 +50,9 @@ class Config:
     no_resume: bool = False
     epub_check: bool = False
     epub_check_path: str = "epubcheck"
-    manifest_path: Path | None = None
+    manifest_path: Path = Path("manifest.json")
+    # Internal pipeline artifact location; deliberately not a CLI/env control.
+    glossary_path: Path = Path("glossary.json")
     glossary_budget: int = GLOSSARY_BUDGET_DEFAULT
     review: bool = False
     preflight_only: bool = False
@@ -124,7 +128,12 @@ def load_config(argv: list[str] | None = None) -> Config:
 
     values["input_dir"] = Path(input_dir)
     values["output_epub"] = Path(output_epub)
-    config = Config(**{name: values[name] for name in {field.name for field in fields(Config)}})
+    config = Config(
+        **{
+            field.name: values.get(field.name, getattr(defaults, field.name))
+            for field in fields(Config)
+        }
+    )
     _validate_config(config, parser, cli_ns)
     return config
 
@@ -143,21 +152,23 @@ def _validate_config(
             "target_lang is required. Set BTRAN_TARGET_LANG in .env or "
             "pass --target-lang on the command line."
         )
-    for field_name in ("concurrency", "max_retries", "timeout", "glossary_budget"):
-        if getattr(config, field_name) <= 0:
+    limits = {
+        "concurrency": CONCURRENCY_MAXIMUM,
+        "max_retries": MAX_RETRIES_MAXIMUM,
+        "timeout": TIMEOUT_MAXIMUM,
+        "glossary_budget": GLOSSARY_BUDGET_MAXIMUM,
+    }
+    for field_name, maximum in limits.items():
+        value = getattr(config, field_name)
+        if value <= 0:
             parser.error(f"{field_name} must be positive")
-    if config.glossary_budget > GLOSSARY_BUDGET_MAXIMUM:
-        parser.error(f"glossary_budget must not exceed {GLOSSARY_BUDGET_MAXIMUM}")
+        if value > maximum:
+            parser.error(f"{field_name} must not exceed {maximum}")
     if config.preflight_only and config.review:
         parser.error("--preflight-only cannot be combined with --review")
     if config.preflight_only and config.epub_check:
         parser.error("--preflight-only cannot be combined with --epub-check")
 
-    explicit_epub_check_path = (
-        cli_ns.epub_check_path is not None or os.getenv("BTRAN_EPUB_CHECK_PATH") is not None
-    )
-    if explicit_epub_check_path and not config.epub_check:
-        parser.error("--epub-check-path requires --epub-check (or BTRAN_EPUB_CHECK=true)")
     if config.epub_check and not config.epub_check_path.strip():
         parser.error("epub_check_path must not be empty when --epub-check is enabled")
 
