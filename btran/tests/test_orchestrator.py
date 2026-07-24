@@ -155,8 +155,10 @@ class TestCachedImages:
         _make_diagonal(img2)  # very different phash from solid red → no match
 
         # Pre-populate cache for img1
-        from btran.hasher import compute_sha256, compute_phash
+        from btran.hasher import compute_phash, compute_prompt_fingerprint, compute_sha256
+        from btran.translator import TRANSLATION_PROMPT
 
+        prompt_v = compute_prompt_fingerprint(TRANSLATION_PROMPT)
         sha1 = compute_sha256(img1)
         ph1 = compute_phash(img1)
         cached_result = PageResult(
@@ -169,7 +171,11 @@ class TestCachedImages:
             translated_text="cached translation",
         )
         icache = ImageCache(cache_db)
-        icache.store(sha1, ph1, str(img1), cached_result)
+        icache.store(
+            sha1, ph1, str(img1), cached_result,
+            source_lang="ja", target_lang="en", model=config.model,
+            prompt_version=prompt_v,
+        )
         icache.close()
 
         mock_translate = AsyncMock(return_value=_make_page_result(2))
@@ -208,12 +214,18 @@ class TestNoResume:
         _make_test_image(img1, color=(255, 0, 0))
 
         # Pre-populate cache
-        from btran.hasher import compute_sha256, compute_phash
+        from btran.hasher import compute_phash, compute_prompt_fingerprint, compute_sha256
+        from btran.translator import TRANSLATION_PROMPT
 
+        prompt_v = compute_prompt_fingerprint(TRANSLATION_PROMPT)
         sha1 = compute_sha256(img1)
         ph1 = compute_phash(img1)
         icache = ImageCache(cache_db)
-        icache.store(sha1, ph1, str(img1), _make_page_result(99))
+        icache.store(
+            sha1, ph1, str(img1), _make_page_result(99),
+            source_lang="ja", target_lang="en", model=config.model,
+            prompt_version=prompt_v,
+        )
         icache.close()
 
         mock_translate = AsyncMock(return_value=_make_page_result(1))
