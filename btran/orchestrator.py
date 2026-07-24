@@ -7,9 +7,7 @@ import json
 import random
 import sys
 import uuid
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
 
 from btran.config import Config
 from btran.epub_builder import build_epub
@@ -19,15 +17,9 @@ from btran.hasher import (
     compute_prompt_fingerprint,
     compute_sha256,
 )
+from btran.orchestrator_contract import PageErrorCallback, RunResult
 from btran.schema import ErrorResult, PageResult
 from btran.translator import TRANSLATION_PROMPT, TranslationError, translate_image
-
-
-@dataclass
-class RunResult:
-    """Result of an orchestrator run."""
-
-    errors: list[str]
 
 
 IMAGE_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".webp"})
@@ -43,7 +35,7 @@ def _atomic_write(path: Path, content: str) -> None:
 
 async def run(
     config: Config,
-    on_page_error: Callable[[int, str], None] | None = None,
+    on_page_error: PageErrorCallback | None = None,
 ) -> RunResult:
     """Main pipeline. Orchestrates the full translation workflow.
 
@@ -238,7 +230,7 @@ async def run(
 
 async def orchestrator_run(
     config: Config,
-    on_page_error: Callable[[int, str], None] | None = None,
+    on_page_error: PageErrorCallback | None = None,
 ) -> RunResult:
     """Async entry point returning a RunResult for CLI integration."""
     return await run(config, on_page_error=on_page_error)
