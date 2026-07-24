@@ -1,0 +1,21 @@
+[project]
+name = "btran"
+version = "0.1.0"
+description = "Translate book photos to EPUB via vision LLM"
+requires-python = ">=3.11"
+dependencies = [
+    "ebooklib>=0.18",
+    "imagehash>=4.3",
+    "Pillow>=10.0",
+    "python-dotenv>=1.0",
+]
+
+[project.scripts]
+btran = "btran.cli:main"
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.24"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["btran/tests"]

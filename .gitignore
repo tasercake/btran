@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.egg-info/
+dist/
+.pytest_cache/
+intermediate/
+cache.sqlite
+*.epub
+.env

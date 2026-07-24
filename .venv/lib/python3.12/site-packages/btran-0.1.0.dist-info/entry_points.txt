@@ -1,0 +1,2 @@
+[console_scripts]
+btran = btran.cli:main
