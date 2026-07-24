@@ -1,0 +1,112 @@
+{
+  "name": "case_005",
+  "fixture_image": "page.png",
+  "source": {
+    "page_number": 1,
+    "image_path": "page.png",
+    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "phash": "bbbbbbbbbbbbbbbb",
+    "source_lang": "fr",
+    "model": "synthetic-fixture",
+    "blocks": [
+      {
+        "id": "h1",
+        "type": "heading",
+        "text": "Journal de bord",
+        "reading_order": 0
+      },
+      {
+        "id": "q1",
+        "type": "quote",
+        "text": "La mer est calme.",
+        "reading_order": 1
+      },
+      {
+        "id": "p1",
+        "type": "paragraph",
+        "text": "Nous partirons après le lever du soleil.",
+        "reading_order": 2
+      },
+      {
+        "id": "num",
+        "type": "page_number",
+        "text": "17",
+        "reading_order": 3
+      }
+    ],
+    "term_mentions": [],
+    "illustrations": []
+  },
+  "translation": {
+    "page_number": 1,
+    "image_path": "page.png",
+    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "phash": "bbbbbbbbbbbbbbbb",
+    "source_lang": "fr",
+    "target_lang": "en",
+    "page_text": "Journal de bord La mer est calme. Nous partirons après le lever du soleil.",
+    "translated_text": "The sea is calm and we will leave after sunrise.",
+    "blocks": [
+      {
+        "id": "h1",
+        "type": "heading",
+        "text": "Journal de bord",
+        "reading_order": 0
+      },
+      {
+        "id": "q1",
+        "type": "quote",
+        "text": "La mer est calme.",
+        "reading_order": 1
+      },
+      {
+        "id": "p1",
+        "type": "paragraph",
+        "text": "Nous partirons après le lever du soleil.",
+        "reading_order": 2
+      },
+      {
+        "id": "num",
+        "type": "page_number",
+        "text": "17",
+        "reading_order": 3
+      }
+    ],
+    "translated_blocks": [
+      {
+        "block_id": "h1",
+        "translated_text": "Logbook"
+      },
+      {
+        "block_id": "q1",
+        "translated_text": "The sea is calm."
+      },
+      {
+        "block_id": "p1",
+        "translated_text": "We will leave after sunrise."
+      },
+      {
+        "block_id": "num",
+        "translated_text": "17"
+      }
+    ],
+    "image_descriptions": [],
+    "term_mentions": [],
+    "illustrations": []
+  },
+  "glossary": {
+    "version": "1.0",
+    "hash": "synthetic",
+    "source_lang": "fr",
+    "target_lang": "en",
+    "entries": []
+  },
+  "expected": {
+    "block_schema": true,
+    "non_empty_text": true,
+    "translation_language": true,
+    "illustration_count": true,
+    "block_id_correspondence": true,
+    "glossary_consistency": true
+  }
+}

@@ -1,0 +1,96 @@
+{
+  "name": "case_004",
+  "fixture_image": "page.png",
+  "source": {
+    "page_number": 1,
+    "image_path": "page.png",
+    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "phash": "bbbbbbbbbbbbbbbb",
+    "source_lang": "en",
+    "model": "synthetic-fixture",
+    "blocks": [
+      {
+        "id": "h1",
+        "type": "heading",
+        "text": "Recipe Card",
+        "reading_order": 0
+      },
+      {
+        "id": "item1",
+        "type": "list_item",
+        "text": "Add water slowly.",
+        "reading_order": 1
+      },
+      {
+        "id": "item2",
+        "type": "list_item",
+        "text": "Stir for three minutes.",
+        "reading_order": 2
+      }
+    ],
+    "term_mentions": [],
+    "illustrations": []
+  },
+  "translation": {
+    "page_number": 1,
+    "image_path": "page.png",
+    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "phash": "bbbbbbbbbbbbbbbb",
+    "source_lang": "en",
+    "target_lang": "ja",
+    "page_text": "Recipe Card Add water slowly. Stir for three minutes.",
+    "translated_text": "レシピカードです。水をゆっくり加えて、三分間かき混ぜます。",
+    "blocks": [
+      {
+        "id": "h1",
+        "type": "heading",
+        "text": "Recipe Card",
+        "reading_order": 0
+      },
+      {
+        "id": "item1",
+        "type": "list_item",
+        "text": "Add water slowly.",
+        "reading_order": 1
+      },
+      {
+        "id": "item2",
+        "type": "list_item",
+        "text": "Stir for three minutes.",
+        "reading_order": 2
+      }
+    ],
+    "translated_blocks": [
+      {
+        "block_id": "h1",
+        "translated_text": "レシピカード"
+      },
+      {
+        "block_id": "item1",
+        "translated_text": "水をゆっくり加えます。"
+      },
+      {
+        "block_id": "item2",
+        "translated_text": "三分間かき混ぜます。"
+      }
+    ],
+    "image_descriptions": [],
+    "term_mentions": [],
+    "illustrations": []
+  },
+  "glossary": {
+    "version": "1.0",
+    "hash": "synthetic",
+    "source_lang": "en",
+    "target_lang": "ja",
+    "entries": []
+  },
+  "expected": {
+    "block_schema": true,
+    "non_empty_text": true,
+    "translation_language": true,
+    "illustration_count": true,
+    "block_id_correspondence": true,
+    "glossary_consistency": true
+  }
+}

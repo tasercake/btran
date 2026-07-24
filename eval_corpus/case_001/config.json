@@ -1,0 +1,96 @@
+{
+  "name": "case_001",
+  "fixture_image": "page.png",
+  "source": {
+    "page_number": 1,
+    "image_path": "page.png",
+    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "phash": "bbbbbbbbbbbbbbbb",
+    "source_lang": "en",
+    "model": "synthetic-fixture",
+    "blocks": [
+      {
+        "id": "title",
+        "type": "heading",
+        "text": "Night Signals",
+        "reading_order": 0
+      },
+      {
+        "id": "left",
+        "type": "paragraph",
+        "text": "A signal crossed the river.",
+        "reading_order": 1
+      },
+      {
+        "id": "right",
+        "type": "paragraph",
+        "text": "The crew answered at dawn.",
+        "reading_order": 2
+      }
+    ],
+    "term_mentions": [],
+    "illustrations": []
+  },
+  "translation": {
+    "page_number": 1,
+    "image_path": "page.png",
+    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "phash": "bbbbbbbbbbbbbbbb",
+    "source_lang": "en",
+    "target_lang": "fr",
+    "page_text": "Night Signals A signal crossed the river. The crew answered at dawn.",
+    "translated_text": "Signaux nocturnes. Un signal a traversé la rivière et l'équipe a répondu à l'aube.",
+    "blocks": [
+      {
+        "id": "title",
+        "type": "heading",
+        "text": "Night Signals",
+        "reading_order": 0
+      },
+      {
+        "id": "left",
+        "type": "paragraph",
+        "text": "A signal crossed the river.",
+        "reading_order": 1
+      },
+      {
+        "id": "right",
+        "type": "paragraph",
+        "text": "The crew answered at dawn.",
+        "reading_order": 2
+      }
+    ],
+    "translated_blocks": [
+      {
+        "block_id": "title",
+        "translated_text": "Signaux nocturnes"
+      },
+      {
+        "block_id": "left",
+        "translated_text": "Un signal a traversé la rivière."
+      },
+      {
+        "block_id": "right",
+        "translated_text": "L'équipe a répondu à l'aube."
+      }
+    ],
+    "image_descriptions": [],
+    "term_mentions": [],
+    "illustrations": []
+  },
+  "glossary": {
+    "version": "1.0",
+    "hash": "synthetic",
+    "source_lang": "en",
+    "target_lang": "fr",
+    "entries": []
+  },
+  "expected": {
+    "block_schema": true,
+    "non_empty_text": true,
+    "translation_language": true,
+    "illustration_count": true,
+    "block_id_correspondence": true,
+    "glossary_consistency": true
+  }
+}

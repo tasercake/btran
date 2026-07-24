@@ -1,0 +1,126 @@
+{
+  "name": "case_003",
+  "fixture_image": "page.png",
+  "source": {
+    "page_number": 1,
+    "image_path": "page.png",
+    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "phash": "bbbbbbbbbbbbbbbb",
+    "source_lang": "en",
+    "model": "synthetic-fixture",
+    "blocks": [
+      {
+        "id": "h1",
+        "type": "heading",
+        "text": "Engine Notes",
+        "reading_order": 0
+      },
+      {
+        "id": "p1",
+        "type": "paragraph",
+        "text": "The engine must cool before service.",
+        "reading_order": 1
+      },
+      {
+        "id": "note",
+        "type": "footnote",
+        "text": "Engine means the main drive unit.",
+        "reading_order": 2
+      }
+    ],
+    "term_mentions": [
+      {
+        "term": "engine",
+        "block_id": "p1"
+      },
+      {
+        "term": "Engine",
+        "block_id": "note"
+      }
+    ],
+    "illustrations": []
+  },
+  "translation": {
+    "page_number": 1,
+    "image_path": "page.png",
+    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "phash": "bbbbbbbbbbbbbbbb",
+    "source_lang": "en",
+    "target_lang": "de",
+    "page_text": "Engine Notes The engine must cool before service.",
+    "translated_text": "Der Motor muss vor dem Service abkühlen und ist bereit.",
+    "blocks": [
+      {
+        "id": "h1",
+        "type": "heading",
+        "text": "Engine Notes",
+        "reading_order": 0
+      },
+      {
+        "id": "p1",
+        "type": "paragraph",
+        "text": "The engine must cool before service.",
+        "reading_order": 1
+      },
+      {
+        "id": "note",
+        "type": "footnote",
+        "text": "Engine means the main drive unit.",
+        "reading_order": 2
+      }
+    ],
+    "translated_blocks": [
+      {
+        "block_id": "h1",
+        "translated_text": "Motornotizen"
+      },
+      {
+        "block_id": "p1",
+        "translated_text": "Der Motor muss vor dem Service abkühlen."
+      },
+      {
+        "block_id": "note",
+        "translated_text": "Motor bedeutet die Hauptantriebseinheit."
+      }
+    ],
+    "image_descriptions": [],
+    "term_mentions": [
+      {
+        "term": "engine",
+        "block_id": "p1"
+      },
+      {
+        "term": "Engine",
+        "block_id": "note"
+      }
+    ],
+    "illustrations": []
+  },
+  "glossary": {
+    "version": "1.0",
+    "hash": "synthetic",
+    "source_lang": "en",
+    "target_lang": "de",
+    "entries": [
+      {
+        "concept_id": "engine",
+        "source_terms": [
+          "engine"
+        ],
+        "target_term": "Motor",
+        "provenance": [
+          "manual"
+        ],
+        "confidence": 1.0
+      }
+    ]
+  },
+  "expected": {
+    "block_schema": true,
+    "non_empty_text": true,
+    "translation_language": true,
+    "illustration_count": true,
+    "block_id_correspondence": true,
+    "glossary_consistency": true
+  }
+}
