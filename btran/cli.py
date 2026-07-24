@@ -5,7 +5,7 @@ import shutil
 import sys
 
 from btran.config import load_config
-from btran.orchestrator import run as orchestrator_run
+from btran.orchestrator import orchestrator_run
 
 IMAGE_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".webp"})
 
@@ -46,9 +46,23 @@ def main() -> None:
         f" → {config.target_lang} using {config.model}"
     )
 
+    # Per-page streaming error callback
+    def on_page_error(page_num: int, msg: str) -> None:
+        print(f"[btran] page {page_num} failed: {msg}", file=sys.stderr)
+
     # Run pipeline
     try:
-        asyncio.run(orchestrator_run(config))
+        result = asyncio.run(orchestrator_run(config, on_page_error=on_page_error))
     except KeyboardInterrupt:
         print("\nInterrupted.", file=sys.stderr)
+        sys.exit(1)
+
+    # Post-run: check for failures
+    if result.errors:
+        print(
+            f"[btran] {len(result.errors)} page(s) failed — no EPUB produced.",
+            file=sys.stderr,
+        )
+        for err in result.errors:
+            print(err, file=sys.stderr)
         sys.exit(1)

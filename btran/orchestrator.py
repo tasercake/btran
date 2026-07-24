@@ -5,8 +5,11 @@ from __future__ import annotations
 import asyncio
 import json
 import random
+import sys
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 from btran.config import Config
 from btran.epub_builder import build_epub
@@ -21,11 +24,32 @@ class RunResult:
 
     errors: list[str]
 
+
 IMAGE_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".webp"})
 
 
-async def run(config: Config) -> None:
-    """Main pipeline. Orchestrates the full translation workflow."""
+def _atomic_write(path: Path, content: str) -> None:
+    """Write content to path atomically via temp file + rename."""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp.write_text(content)
+    tmp.rename(path)
+
+
+async def run(
+    config: Config,
+    on_page_error: Callable[[int, str], None] | None = None,
+) -> RunResult:
+    """Main pipeline. Orchestrates the full translation workflow.
+
+    Args:
+        config: Pipeline configuration.
+        on_page_error: Optional callback invoked immediately when a page
+            reaches terminal failure. Receives (page_number, error_message).
+
+    Returns:
+        RunResult with collected errors.
+    """
 
     # 1. Scan config.input_dir for image files (sorted by name)
     image_files = sorted(
@@ -35,16 +59,36 @@ async def run(config: Config) -> None:
     )
 
     if not image_files:
-        print("No images found in input directory.")
-        return
+        return RunResult(errors=[])
 
     # 2. Create config.intermediate_dir if it doesn't exist
     config.intermediate_dir.mkdir(parents=True, exist_ok=True)
+
+    # ---- Run manifest: track expected pages for this run ----
+    run_id = uuid.uuid4().hex[:12]
+    expected_pages = list(range(1, len(image_files) + 1))
+    _atomic_write(
+        config.intermediate_dir / ".run_manifest.json",
+        json.dumps({"run_id": run_id, "expected_pages": expected_pages}),
+    )
+
+    # Clean stale page_*.json files from prior runs (outside expected range)
+    for existing in sorted(config.intermediate_dir.glob("page_*.json")):
+        try:
+            pn_str = existing.stem.split("_", 1)[1]
+            pn = int(pn_str)
+        except (ValueError, IndexError):
+            # Malformed filename → remove
+            existing.unlink(missing_ok=True)
+            continue
+        if pn not in expected_pages:
+            existing.unlink(missing_ok=True)
 
     # 3. Open ImageCache
     cache = ImageCache(config.cache_db)
 
     total = len(image_files)
+    errors: list[str] = []
 
     # 4. For each image: hash it, check cache, build pending list
     pending: list[tuple[int, Path, str, str]] = []  # (page_number, path, sha256, phash)
@@ -112,11 +156,22 @@ async def run(config: Config) -> None:
                         backoff = 0.5 * (2 ** attempt)
                         jitter = random.uniform(0, backoff * 0.2)
                         await asyncio.sleep(backoff + jitter)
+                except Exception as exc:
+                    # Capture unexpected task exceptions
+                    result = ErrorResult(
+                        page_number=pn,
+                        image_path=str(img_path),
+                        error=f"{type(exc).__name__}: {exc}",
+                        retry_count=attempt + 1,
+                        model=config.model,
+                    )
+                    break
 
-            # Save result
+            # Save result atomically
             out_path = config.intermediate_dir / f"page_{pn:04d}.json"
             assert result is not None
-            result.to_file(out_path)
+            result_json = json.dumps(result.to_dict(), indent=2, ensure_ascii=False) + "\n"
+            _atomic_write(out_path, result_json)
 
             if isinstance(result, PageResult):
                 async with cache_lock:
@@ -125,6 +180,11 @@ async def run(config: Config) -> None:
             async with results_lock:
                 if isinstance(result, ErrorResult):
                     failed += 1
+                    error_msg = f"[btran] page {pn} failed: {result.error}"
+                    errors.append(error_msg)
+                    # Stream error immediately via callback
+                    if on_page_error is not None:
+                        on_page_error(pn, result.error)
                     symbol = "\u2717"
                 else:
                     symbol = "\u2713"
@@ -146,8 +206,8 @@ async def run(config: Config) -> None:
 
     cache.close()
 
-    # 8. Compile EPUB from intermediate JSON files
-    _compile_epub(config)
+    # 8. Compile EPUB from intermediate JSON files (gated on all-pages success)
+    _compile_epub(config, expected_pages, errors)
 
     # 9. Summary
     if failed:
@@ -155,29 +215,71 @@ async def run(config: Config) -> None:
     else:
         print(f"Done: {completed}/{total} pages translated")
 
+    return RunResult(errors=errors)
 
-async def orchestrator_run(config: Config) -> RunResult:
+
+async def orchestrator_run(
+    config: Config,
+    on_page_error: Callable[[int, str], None] | None = None,
+) -> RunResult:
     """Async entry point returning a RunResult for CLI integration."""
-    await run(config)
-    return RunResult(errors=[])
+    return await run(config, on_page_error=on_page_error)
 
 
-def _compile_epub(config: Config) -> None:
-    """Load intermediate JSON files and build the EPUB."""
-    json_files = sorted(config.intermediate_dir.glob("page_*.json"))
-    if not json_files:
-        print("No intermediate files found — skipping EPUB build.")
+def _compile_epub(
+    config: Config,
+    expected_pages: list[int],
+    errors: list[str],
+) -> None:
+    """Load intermediate JSON files and build the EPUB.
+
+    Gated: only builds EPUB if all expected pages produced valid PageResult
+    files.  Stale/missing/malformed/error pages prevent EPUB creation.
+    """
+    pages: list[PageResult] = []
+    missing_or_bad: list[int] = []
+
+    for page_num in expected_pages:
+        jf = config.intermediate_dir / f"page_{page_num:04d}.json"
+        if not jf.exists():
+            missing_or_bad.append(page_num)
+            msg = f"[btran] page {page_num} missing from intermediate files"
+            print(msg, file=sys.stderr)
+            errors.append(msg)
+            continue
+
+        try:
+            data = json.loads(jf.read_text())
+        except json.JSONDecodeError as exc:
+            missing_or_bad.append(page_num)
+            msg = f"[btran] page {page_num} intermediate file is malformed: {exc}"
+            print(msg, file=sys.stderr)
+            errors.append(msg)
+            continue
+
+        if "error" in data:
+            # ErrorResult — already tracked during processing
+            missing_or_bad.append(page_num)
+            continue
+
+        try:
+            pages.append(PageResult.from_dict(data))
+        except Exception as exc:
+            missing_or_bad.append(page_num)
+            msg = f"[btran] page {page_num} failed to parse PageResult: {exc}"
+            print(msg, file=sys.stderr)
+            errors.append(msg)
+
+    if missing_or_bad:
+        print(
+            f"[btran] skipping EPUB build: {len(missing_or_bad)} page(s) "
+            f"incomplete — {missing_or_bad}",
+            file=sys.stderr,
+        )
         return
 
-    pages: list[PageResult] = []
-    for jf in json_files:
-        data = json.loads(jf.read_text())
-        if "error" in data:
-            continue  # skip failed pages
-        pages.append(PageResult.from_dict(data))
-
     if not pages:
-        print("All pages failed — no content for EPUB.")
+        print("[btran] all pages failed — no content for EPUB.", file=sys.stderr)
         return
 
     build_epub(
@@ -195,7 +297,8 @@ def _compile_epub(config: Config) -> None:
 def _write_intermediate(
     cached: PageResult, intermediate_dir: Path, page_number: int
 ) -> None:
-    """Write a cached result to an intermediate JSON file."""
+    """Write a cached result to an intermediate JSON file (atomic)."""
     out_path = intermediate_dir / f"page_{page_number:04d}.json"
     cached.page_number = page_number
-    cached.to_file(out_path)
+    result_json = json.dumps(cached.to_dict(), indent=2, ensure_ascii=False) + "\n"
+    _atomic_write(out_path, result_json)
