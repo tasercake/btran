@@ -1,0 +1,68 @@
+{
+  "name": "case_017",
+  "risk_tags": [
+    "synthetic-fixture",
+    "wrong-target-language"
+  ],
+  "fixture_image": "page.png",
+  "source": {
+    "page_number": 17,
+    "image_path": "page.png",
+    "sha256": "74b0b386cb6243aac128e11c5d8a2366571c3597c128d6de275b2fe6db736fc0",
+    "phash": "950f6ae06ec66af0",
+    "source_lang": "en",
+    "model": "synthetic-fixture",
+    "blocks": [
+      {
+        "id": "p1",
+        "type": "paragraph",
+        "text": "Turn the handle clockwise.",
+        "reading_order": 0
+      }
+    ],
+    "term_mentions": [],
+    "illustrations": []
+  },
+  "translation": {
+    "page_number": 17,
+    "image_path": "page.png",
+    "sha256": "74b0b386cb6243aac128e11c5d8a2366571c3597c128d6de275b2fe6db736fc0",
+    "phash": "950f6ae06ec66af0",
+    "source_lang": "en",
+    "target_lang": "ja",
+    "page_text": "Turn the handle clockwise.",
+    "translated_text": "The handle is turned and the door is open.",
+    "blocks": [
+      {
+        "id": "p1",
+        "type": "paragraph",
+        "text": "Turn the handle clockwise.",
+        "reading_order": 0
+      }
+    ],
+    "translated_blocks": [
+      {
+        "block_id": "p1",
+        "translated_text": "Turn the handle clockwise."
+      }
+    ],
+    "image_descriptions": [],
+    "term_mentions": [],
+    "illustrations": []
+  },
+  "glossary": {
+    "version": "1.0",
+    "hash": "synthetic-017",
+    "source_lang": "en",
+    "target_lang": "ja",
+    "entries": []
+  },
+  "expected": {
+    "block_schema": true,
+    "non_empty_text": true,
+    "translation_language": false,
+    "illustration_count": true,
+    "block_id_correspondence": true,
+    "glossary_consistency": true
+  }
+}

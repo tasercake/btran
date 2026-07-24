@@ -48,3 +48,40 @@ control.
 Resource bounds: concurrency is 1–32, `--max-retries` is 1–10 total attempts,
 and timeout is 1–3,600 seconds. `--pi-bin` selects the `pi` executable used by
 the model leaves.
+
+## Deterministic eval corpus
+
+`eval_corpus/case_*/` contains locally authored, synthetic regression fixtures;
+it contains no scanned book pages, private inputs, or copyrighted source text.
+Each directory has a locally generated `page.png` and a `config.json` that
+supplies the source artifact, translated artifact, glossary, expected result
+for every validator stage, and non-empty `risk_tags`. The source and
+translation artifacts record the fixture's actual SHA-256 and perceptual hash;
+the harness rejects a config whose identities do not match its PNG. Tags
+describe the reviewed hard page condition (for example `tables`,
+`low-resolution-risk`, or `block-id-mismatch`), rather than a claim about model
+quality.
+
+Run the corpus with:
+
+```bash
+pytest btran/tests/test_eval_harness.py -q
+# or write an inspectable report
+python -c 'from pathlib import Path; from btran.eval_harness import run_corpus; print(run_corpus(Path("eval_corpus"), Path("eval-report.json")))'
+```
+
+To add a reviewed failure, create one case directory with a synthetic fixture
+that you generated yourself, a complete `config.json`, at least one meaningful
+risk tag, and explicit `true`/`false` expectations for every validation stage.
+Keep the corpus between 20 and 50 cases; extend category coverage instead of
+adding near-duplicates. The repository test gates the required categories,
+valid and deliberately invalid outcomes for every validator stage, and fixture
+size (16 KiB each / 200 KiB total). A deliberately invalid artifact belongs in
+the corpus only when its expected validator failure is recorded and reviewed.
+
+This corpus exercises JSON artifacts and deterministic validators only. It does
+not measure live OCR, translation fluency, semantic adequacy, visual extraction
+accuracy, or provider reliability; it has no LLM judge and makes no live
+provider calls. In particular, terminology context-variant cases are
+preclassified glossary artifacts: they demonstrate permitted entries, not
+semantic sense disambiguation by the validator.

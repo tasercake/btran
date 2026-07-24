@@ -1,0 +1,84 @@
+{
+  "name": "case_007",
+  "risk_tags": [
+    "synthetic-fixture",
+    "footnotes"
+  ],
+  "fixture_image": "page.png",
+  "source": {
+    "page_number": 7,
+    "image_path": "page.png",
+    "sha256": "befd4fe434d8d690e0bc5835a14da10e8b45986d053c6438992f50f687a8916c",
+    "phash": "850f6afe2fe0681c",
+    "source_lang": "en",
+    "model": "synthetic-fixture",
+    "blocks": [
+      {
+        "id": "p1",
+        "type": "paragraph",
+        "text": "The valve opens at noon.",
+        "reading_order": 0
+      },
+      {
+        "id": "fn1",
+        "type": "footnote",
+        "text": "Times use local solar time.",
+        "reading_order": 1
+      }
+    ],
+    "term_mentions": [],
+    "illustrations": []
+  },
+  "translation": {
+    "page_number": 7,
+    "image_path": "page.png",
+    "sha256": "befd4fe434d8d690e0bc5835a14da10e8b45986d053c6438992f50f687a8916c",
+    "phash": "850f6afe2fe0681c",
+    "source_lang": "en",
+    "target_lang": "fr",
+    "page_text": "The valve opens at noon. Times use local solar time.",
+    "translated_text": "Le texte traduit est prêt et clair.",
+    "blocks": [
+      {
+        "id": "p1",
+        "type": "paragraph",
+        "text": "The valve opens at noon.",
+        "reading_order": 0
+      },
+      {
+        "id": "fn1",
+        "type": "footnote",
+        "text": "Times use local solar time.",
+        "reading_order": 1
+      }
+    ],
+    "translated_blocks": [
+      {
+        "block_id": "p1",
+        "translated_text": "La valve s’ouvre à midi."
+      },
+      {
+        "block_id": "fn1",
+        "translated_text": "Les heures utilisent le temps solaire local."
+      }
+    ],
+    "image_descriptions": [],
+    "term_mentions": [],
+    "illustrations": []
+  },
+  "glossary": {
+    "version": "1.0",
+    "hash": "synthetic-007",
+    "source_lang": "en",
+    "target_lang": "fr",
+    "entries": []
+  },
+  "expected": {
+    "block_schema": true,
+    "non_empty_text": true,
+    "translation_language": true,
+    "illustration_count": true,
+    "block_id_correspondence": true,
+    "glossary_consistency": true
+  }
+}

@@ -4,27 +4,27 @@
   "source": {
     "page_number": 1,
     "image_path": "page.png",
-    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    "phash": "bbbbbbbbbbbbbbbb",
+    "sha256": "8b1b36f0d97e5940d1152d1b72df06dd3f059628879d0ea498755787d0ea0a05",
+    "phash": "b79f1d6c6262e8c0",
     "source_lang": "fr",
     "model": "synthetic-fixture",
     "blocks": [
       {
         "id": "h1",
         "type": "heading",
-        "text": "Journal de bord",
+        "text": "Cadran solaire",
         "reading_order": 0
       },
       {
         "id": "q1",
         "type": "quote",
-        "text": "La mer est calme.",
+        "text": "L’ombre indique midi.",
         "reading_order": 1
       },
       {
         "id": "p1",
         "type": "paragraph",
-        "text": "Nous partirons après le lever du soleil.",
+        "text": "La plaque est gravée pour le jardin.",
         "reading_order": 2
       },
       {
@@ -35,34 +35,36 @@
       }
     ],
     "term_mentions": [],
-    "illustrations": []
+    "illustrations": [
+      "sundial sketch"
+    ]
   },
   "translation": {
     "page_number": 1,
     "image_path": "page.png",
-    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    "phash": "bbbbbbbbbbbbbbbb",
+    "sha256": "8b1b36f0d97e5940d1152d1b72df06dd3f059628879d0ea498755787d0ea0a05",
+    "phash": "b79f1d6c6262e8c0",
     "source_lang": "fr",
     "target_lang": "en",
-    "page_text": "Journal de bord La mer est calme. Nous partirons après le lever du soleil.",
-    "translated_text": "The sea is calm and we will leave after sunrise.",
+    "page_text": "Cadran solaire L’ombre indique midi. La plaque est gravée pour le jardin.",
+    "translated_text": "The sundial shadow marks noon in the garden.",
     "blocks": [
       {
         "id": "h1",
         "type": "heading",
-        "text": "Journal de bord",
+        "text": "Cadran solaire",
         "reading_order": 0
       },
       {
         "id": "q1",
         "type": "quote",
-        "text": "La mer est calme.",
+        "text": "L’ombre indique midi.",
         "reading_order": 1
       },
       {
         "id": "p1",
         "type": "paragraph",
-        "text": "Nous partirons après le lever du soleil.",
+        "text": "La plaque est gravée pour le jardin.",
         "reading_order": 2
       },
       {
@@ -75,15 +77,15 @@
     "translated_blocks": [
       {
         "block_id": "h1",
-        "translated_text": "Logbook"
+        "translated_text": "Sundial"
       },
       {
         "block_id": "q1",
-        "translated_text": "The sea is calm."
+        "translated_text": "The shadow marks noon."
       },
       {
         "block_id": "p1",
-        "translated_text": "We will leave after sunrise."
+        "translated_text": "The plate is engraved for the garden."
       },
       {
         "block_id": "num",
@@ -92,7 +94,9 @@
     ],
     "image_descriptions": [],
     "term_mentions": [],
-    "illustrations": []
+    "illustrations": [
+      "sundial sketch"
+    ]
   },
   "glossary": {
     "version": "1.0",
@@ -105,8 +109,13 @@
     "block_schema": true,
     "non_empty_text": true,
     "translation_language": true,
-    "illustration_count": true,
+    "illustration_count": false,
     "block_id_correspondence": true,
     "glossary_consistency": true
-  }
+  },
+  "risk_tags": [
+    "synthetic-fixture",
+    "captions-illustrations",
+    "illustration-count-mismatch"
+  ]
 }

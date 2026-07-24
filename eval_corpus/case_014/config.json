@@ -1,0 +1,68 @@
+{
+  "name": "case_014",
+  "risk_tags": [
+    "synthetic-fixture",
+    "malformed-blocks"
+  ],
+  "fixture_image": "page.png",
+  "source": {
+    "page_number": 14,
+    "image_path": "page.png",
+    "sha256": "c9e3deafc65bce8fdae2af15cfbe5aa98ff75289466b268e2697776c924a4275",
+    "phash": "951f6be06ec262f0",
+    "source_lang": "en",
+    "model": "synthetic-fixture",
+    "blocks": [
+      {
+        "id": "margin",
+        "type": "marginalia",
+        "text": "Ink mark beside the paragraph.",
+        "reading_order": 0
+      }
+    ],
+    "term_mentions": [],
+    "illustrations": []
+  },
+  "translation": {
+    "page_number": 14,
+    "image_path": "page.png",
+    "sha256": "c9e3deafc65bce8fdae2af15cfbe5aa98ff75289466b268e2697776c924a4275",
+    "phash": "951f6be06ec262f0",
+    "source_lang": "en",
+    "target_lang": "fr",
+    "page_text": "Ink mark beside the paragraph.",
+    "translated_text": "Le texte traduit est prêt et clair.",
+    "blocks": [
+      {
+        "id": "margin",
+        "type": "marginalia",
+        "text": "Ink mark beside the paragraph.",
+        "reading_order": 0
+      }
+    ],
+    "translated_blocks": [
+      {
+        "block_id": "margin",
+        "translated_text": "Marque à l’encre près du paragraphe."
+      }
+    ],
+    "image_descriptions": [],
+    "term_mentions": [],
+    "illustrations": []
+  },
+  "glossary": {
+    "version": "1.0",
+    "hash": "synthetic-014",
+    "source_lang": "en",
+    "target_lang": "fr",
+    "entries": []
+  },
+  "expected": {
+    "block_schema": false,
+    "non_empty_text": true,
+    "translation_language": true,
+    "illustration_count": true,
+    "block_id_correspondence": true,
+    "glossary_consistency": true
+  }
+}

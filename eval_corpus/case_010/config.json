@@ -1,0 +1,69 @@
+{
+  "name": "case_010",
+  "risk_tags": [
+    "synthetic-fixture",
+    "blank-near-blank",
+    "empty-blocks"
+  ],
+  "fixture_image": "page.png",
+  "source": {
+    "page_number": 10,
+    "image_path": "page.png",
+    "sha256": "85e9da87be70647c084dc7da5e7b5ecae9cd3dfb642c03adb426ad2da21dc45c",
+    "phash": "850f2be06ae07ef8",
+    "source_lang": "en",
+    "model": "synthetic-fixture",
+    "blocks": [
+      {
+        "id": "p1",
+        "type": "paragraph",
+        "text": "   ",
+        "reading_order": 0
+      }
+    ],
+    "term_mentions": [],
+    "illustrations": []
+  },
+  "translation": {
+    "page_number": 10,
+    "image_path": "page.png",
+    "sha256": "85e9da87be70647c084dc7da5e7b5ecae9cd3dfb642c03adb426ad2da21dc45c",
+    "phash": "850f2be06ae07ef8",
+    "source_lang": "en",
+    "target_lang": "fr",
+    "page_text": "Blank source test",
+    "translated_text": "Le texte traduit est prêt et clair.",
+    "blocks": [
+      {
+        "id": "p1",
+        "type": "paragraph",
+        "text": "   ",
+        "reading_order": 0
+      }
+    ],
+    "translated_blocks": [
+      {
+        "block_id": "p1",
+        "translated_text": "Le bloc est vide."
+      }
+    ],
+    "image_descriptions": [],
+    "term_mentions": [],
+    "illustrations": []
+  },
+  "glossary": {
+    "version": "1.0",
+    "hash": "synthetic-010",
+    "source_lang": "en",
+    "target_lang": "fr",
+    "entries": []
+  },
+  "expected": {
+    "block_schema": true,
+    "non_empty_text": false,
+    "translation_language": true,
+    "illustration_count": true,
+    "block_id_correspondence": true,
+    "glossary_consistency": true
+  }
+}

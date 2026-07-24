@@ -1,0 +1,99 @@
+{
+  "name": "case_019",
+  "risk_tags": [
+    "synthetic-fixture",
+    "terminology-aliases"
+  ],
+  "fixture_image": "page.png",
+  "source": {
+    "page_number": 19,
+    "image_path": "page.png",
+    "sha256": "3c029de005da5d6ad6f755d9c1a5d91de835fcff05d90289738d4ac7366e505b",
+    "phash": "951f6be07ac163e0",
+    "source_lang": "en",
+    "model": "synthetic-fixture",
+    "blocks": [
+      {
+        "id": "p1",
+        "type": "paragraph",
+        "text": "The harbor is quiet; the port gate is closed.",
+        "reading_order": 0
+      }
+    ],
+    "term_mentions": [
+      {
+        "term": "harbor",
+        "block_id": "p1"
+      },
+      {
+        "term": "port",
+        "block_id": "p1"
+      }
+    ],
+    "illustrations": []
+  },
+  "translation": {
+    "page_number": 19,
+    "image_path": "page.png",
+    "sha256": "3c029de005da5d6ad6f755d9c1a5d91de835fcff05d90289738d4ac7366e505b",
+    "phash": "951f6be07ac163e0",
+    "source_lang": "en",
+    "target_lang": "fr",
+    "page_text": "The harbor is quiet; the port gate is closed.",
+    "translated_text": "Le texte traduit est prêt et clair.",
+    "blocks": [
+      {
+        "id": "p1",
+        "type": "paragraph",
+        "text": "The harbor is quiet; the port gate is closed.",
+        "reading_order": 0
+      }
+    ],
+    "translated_blocks": [
+      {
+        "block_id": "p1",
+        "translated_text": "Le port est calme ; la porte du port est fermée."
+      }
+    ],
+    "image_descriptions": [],
+    "term_mentions": [
+      {
+        "term": "harbor",
+        "block_id": "p1"
+      },
+      {
+        "term": "port",
+        "block_id": "p1"
+      }
+    ],
+    "illustrations": []
+  },
+  "glossary": {
+    "version": "1.0",
+    "hash": "synthetic-019",
+    "source_lang": "en",
+    "target_lang": "fr",
+    "entries": [
+      {
+        "concept_id": "harbor-port",
+        "source_terms": [
+          "harbor",
+          "port"
+        ],
+        "target_term": "port",
+        "provenance": [
+          "synthetic-reviewed"
+        ],
+        "confidence": 1.0
+      }
+    ]
+  },
+  "expected": {
+    "block_schema": true,
+    "non_empty_text": true,
+    "translation_language": true,
+    "illustration_count": true,
+    "block_id_correspondence": true,
+    "glossary_consistency": true
+  }
+}

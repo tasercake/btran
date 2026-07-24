@@ -1,0 +1,68 @@
+{
+  "name": "case_009",
+  "risk_tags": [
+    "synthetic-fixture",
+    "mixed-language"
+  ],
+  "fixture_image": "page.png",
+  "source": {
+    "page_number": 9,
+    "image_path": "page.png",
+    "sha256": "663dd04430e90859d02c0c8e03f4ccbdba255643e006c60545ecfa9f332ec852",
+    "phash": "850f6ae06fe16af0",
+    "source_lang": "en",
+    "model": "synthetic-fixture",
+    "blocks": [
+      {
+        "id": "p1",
+        "type": "paragraph",
+        "text": "Press the 開始 button to begin.",
+        "reading_order": 0
+      }
+    ],
+    "term_mentions": [],
+    "illustrations": []
+  },
+  "translation": {
+    "page_number": 9,
+    "image_path": "page.png",
+    "sha256": "663dd04430e90859d02c0c8e03f4ccbdba255643e006c60545ecfa9f332ec852",
+    "phash": "850f6ae06fe16af0",
+    "source_lang": "en",
+    "target_lang": "ja",
+    "page_text": "Press the 開始 button to begin.",
+    "translated_text": "開始ボタンを押すと始まります。",
+    "blocks": [
+      {
+        "id": "p1",
+        "type": "paragraph",
+        "text": "Press the 開始 button to begin.",
+        "reading_order": 0
+      }
+    ],
+    "translated_blocks": [
+      {
+        "block_id": "p1",
+        "translated_text": "開始ボタンを押すと始まります。"
+      }
+    ],
+    "image_descriptions": [],
+    "term_mentions": [],
+    "illustrations": []
+  },
+  "glossary": {
+    "version": "1.0",
+    "hash": "synthetic-009",
+    "source_lang": "en",
+    "target_lang": "ja",
+    "entries": []
+  },
+  "expected": {
+    "block_schema": true,
+    "non_empty_text": true,
+    "translation_language": true,
+    "illustration_count": true,
+    "block_id_correspondence": true,
+    "glossary_consistency": true
+  }
+}

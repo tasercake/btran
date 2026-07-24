@@ -1,0 +1,84 @@
+{
+  "name": "case_016",
+  "risk_tags": [
+    "synthetic-fixture",
+    "block-id-mismatch"
+  ],
+  "fixture_image": "page.png",
+  "source": {
+    "page_number": 16,
+    "image_path": "page.png",
+    "sha256": "4fec002414991558312e0661bce250e7f9b8172f7d4923dba6d6272d77f5ece5",
+    "phash": "851f7ae26fe06a18",
+    "source_lang": "en",
+    "model": "synthetic-fixture",
+    "blocks": [
+      {
+        "id": "p1",
+        "type": "paragraph",
+        "text": "The lantern is lit.",
+        "reading_order": 0
+      },
+      {
+        "id": "p2",
+        "type": "paragraph",
+        "text": "The path is clear.",
+        "reading_order": 1
+      }
+    ],
+    "term_mentions": [],
+    "illustrations": []
+  },
+  "translation": {
+    "page_number": 16,
+    "image_path": "page.png",
+    "sha256": "4fec002414991558312e0661bce250e7f9b8172f7d4923dba6d6272d77f5ece5",
+    "phash": "851f7ae26fe06a18",
+    "source_lang": "en",
+    "target_lang": "fr",
+    "page_text": "The lantern is lit. The path is clear.",
+    "translated_text": "Le texte traduit est prêt et clair.",
+    "blocks": [
+      {
+        "id": "p1",
+        "type": "paragraph",
+        "text": "The lantern is lit.",
+        "reading_order": 0
+      },
+      {
+        "id": "p2",
+        "type": "paragraph",
+        "text": "The path is clear.",
+        "reading_order": 1
+      }
+    ],
+    "translated_blocks": [
+      {
+        "block_id": "p1",
+        "translated_text": "La lanterne est allumée."
+      },
+      {
+        "block_id": "extra",
+        "translated_text": "Le chemin est libre."
+      }
+    ],
+    "image_descriptions": [],
+    "term_mentions": [],
+    "illustrations": []
+  },
+  "glossary": {
+    "version": "1.0",
+    "hash": "synthetic-016",
+    "source_lang": "en",
+    "target_lang": "fr",
+    "entries": []
+  },
+  "expected": {
+    "block_schema": true,
+    "non_empty_text": true,
+    "translation_language": true,
+    "illustration_count": true,
+    "block_id_correspondence": false,
+    "glossary_consistency": true
+  }
+}

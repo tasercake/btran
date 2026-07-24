@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
+from btran.hasher import compute_phash, compute_sha256
 from btran.schema import PageExtraction, PageResult, TerminologyMap
 from btran.validators import VALIDATION_STAGES, validate_page
 
@@ -20,6 +22,7 @@ class EvalCase:
     translation: PageResult
     glossary: TerminologyMap
     expected: dict[str, bool]
+    risk_tags: list[str]
 
 
 def load_eval_cases(corpus_dir: Path) -> list[EvalCase]:
@@ -31,7 +34,15 @@ def load_eval_cases(corpus_dir: Path) -> list[EvalCase]:
         image = case_dir / config["fixture_image"]
         if not image.is_file():
             raise FileNotFoundError(f"fixture image missing for {config['name']}: {image}")
+        _validate_fixture_identity(config, image)
         expected = config["expected"]
+        risk_tags = config.get("risk_tags")
+        if (
+            not isinstance(risk_tags, list)
+            or not risk_tags
+            or not all(isinstance(tag, str) and tag.strip() for tag in risk_tags)
+        ):
+            raise ValueError(f"case {config['name']} risk_tags must be a non-empty list of strings")
         if not isinstance(expected, dict) or set(expected) != set(VALIDATION_STAGES):
             raise ValueError(
                 f"case {config['name']} expected stages must exactly match "
@@ -46,6 +57,7 @@ def load_eval_cases(corpus_dir: Path) -> list[EvalCase]:
             translation=PageResult.from_dict(config["translation"]),
             glossary=TerminologyMap.from_dict(config["glossary"]),
             expected=expected,
+            risk_tags=risk_tags,
         ))
     return cases
 
@@ -53,16 +65,40 @@ def load_eval_cases(corpus_dir: Path) -> list[EvalCase]:
 def run_corpus(corpus_dir: Path, report_path: Path | None = None) -> dict:
     """Run validation stages for every case and return a JSON-serializable report."""
     results = [_run_case(case) for case in load_eval_cases(corpus_dir)]
+    risk_tag_counts = Counter(tag for case in results for tag in case["risk_tags"])
+    validator_outcomes = {
+        stage: {
+            "expected_valid": sum(case["stages"][stage]["expected"] for case in results),
+            "expected_invalid": sum(not case["stages"][stage]["expected"] for case in results),
+            "actual_valid": sum(case["stages"][stage]["actual"] for case in results),
+            "actual_invalid": sum(not case["stages"][stage]["actual"] for case in results),
+        }
+        for stage in VALIDATION_STAGES
+    }
     report = {
         "cases": results,
         "passed": sum(case["passed"] for case in results),
         "failed": sum(not case["passed"] for case in results),
         "all_passed": all(case["passed"] for case in results),
+        "risk_tag_counts": dict(sorted(risk_tag_counts.items())),
+        "validator_outcomes": validator_outcomes,
     }
     if report_path is not None:
         report_path.parent.mkdir(parents=True, exist_ok=True)
         report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
     return report
+
+
+def _validate_fixture_identity(config: dict, image: Path) -> None:
+    """Require source and translation artifact identities to describe the fixture."""
+    sha256 = compute_sha256(image)
+    phash = compute_phash(image)
+    for artifact_name in ("source", "translation"):
+        artifact = config[artifact_name]
+        if artifact.get("sha256") != sha256:
+            raise ValueError(f"fixture sha256 does not match {artifact_name} artifact for {config['name']}")
+        if artifact.get("phash") != phash:
+            raise ValueError(f"fixture phash does not match {artifact_name} artifact for {config['name']}")
 
 
 def _run_case(case: EvalCase) -> dict:
@@ -78,6 +114,7 @@ def _run_case(case: EvalCase) -> dict:
     }
     return {
         "name": case.name,
+        "risk_tags": case.risk_tags,
         "passed": all(stage["passed"] for stage in stages.values()),
         "stages": stages,
     }

@@ -4,8 +4,8 @@
   "source": {
     "page_number": 1,
     "image_path": "page.png",
-    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    "phash": "bbbbbbbbbbbbbbbb",
+    "sha256": "fc21f7eb07e424643a242b989f97e83efae5c8aa3e52c5eebe71e114333fde99",
+    "phash": "953fdac06bc06b61",
     "source_lang": "en",
     "model": "synthetic-fixture",
     "blocks": [
@@ -34,8 +34,8 @@
   "translation": {
     "page_number": 1,
     "image_path": "page.png",
-    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    "phash": "bbbbbbbbbbbbbbbb",
+    "sha256": "fc21f7eb07e424643a242b989f97e83efae5c8aa3e52c5eebe71e114333fde99",
+    "phash": "953fdac06bc06b61",
     "source_lang": "en",
     "target_lang": "fr",
     "page_text": "Night Signals A signal crossed the river. The crew answered at dawn.",
@@ -92,5 +92,9 @@
     "illustration_count": true,
     "block_id_correspondence": true,
     "glossary_consistency": true
-  }
+  },
+  "risk_tags": [
+    "synthetic-fixture",
+    "headings-paragraphs"
+  ]
 }

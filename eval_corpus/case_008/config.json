@@ -1,0 +1,116 @@
+{
+  "name": "case_008",
+  "risk_tags": [
+    "synthetic-fixture",
+    "columns-reading-order"
+  ],
+  "fixture_image": "page.png",
+  "source": {
+    "page_number": 8,
+    "image_path": "page.png",
+    "sha256": "c690090fcdc7ead197480be4b53651f037f614137674e7abc4b51d328142f087",
+    "phash": "851c780f6ae17af8",
+    "source_lang": "en",
+    "model": "synthetic-fixture",
+    "blocks": [
+      {
+        "id": "heading",
+        "type": "heading",
+        "text": "Field notes",
+        "reading_order": 0
+      },
+      {
+        "id": "left-1",
+        "type": "paragraph",
+        "text": "North path: dry stones.",
+        "reading_order": 1
+      },
+      {
+        "id": "right-1",
+        "type": "paragraph",
+        "text": "South path: wet grass.",
+        "reading_order": 2
+      },
+      {
+        "id": "left-2",
+        "type": "paragraph",
+        "text": "Meet at the bridge.",
+        "reading_order": 3
+      }
+    ],
+    "term_mentions": [],
+    "illustrations": []
+  },
+  "translation": {
+    "page_number": 8,
+    "image_path": "page.png",
+    "sha256": "c690090fcdc7ead197480be4b53651f037f614137674e7abc4b51d328142f087",
+    "phash": "851c780f6ae17af8",
+    "source_lang": "en",
+    "target_lang": "fr",
+    "page_text": "Field notes North path: dry stones. South path: wet grass. Meet at the bridge.",
+    "translated_text": "Le texte traduit est prêt et clair.",
+    "blocks": [
+      {
+        "id": "heading",
+        "type": "heading",
+        "text": "Field notes",
+        "reading_order": 0
+      },
+      {
+        "id": "left-1",
+        "type": "paragraph",
+        "text": "North path: dry stones.",
+        "reading_order": 1
+      },
+      {
+        "id": "right-1",
+        "type": "paragraph",
+        "text": "South path: wet grass.",
+        "reading_order": 2
+      },
+      {
+        "id": "left-2",
+        "type": "paragraph",
+        "text": "Meet at the bridge.",
+        "reading_order": 3
+      }
+    ],
+    "translated_blocks": [
+      {
+        "block_id": "heading",
+        "translated_text": "Notes de terrain"
+      },
+      {
+        "block_id": "left-1",
+        "translated_text": "Chemin nord : pierres sèches."
+      },
+      {
+        "block_id": "right-1",
+        "translated_text": "Chemin sud : herbe humide."
+      },
+      {
+        "block_id": "left-2",
+        "translated_text": "Retrouvez-vous au pont."
+      }
+    ],
+    "image_descriptions": [],
+    "term_mentions": [],
+    "illustrations": []
+  },
+  "glossary": {
+    "version": "1.0",
+    "hash": "synthetic-008",
+    "source_lang": "en",
+    "target_lang": "fr",
+    "entries": []
+  },
+  "expected": {
+    "block_schema": true,
+    "non_empty_text": true,
+    "translation_language": true,
+    "illustration_count": true,
+    "block_id_correspondence": true,
+    "glossary_consistency": true
+  }
+}

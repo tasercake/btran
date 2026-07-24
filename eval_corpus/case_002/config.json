@@ -4,8 +4,8 @@
   "source": {
     "page_number": 1,
     "image_path": "page.png",
-    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    "phash": "bbbbbbbbbbbbbbbb",
+    "sha256": "98cc1b66a753aa640422c8ef1729c2b3c47a66e53742ad011304aa93d18fde0f",
+    "phash": "c937964a3ac13f62",
     "source_lang": "en",
     "model": "synthetic-fixture",
     "blocks": [
@@ -36,8 +36,8 @@
   "translation": {
     "page_number": 1,
     "image_path": "page.png",
-    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    "phash": "bbbbbbbbbbbbbbbb",
+    "sha256": "98cc1b66a753aa640422c8ef1729c2b3c47a66e53742ad011304aa93d18fde0f",
+    "phash": "c937964a3ac13f62",
     "source_lang": "en",
     "target_lang": "es",
     "page_text": "A Map for the Crossing Follow the northern road.",
@@ -98,5 +98,9 @@
     "illustration_count": true,
     "block_id_correspondence": true,
     "glossary_consistency": true
-  }
+  },
+  "risk_tags": [
+    "synthetic-fixture",
+    "captions-illustrations"
+  ]
 }

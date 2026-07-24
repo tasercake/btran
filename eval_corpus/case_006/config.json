@@ -1,0 +1,84 @@
+{
+  "name": "case_006",
+  "risk_tags": [
+    "synthetic-fixture",
+    "tables"
+  ],
+  "fixture_image": "page.png",
+  "source": {
+    "page_number": 6,
+    "image_path": "page.png",
+    "sha256": "1c363d7cccbda583e5e287b4fcef7f20de81e294b8154d4625f5977f60f1595a",
+    "phash": "850f6a3e2fe07a1c",
+    "source_lang": "en",
+    "model": "synthetic-fixture",
+    "blocks": [
+      {
+        "id": "h1",
+        "type": "heading",
+        "text": "Weather log",
+        "reading_order": 0
+      },
+      {
+        "id": "t1",
+        "type": "table",
+        "text": "Day | Wind | Rain; Mon | calm | 2 mm",
+        "reading_order": 1
+      }
+    ],
+    "term_mentions": [],
+    "illustrations": []
+  },
+  "translation": {
+    "page_number": 6,
+    "image_path": "page.png",
+    "sha256": "1c363d7cccbda583e5e287b4fcef7f20de81e294b8154d4625f5977f60f1595a",
+    "phash": "850f6a3e2fe07a1c",
+    "source_lang": "en",
+    "target_lang": "fr",
+    "page_text": "Weather log Day | Wind | Rain; Mon | calm | 2 mm",
+    "translated_text": "Le texte traduit est prêt et clair.",
+    "blocks": [
+      {
+        "id": "h1",
+        "type": "heading",
+        "text": "Weather log",
+        "reading_order": 0
+      },
+      {
+        "id": "t1",
+        "type": "table",
+        "text": "Day | Wind | Rain; Mon | calm | 2 mm",
+        "reading_order": 1
+      }
+    ],
+    "translated_blocks": [
+      {
+        "block_id": "h1",
+        "translated_text": "Journal météo"
+      },
+      {
+        "block_id": "t1",
+        "translated_text": "Jour | Vent | Pluie; Lun | calme | 2 mm"
+      }
+    ],
+    "image_descriptions": [],
+    "term_mentions": [],
+    "illustrations": []
+  },
+  "glossary": {
+    "version": "1.0",
+    "hash": "synthetic-006",
+    "source_lang": "en",
+    "target_lang": "fr",
+    "entries": []
+  },
+  "expected": {
+    "block_schema": true,
+    "non_empty_text": true,
+    "translation_language": true,
+    "illustration_count": true,
+    "block_id_correspondence": true,
+    "glossary_consistency": true
+  }
+}
