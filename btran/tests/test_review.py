@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from btran.review import ReviewItem, unresolved_items, write_items, resolve_item
+from btran.review import ReviewItem, corrections, unresolved_items, write_items, resolve_item
 
 
 def test_flat_review_artifact_keeps_evidence_image_reference_and_resolution(tmp_path: Path):
@@ -55,6 +55,22 @@ def test_malformed_current_review_artifact_blocks_instead_of_being_replaced(tmp_
     pending = unresolved_items(directory)
     assert len(pending) == 1
     assert pending[0].kind == "malformed_review_artifact"
+
+
+def test_reused_review_id_cannot_apply_a_correction_to_a_different_concept(tmp_path: Path):
+    """A forged/stale stable ID may not transplant its correction to this run's concept."""
+    directory = tmp_path / "needs_review"
+    current = ReviewItem("shared-id", "low_confidence", True, {"concept_id": "current"})
+    unrelated = ReviewItem(
+        "shared-id", "low_confidence", True, {"concept_id": "unrelated"},
+        status="resolved", resolution={"action": "correct", "correction": "wrong term"},
+    )
+    write_items(directory, [unrelated])
+
+    write_items(directory, [current], archive_stale=True)
+
+    assert unresolved_items(directory) == [current]
+    assert corrections(directory) == {}
 
 
 def test_invalid_current_resolution_shape_blocks_review(tmp_path: Path):

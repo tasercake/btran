@@ -224,8 +224,13 @@ def make_pi_consolidation_call(
     *, pi_bin: str = "pi", model: str, timeout: float = 120
 ) -> Callable[[str], str]:
     """Create an ephemeral, tool-less text Pi caller with bounded cleanup."""
-    if timeout <= 0:
-        raise ValueError("timeout must be positive")
+    if (
+        isinstance(timeout, bool)
+        or not isinstance(timeout, (int, float))
+        or not math.isfinite(timeout)
+        or timeout <= 0
+    ):
+        raise ValueError("timeout must be positive and finite")
 
     def pi_call(prompt: str) -> str:
         if not isinstance(prompt, str):

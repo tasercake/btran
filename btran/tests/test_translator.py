@@ -2,6 +2,8 @@
 
 import asyncio
 import json
+import os
+import signal
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
@@ -226,6 +228,8 @@ async def test_translate_blocks_isolated_from_tools_and_project_configuration():
     for option in ("--no-session", "--no-tools", "--no-extensions", "--no-skills",
                    "--no-prompt-templates", "--no-context-files", "--no-approve"):
         assert option in args
+    assert exec_mock.call_args.kwargs["stdin"] is asyncio.subprocess.DEVNULL
+    assert exec_mock.call_args.kwargs["start_new_session"] is (os.name == "posix")
 
 
 @pytest.mark.asyncio
@@ -252,14 +256,17 @@ async def test_translate_blocks_terminates_child_on_timeout():
     from btran.translator import TranslationError, translate_blocks
 
     proc = Mock()
+    proc.pid = 123
     proc.returncode = None
     proc.communicate = AsyncMock(side_effect=asyncio.TimeoutError())
     proc.wait = AsyncMock(return_value=None)
-    with patch("btran.translator.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
+    with patch("btran.translator.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)), \
+         patch("btran.translator.os.killpg") as killpg:
         with pytest.raises(TranslationError, match="timed out"):
             await translate_blocks(_page(), _glossary(), model="text-model", timeout=1)
 
-    proc.terminate.assert_called_once_with()
+    killpg.assert_called_once_with(123, signal.SIGTERM)
+    proc.terminate.assert_not_called()
     proc.wait.assert_awaited_once_with()
 
 
@@ -275,14 +282,30 @@ async def test_translate_blocks_terminates_child_on_cancellation():
         await asyncio.Event().wait()
 
     proc = Mock(returncode=None)
+    proc.pid = 123
     proc.communicate = never_finishes
     proc.wait = AsyncMock(return_value=None)
-    with patch("btran.translator.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
+    with patch("btran.translator.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)), \
+         patch("btran.translator.os.killpg") as killpg:
         task = asyncio.create_task(translate_blocks(_page(), _glossary(), model="text-model"))
         await started.wait()
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
 
-    proc.terminate.assert_called_once_with()
+    killpg.assert_called_once_with(123, signal.SIGTERM)
+    proc.terminate.assert_not_called()
     proc.wait.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_translate_blocks_rejects_non_positive_timeout_before_spawning_pi():
+    """A direct caller cannot create an unbounded/instant Pi leaf."""
+    from btran.translator import TranslationError, translate_blocks
+
+    exec_mock = AsyncMock()
+    with patch("btran.translator.asyncio.create_subprocess_exec", exec_mock):
+        with pytest.raises(TranslationError, match="timeout must be positive"):
+            await translate_blocks(_page(), _glossary(), model="text-model", timeout=0)
+
+    exec_mock.assert_not_awaited()

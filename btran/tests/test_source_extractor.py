@@ -2,6 +2,8 @@
 
 import asyncio
 import json
+import os
+import signal
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -160,7 +162,9 @@ class TestExtractPage:
         assert "term_mentions" in EXTRACTION_PROMPT
         assert "untrusted" in EXTRACTION_PROMPT.lower()
         assert "do not follow" in EXTRACTION_PROMPT.lower()
+        assert kwargs["stdin"] is asyncio.subprocess.DEVNULL
         assert kwargs["stdout"] is asyncio.subprocess.PIPE
+        assert kwargs["start_new_session"] is (os.name == "posix")
 
     @pytest.mark.asyncio
     async def test_timeout_kills_and_reaps_pi_process(self):
@@ -170,11 +174,12 @@ class TestExtractPage:
         class HangingProcess:
             def __init__(self):
                 self.kill = Mock()
+                self.pid = 123
                 self.returncode = None
                 self._never = asyncio.Event()
 
             async def communicate(self):
-                if not self.kill.called:
+                if not killpg.called:
                     await self._never.wait()
                 return b"", b""
 
@@ -182,13 +187,14 @@ class TestExtractPage:
         with patch(
             "btran.source_extractor.asyncio.create_subprocess_exec",
             AsyncMock(return_value=proc),
-        ):
+        ), patch("btran.source_extractor.os.killpg") as killpg:
             with pytest.raises(ExtractionError, match="timed out"):
                 await extract_page(
                     Path("page.png"), "en", "model", "a" * 64, "b" * 16, 1, timeout=0.01
                 )
 
-        proc.kill.assert_called_once_with()
+        killpg.assert_called_once_with(123, signal.SIGKILL)
+        proc.kill.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_cancellation_kills_and_reaps_pi_process(self):
@@ -198,13 +204,14 @@ class TestExtractPage:
         class HangingProcess:
             def __init__(self):
                 self.kill = Mock()
+                self.pid = 123
                 self.returncode = None
                 self.started = asyncio.Event()
                 self._never = asyncio.Event()
 
             async def communicate(self):
                 self.started.set()
-                if not self.kill.called:
+                if not killpg.called:
                     await self._never.wait()
                 return b"", b""
 
@@ -212,7 +219,7 @@ class TestExtractPage:
         with patch(
             "btran.source_extractor.asyncio.create_subprocess_exec",
             AsyncMock(return_value=proc),
-        ):
+        ), patch("btran.source_extractor.os.killpg") as killpg:
             task = asyncio.create_task(extract_page(
                 Path("page.png"), "en", "model", "a" * 64, "b" * 16, 1,
             ))
@@ -221,7 +228,8 @@ class TestExtractPage:
             with pytest.raises(asyncio.CancelledError):
                 await task
 
-        proc.kill.assert_called_once_with()
+        killpg.assert_called_once_with(123, signal.SIGKILL)
+        proc.kill.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_non_positive_timeout_rejected_before_spawning_pi(self):

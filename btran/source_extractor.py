@@ -7,6 +7,7 @@ import hashlib
 import json
 import math
 import os
+import signal
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -64,11 +65,14 @@ def _require_exact_fields(
 
 
 async def _kill_and_reap(proc: asyncio.subprocess.Process) -> None:
-    """Stop a timed-out child so it cannot outlive this extraction."""
+    """Kill the isolated Pi process group and reap its direct child."""
     if proc.returncode is None:
         try:
-            proc.kill()
-        except ProcessLookupError:
+            if os.name == "posix":
+                os.killpg(proc.pid, signal.SIGKILL)
+            else:
+                proc.kill()
+        except (OSError, ProcessLookupError):
             pass
     try:
         await proc.communicate()
@@ -209,9 +213,11 @@ async def extract_page(
             "--no-context-files",
             "--no-approve",
             f"{prompt} @{image_path}",
+            stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env={**os.environ, "PI_OFFLINE": "0"},
+            start_new_session=os.name == "posix",
         )
         stdout_bytes, stderr_bytes = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except asyncio.TimeoutError:

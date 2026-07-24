@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
 import os
+import signal
 import re
 import unicodedata
 
@@ -146,15 +148,33 @@ def _translated_blocks(data: object, source_ids: list[str]) -> list[TranslatedBl
     return [by_id[block_id] for block_id in source_ids]
 
 
+async def _signal_process_group(proc: asyncio.subprocess.Process, signal_number: int) -> None:
+    """Signal the Pi worker group, falling back to its direct child if needed."""
+    try:
+        if os.name == "posix":
+            os.killpg(proc.pid, signal_number)
+        elif signal_number == signal.SIGKILL:
+            proc.kill()
+        else:
+            proc.terminate()
+    except ProcessLookupError:
+        pass
+    except OSError:
+        if signal_number == signal.SIGKILL:
+            proc.kill()
+        else:
+            proc.terminate()
+
+
 async def _reap_process(proc: asyncio.subprocess.Process) -> None:
-    """Terminate a running child and wait for it so timeout/cancel cannot leak it."""
+    """Terminate the isolated Pi group and reap it after timeout/cancellation."""
     if proc.returncode is not None:
         return
-    proc.terminate()
+    await _signal_process_group(proc, signal.SIGTERM)
     try:
         await asyncio.wait_for(proc.wait(), timeout=_CLEANUP_TIMEOUT_SECONDS)
     except asyncio.TimeoutError:
-        proc.kill()
+        await _signal_process_group(proc, signal.SIGKILL)
         await proc.wait()
 
 
@@ -169,6 +189,13 @@ async def translate_blocks(
     next_page: PageExtraction | None = None,
 ) -> list[TranslatedBlock]:
     """Translate a page independently with only adjacent-page source excerpts."""
+    if (
+        isinstance(timeout, bool)
+        or not isinstance(timeout, (int, float))
+        or not math.isfinite(timeout)
+        or timeout <= 0
+    ):
+        raise TranslationError("timeout must be positive and finite")
     context = _translation_context(extraction, glossary, previous_page, next_page)
     prompt = TRANSLATION_PROMPT.format(
         source_lang=extraction.source_lang,
@@ -190,9 +217,11 @@ async def translate_blocks(
             "--no-context-files",
             "--no-approve",
             prompt,
+            stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env={**os.environ, "PI_OFFLINE": "0"},
+            start_new_session=os.name == "posix",
         )
         stdout_bytes, stderr_bytes = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except asyncio.TimeoutError:

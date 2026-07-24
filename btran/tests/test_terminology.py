@@ -220,6 +220,13 @@ def test_consolidation_fails_when_multiple_batches_do_not_reduce_without_target_
         )
 
 
+@pytest.mark.parametrize("timeout", [0, -1, float("nan"), True])
+def test_pi_consolidation_rejects_invalid_timeout_before_constructing_leaf(timeout):
+    """Direct callers cannot create unbounded or nonsensical Pi workers."""
+    with pytest.raises(ValueError, match="timeout must be positive and finite"):
+        make_pi_consolidation_call(pi_bin="pi", model="test-model", timeout=timeout)
+
+
 def test_tool_less_ephemeral_pi_call_returns_stdout_and_cleans_up_timeout(tmp_path):
     fake_pi = tmp_path / "fake-pi"
     fake_pi.write_text(

@@ -84,6 +84,18 @@ def _read_item(path: Path) -> ReviewItem:
     return item
 
 
+def _same_review_subject(existing: ReviewItem, current: ReviewItem) -> bool:
+    """Keep a decision only when it remains bound to the same review subject."""
+    if existing.kind != current.kind or existing.blocking != current.blocking:
+        return False
+    for key in ("concept_id", "source_term"):
+        before = existing.evidence.get(key)
+        after = current.evidence.get(key)
+        if before is not None or after is not None:
+            return isinstance(before, str) and bool(before) and before == after
+    return existing.evidence == current.evidence
+
+
 def _archive_stale(directory: Path, active_ids: set[str]) -> None:
     archive = directory / "archive"
     for path in sorted(directory.glob("*.json")):
@@ -118,7 +130,7 @@ def write_items(directory: Path, items: list[ReviewItem], *, archive_stale: bool
                 # A malformed current artifact is a blocking operator problem.
                 paths.append(path)
                 continue
-            if existing.status == "resolved" and existing.resolution:
+            if existing.status == "resolved" and existing.resolution and _same_review_subject(existing, item):
                 value["status"] = existing.status
                 value["resolution"] = existing.resolution
         _atomic_json(path, value)
