@@ -7,7 +7,17 @@ from pathlib import Path
 
 import pytest
 
-from btran.schema import PageResult, ErrorResult
+from btran.schema import (
+    ErrorResult,
+    Manifest,
+    PageExtraction,
+    PageResult,
+    SourceBlock,
+    TermMention,
+    TerminologyEntry,
+    TerminologyMap,
+    TranslatedBlock,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -136,6 +146,7 @@ class TestPageResult:
             "page_number", "image_path", "sha256", "phash",
             "source_lang", "target_lang", "page_text", "translated_text",
             "image_descriptions", "model", "timestamp", "retry_count",
+            "blocks", "translated_blocks", "term_mentions", "illustrations",
         }
         assert set(d.keys()) == expected_keys
 
@@ -210,3 +221,118 @@ class TestErrorResult:
         er = ErrorResult.from_dict(d)
         assert er.retry_count == 0
         assert er.model == ""
+
+
+# ---------------------------------------------------------------------------
+# Gate 0 structural-contract tests
+# ---------------------------------------------------------------------------
+
+class TestSourceBlock:
+    def test_construction_and_equality(self, sample_source_block):
+        assert sample_source_block == SourceBlock(
+            id="page_1_block_0", type="heading", text="Chapter 1", reading_order=0
+        )
+
+    def test_to_dict_contains_all_fields(self, sample_source_block):
+        assert sample_source_block.to_dict() == {
+            "id": "page_1_block_0", "type": "heading", "text": "Chapter 1", "reading_order": 0
+        }
+
+
+class TestTermMention:
+    def test_construction_and_field_access(self):
+        mention = TermMention(term="continuation", block_id="page_4_block_2")
+        assert mention.term == "continuation"
+        assert mention.block_id == "page_4_block_2"
+
+
+class TestPageExtraction:
+    def test_round_trip_to_from_dict(self, sample_page_extraction):
+        assert PageExtraction.from_dict(sample_page_extraction.to_dict()) == sample_page_extraction
+
+    def test_file_io_round_trip(self, sample_page_extraction, tmp_path):
+        path = tmp_path / "nested" / "extraction.json"
+        sample_page_extraction.to_file(path)
+        assert PageExtraction.from_file(path) == sample_page_extraction
+
+    def test_defaults_are_empty_collections(self):
+        extraction = PageExtraction(
+            page_number=1, image_path="page.jpg", sha256="a" * 64, phash="b" * 16,
+            source_lang="en", model="model", timestamp="",
+        )
+        assert extraction.blocks == []
+        assert extraction.term_mentions == []
+        assert extraction.illustrations == []
+
+    def test_timestamp_is_auto_populated(self):
+        extraction = PageExtraction(
+            page_number=1, image_path="page.jpg", sha256="a" * 64, phash="b" * 16,
+            source_lang="en", model="model", timestamp="",
+        )
+        assert datetime.fromisoformat(extraction.timestamp).tzinfo is not None
+
+
+class TestTranslatedBlock:
+    def test_construction_preserves_matching_block_id(self, sample_translated_block):
+        assert sample_translated_block.block_id == "p1_b0"
+        assert sample_translated_block.translated_text == "Bonjour le monde"
+
+
+class TestTerminologyEntry:
+    def test_construction_and_default_notes(self):
+        entry = TerminologyEntry(
+            concept_id="c1", source_terms=["hello"], target_term="bonjour",
+            provenance=["hello"], confidence=0.95,
+        )
+        assert entry.notes == ""
+        assert 0.0 <= entry.confidence <= 1.0
+
+
+class TestTerminologyMap:
+    def test_round_trip_to_from_dict(self, sample_terminology_map):
+        assert TerminologyMap.from_dict(sample_terminology_map.to_dict()) == sample_terminology_map
+
+    def test_file_io_round_trip(self, sample_terminology_map, tmp_path):
+        path = tmp_path / "nested" / "glossary.json"
+        sample_terminology_map.to_file(path)
+        assert TerminologyMap.from_file(path) == sample_terminology_map
+
+    def test_hash_is_stable_through_serialization(self, sample_terminology_map):
+        assert TerminologyMap.from_dict(sample_terminology_map.to_dict()).hash == "abc123"
+
+    def test_timestamp_is_auto_populated(self):
+        glossary = TerminologyMap(
+            version="1.0.0", hash="abc", source_lang="en", target_lang="fr", entries=[], created_at=""
+        )
+        assert datetime.fromisoformat(glossary.created_at).tzinfo is not None
+
+
+class TestManifest:
+    def test_round_trip_to_from_dict(self, sample_manifest):
+        assert Manifest.from_dict(sample_manifest.to_dict()) == sample_manifest
+
+    def test_file_io_round_trip(self, sample_manifest, tmp_path):
+        path = tmp_path / "nested" / "manifest.json"
+        sample_manifest.to_file(path)
+        assert Manifest.from_file(path) == sample_manifest
+
+    def test_total_pages_matches_pages_length(self, sample_manifest):
+        assert sample_manifest.total_pages == len(sample_manifest.pages)
+
+
+class TestPageResultExtended:
+    def test_new_fields_default_to_empty_lists(self):
+        result = PageResult(page_number=1, sha256="a" * 64, phash="b" * 16)
+        assert result.blocks == []
+        assert result.translated_blocks == []
+        assert result.term_mentions == []
+        assert result.illustrations == []
+
+    def test_from_dict_without_new_fields_remains_backward_compatible(self):
+        result = PageResult.from_dict({
+            "page_number": 1, "sha256": "a" * 64, "phash": "b" * 16,
+        })
+        assert result.blocks == []
+        assert result.translated_blocks == []
+        assert result.term_mentions == []
+        assert result.illustrations == []
