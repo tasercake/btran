@@ -22,7 +22,7 @@ def image(path: Path, color: tuple[int, int, int]) -> None:
 def config(tmp_path: Path, **changes: object) -> Config:
     values = dict(
         input_dir=tmp_path / "input", output_epub=tmp_path / "book.epub",
-        intermediate_dir=tmp_path / "work", cache_db=tmp_path / "cache.sqlite",
+        intermediate_dir=tmp_path / "work",
         source_lang="ja", target_lang="en", max_retries=1, concurrency=2,
     )
     values.update(changes)
