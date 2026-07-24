@@ -63,6 +63,90 @@ async def test_full_happy_path_writes_checkpointed_artifacts_and_epub(tmp_path: 
 
 
 @pytest.mark.asyncio
+async def test_source_extraction_cache_reuses_valid_run_owned_artifact(tmp_path: Path):
+    """A second run reuses only the source artifact bound to its page and image."""
+    cfg = config(tmp_path)
+    cfg.input_dir.mkdir()
+    source_path = cfg.input_dir / "a.png"
+    image(source_path, (1, 2, 3))
+
+    async def extract(path, source_lang, model, sha256, phash, page, *_):
+        return PageExtraction(
+            page, str(path), sha256, phash, source_lang, model,
+            blocks=[SourceBlock(f"page_{page}_block_0", "paragraph", "source", 0)],
+        )
+
+    async def translate(source, _glossary, **_):
+        return translations(source)
+
+    with patch("btran.orchestrator.extract_page", side_effect=extract) as leaf, \
+         patch("btran.orchestrator.translate_blocks", side_effect=translate), \
+         patch("btran.orchestrator.build_epub"):
+        assert (await run(cfg)).errors == []
+        assert (await run(cfg)).errors == []
+
+    assert leaf.await_count == 1
+    assert len(list((cfg.intermediate_dir / "source_cache").glob("*.json"))) == 1
+
+
+@pytest.mark.asyncio
+async def test_corrupt_source_cache_is_a_miss_and_is_replaced(tmp_path: Path):
+    """Malformed cached extraction data never reaches downstream stages."""
+    cfg = config(tmp_path)
+    cfg.input_dir.mkdir()
+    source_path = cfg.input_dir / "a.png"
+    image(source_path, (1, 2, 3))
+    from btran.source_extractor import extraction_cache_identity
+    from btran.hasher import compute_sha256
+    cache_path = cfg.intermediate_dir / "source_cache" / f"{extraction_cache_identity(compute_sha256(source_path), 'ja', cfg.model)}.json"
+    cache_path.parent.mkdir(parents=True)
+    cache_path.write_text("not extraction JSON")
+
+    async def extract(path, source_lang, model, sha256, phash, page, *_):
+        return PageExtraction(
+            page, str(path), sha256, phash, source_lang, model,
+            blocks=[SourceBlock(f"page_{page}_block_0", "paragraph", "source", 0)],
+        )
+
+    with patch("btran.orchestrator.extract_page", side_effect=extract) as leaf, \
+         patch("btran.orchestrator.translate_blocks", side_effect=lambda source, *_args, **_kwargs: translations(source)), \
+         patch("btran.orchestrator.build_epub"):
+        assert (await run(cfg)).errors == []
+
+    assert leaf.await_count == 1
+    assert json.loads(cache_path.read_text())["page_number"] == 1
+
+
+@pytest.mark.asyncio
+async def test_corrupt_translation_cache_is_a_miss_and_is_replaced(tmp_path: Path):
+    """Malformed cached translations never block a recoverable resume or reach EPUB."""
+    cfg = config(tmp_path)
+    cfg.input_dir.mkdir()
+    source_path = cfg.input_dir / "a.png"
+    image(source_path, (1, 2, 3))
+
+    async def extract(path, source_lang, model, sha256, phash, page, *_):
+        return PageExtraction(
+            page, str(path), sha256, phash, source_lang, model,
+            blocks=[SourceBlock(f"page_{page}_block_0", "paragraph", "source", 0)],
+        )
+
+    async def translate(source, _glossary, **_):
+        return translations(source)
+
+    with patch("btran.orchestrator.extract_page", side_effect=extract), \
+         patch("btran.orchestrator.translate_blocks", side_effect=translate) as leaf, \
+         patch("btran.orchestrator.build_epub"):
+        assert (await run(cfg)).errors == []
+        cache_path = next((cfg.intermediate_dir / "translation_cache").glob("*.json"))
+        cache_path.write_text("not translation JSON")
+        assert (await run(cfg)).errors == []
+
+    assert leaf.await_count == 2
+    assert json.loads(cache_path.read_text())[0]["block_id"] == "page_1_block_0"
+
+
+@pytest.mark.asyncio
 async def test_invalid_manifest_or_preflight_calls_no_pi_leaves(tmp_path: Path):
     cfg = config(tmp_path)
     cfg.input_dir.mkdir()

@@ -240,6 +240,7 @@ def test_tool_less_ephemeral_pi_call_returns_stdout_and_cleans_up_timeout(tmp_pa
     assert "--no-skills" in arguments
     assert "--no-prompt-templates" in arguments
     assert "--no-context-files" in arguments
+    assert "--no-approve" in arguments
     assert arguments[-1] == "prompt"
     with pytest.raises(PiConsolidationError, match="timed out"):
         pi_call("sleep")

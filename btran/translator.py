@@ -46,8 +46,25 @@ def _term_in_text(term: str, text: str) -> bool:
     return normalized_term in normalized_text
 
 
-def _glossary_slice(extraction: PageExtraction, glossary: TerminologyMap) -> list[dict]:
-    source_text = "\n".join(block.text for block in extraction.blocks)
+def _boundary(extraction: PageExtraction | None, *, tail: bool) -> dict | None:
+    """Return the one source excerpt that crosses a physical page boundary."""
+    if extraction is None or not extraction.blocks:
+        return None
+    blocks = sorted(extraction.blocks, key=lambda block: block.reading_order)
+    block = blocks[-1] if tail else blocks[0]
+    return {"page_number": extraction.page_number, "block_id": block.id, "text": block.text}
+
+
+def _glossary_slice(
+    extraction: PageExtraction,
+    glossary: TerminologyMap,
+    previous_page: PageExtraction | None = None,
+    next_page: PageExtraction | None = None,
+) -> list[dict]:
+    boundaries = (_boundary(previous_page, tail=True), _boundary(next_page, tail=False))
+    source_text = "\n".join(
+        [*(block.text for block in extraction.blocks), *(item["text"] for item in boundaries if item)]
+    )
     return [
         entry.to_dict()
         for entry in glossary.entries
@@ -55,19 +72,19 @@ def _glossary_slice(extraction: PageExtraction, glossary: TerminologyMap) -> lis
     ]
 
 
-def _translation_context(extraction: PageExtraction, glossary: TerminologyMap) -> dict:
-    blocks = extraction.blocks
+def _translation_context(
+    extraction: PageExtraction,
+    glossary: TerminologyMap,
+    previous_page: PageExtraction | None = None,
+    next_page: PageExtraction | None = None,
+) -> dict:
     return {
-        "source_blocks": [block.to_dict() for block in blocks],
-        "glossary": _glossary_slice(extraction, glossary),
-        "adjacent_source_boundaries": [
-            {
-                "block_id": block.id,
-                "previous": blocks[index - 1].text if index else None,
-                "next": blocks[index + 1].text if index + 1 < len(blocks) else None,
-            }
-            for index, block in enumerate(blocks)
-        ],
+        "source_blocks": [block.to_dict() for block in extraction.blocks],
+        "glossary": _glossary_slice(extraction, glossary, previous_page, next_page),
+        "adjacent_source_boundaries": {
+            "previous_page_tail": _boundary(previous_page, tail=True),
+            "next_page_head": _boundary(next_page, tail=False),
+        },
     }
 
 
@@ -148,9 +165,11 @@ async def translate_blocks(
     model: str,
     pi_bin: str = "pi",
     timeout: int = 120,
+    previous_page: PageExtraction | None = None,
+    next_page: PageExtraction | None = None,
 ) -> list[TranslatedBlock]:
-    """Translate source blocks in an isolated, tool-less, no-session Pi process."""
-    context = _translation_context(extraction, glossary)
+    """Translate a page independently with only adjacent-page source excerpts."""
+    context = _translation_context(extraction, glossary, previous_page, next_page)
     prompt = TRANSLATION_PROMPT.format(
         source_lang=extraction.source_lang,
         target_lang=glossary.target_lang,

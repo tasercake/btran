@@ -22,3 +22,48 @@ def test_flat_review_artifact_keeps_evidence_image_reference_and_resolution(tmp_
     resolve_item(path, "correct", correction="isle")
     assert unresolved_items(directory) == []
     assert json.loads(path.read_text())["resolution"] == {"action": "correct", "correction": "isle"}
+
+
+def test_current_review_set_archives_stale_artifacts_without_applying_them(tmp_path: Path):
+    """Only stable IDs in this run participate; resolved recurring items survive."""
+    directory = tmp_path / "needs_review"
+    stale = ReviewItem("old-concept", "low_confidence", True, {"concept_id": "old"})
+    current = ReviewItem("current-concept", "low_confidence", True, {"concept_id": "current"})
+    write_items(directory, [stale])
+    resolve_item(directory / "old-concept.json", "correct", correction="obsolete")
+    write_items(directory, [current], archive_stale=True)
+
+    assert not (directory / "old-concept.json").exists()
+    assert (directory / "archive" / "old-concept.json").is_file()
+    assert unresolved_items(directory) == [current]
+
+    resolve_item(directory / "current-concept.json", "accept")
+    write_items(directory, [current], archive_stale=True)
+    assert unresolved_items(directory) == []
+    assert json.loads((directory / "current-concept.json").read_text())["status"] == "resolved"
+
+
+def test_malformed_current_review_artifact_blocks_instead_of_being_replaced(tmp_path: Path):
+    """A current malformed decision cannot be silently accepted or overwritten."""
+    directory = tmp_path / "needs_review"
+    directory.mkdir()
+    (directory / "current.json").write_text("not json")
+    current = ReviewItem("current", "low_confidence", True, {"concept_id": "current"})
+
+    write_items(directory, [current], archive_stale=True)
+
+    pending = unresolved_items(directory)
+    assert len(pending) == 1
+    assert pending[0].kind == "malformed_review_artifact"
+
+
+def test_invalid_current_resolution_shape_blocks_review(tmp_path: Path):
+    """A syntactically JSON but invalid operator decision is also malformed."""
+    directory = tmp_path / "needs_review"
+    item = ReviewItem(
+        "current", "low_confidence", True, {"concept_id": "current"},
+        status="resolved", resolution={"action": "correct", "correction": " "},
+    )
+    write_items(directory, [item])
+
+    assert unresolved_items(directory)[0].kind == "malformed_review_artifact"

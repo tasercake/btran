@@ -241,6 +241,7 @@ def make_pi_consolidation_call(
             "--no-skills",
             "--no-prompt-templates",
             "--no-context-files",
+            "--no-approve",
             prompt,
         ]
         try:

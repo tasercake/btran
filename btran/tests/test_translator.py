@@ -157,6 +157,27 @@ def test_translation_cache_identity_changes_for_source_artifact_or_glossary():
     )
 
 
+def test_translation_context_uses_page_neighbors_and_slices_glossary_for_them():
+    """Boundary context is the adjacent pages, and its terminology is included."""
+    from btran.translator import _translation_context
+
+    previous = PageExtraction(
+        6, "page-006.jpg", "previous-sha", "unused", "ja", "extractor",
+        blocks=[SourceBlock("p6_b1", "paragraph", "前の犬", 0)],
+    )
+    following = PageExtraction(
+        8, "page-008.jpg", "next-sha", "unused", "ja", "extractor",
+        blocks=[SourceBlock("p8_b1", "paragraph", "次の犬", 0)],
+    )
+    context = _translation_context(_page(), _glossary(), previous, following)
+
+    assert context["adjacent_source_boundaries"] == {
+        "previous_page_tail": {"page_number": 6, "block_id": "p6_b1", "text": "前の犬"},
+        "next_page_head": {"page_number": 8, "block_id": "p8_b1", "text": "次の犬"},
+    }
+    assert {entry["concept_id"] for entry in context["glossary"]} == {"cat", "dog"}
+
+
 def test_translation_cache_identity_binds_prompt_and_output_schema():
     """Prompt or response-schema changes invalidate text translation cache entries."""
     import btran.translator as translator

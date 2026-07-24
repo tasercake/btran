@@ -21,7 +21,13 @@ from btran.preflight import normalize_exif_orientation_copy, preflight_manifest
 from btran.reconciliation import ReconciliationResult, reconcile
 from btran.review import ReviewItem, corrections, unresolved_items, write_items
 from btran.schema import ErrorResult, PageExtraction, PageResult, TerminologyMap, TranslatedBlock
-from btran.source_extractor import extract_page, legacy_page_text, to_file
+from btran.source_extractor import (
+    extract_page,
+    extraction_cache_identity,
+    legacy_page_text,
+    to_file,
+    validate_extraction_artifact,
+)
 from btran.terminology import (
     HARD_TOKEN_CAP,
     MAX_TOKEN_BUDGET,
@@ -87,6 +93,69 @@ def _error(errors: list[str], page: int, message: str, callback: PageErrorCallba
 def _source_artifact_hash(extraction: PageExtraction) -> str:
     data = json.dumps(extraction.to_dict(), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(data.encode()).hexdigest()
+
+
+def _translation_source_hash(
+    extraction: PageExtraction,
+    previous_page: PageExtraction | None,
+    next_page: PageExtraction | None,
+) -> str:
+    """Bind a translation cache entry to its page plus true boundary excerpts."""
+    def boundary(page: PageExtraction | None, tail: bool) -> dict | None:
+        if page is None or not page.blocks:
+            return None
+        blocks = sorted(page.blocks, key=lambda block: block.reading_order)
+        block = blocks[-1] if tail else blocks[0]
+        return {"page": page.page_number, "block_id": block.id, "text": block.text}
+
+    payload = {
+        "source_artifact": _source_artifact_hash(extraction),
+        "previous_page_tail": boundary(previous_page, True),
+        "next_page_head": boundary(next_page, False),
+    }
+    return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+
+
+def _valid_translation_cache_entry(value: object, source: PageExtraction) -> list[TranslatedBlock] | None:
+    """Return an exact cached block bijection, or fail closed to a model miss."""
+    if not isinstance(value, list):
+        return None
+    try:
+        translated = [TranslatedBlock.from_dict(item) for item in value]
+    except (TypeError, ValueError, KeyError):
+        return None
+    source_ids = [block.id for block in source.blocks]
+    if (
+        len(translated) != len(source_ids)
+        or [block.block_id for block in translated] != source_ids
+        or any(not isinstance(block.translated_text, str) for block in translated)
+    ):
+        return None
+    return translated
+
+
+def _valid_source_cache_entry(
+    artifact: PageExtraction,
+    *,
+    page_number: int,
+    image_path: Path,
+    sha256: str,
+    phash: str,
+    source_lang: str,
+    model: str,
+) -> bool:
+    try:
+        validate_extraction_artifact(artifact)
+    except Exception:
+        return False
+    return (
+        artifact.page_number == page_number
+        and artifact.image_path == str(image_path)
+        and artifact.sha256 == sha256
+        and artifact.phash == phash
+        and artifact.source_lang == source_lang
+        and artifact.model == model
+    )
 
 
 def _result_from(extraction: PageExtraction, translated: list[TranslatedBlock], target_lang: str) -> PageResult:
@@ -263,10 +332,27 @@ async def run(config: Config, on_page_error: PageErrorCallback | None = None) ->
 
     async def extract(number: int, path: Path) -> PageExtraction:
         sha, phash = hashes[number]
+        source_cache = work / "source_cache" / f"{extraction_cache_identity(sha, config.source_lang, config.model)}.json"
+        if not config.no_resume and source_cache.exists():
+            try:
+                cached = PageExtraction.from_file(source_cache)
+            except Exception:
+                cached = None
+            if cached is not None and _valid_source_cache_entry(
+                cached, page_number=number, image_path=original_paths[number], sha256=sha, phash=phash,
+                source_lang=config.source_lang, model=config.model,
+            ):
+                to_file(cached, work / "source" / f"page_{number:04d}.json")
+                return cached
         result = await _with_retries(lambda: extract_page(path, config.source_lang, config.model, sha, phash, number, config.pi_bin, config.timeout), config.max_retries)
         # The artifact refers to the source photo, even if a safe normalized copy was sent to Pi.
         result.image_path = str(original_paths[number])
         to_file(result, work / "source" / f"page_{number:04d}.json")
+        if _valid_source_cache_entry(
+            result, page_number=number, image_path=original_paths[number], sha256=sha, phash=phash,
+            source_lang=config.source_lang, model=config.model,
+        ):
+            to_file(result, source_cache)
         return result
 
     extracted, failures = await _parallel_pages(processed, config.concurrency, extract, on_page_error)
@@ -284,6 +370,7 @@ async def run(config: Config, on_page_error: PageErrorCallback | None = None) ->
         artifact = work / "source" / f"page_{number:04d}.json"
         try:
             checkpointed[number] = PageExtraction.from_file(artifact)
+            validate_extraction_artifact(checkpointed[number])
         except Exception as exc:
             _error(errors, number, f"source checkpoint is missing or malformed: {exc}", on_page_error)
     if errors:
@@ -312,7 +399,7 @@ async def run(config: Config, on_page_error: PageErrorCallback | None = None) ->
     _record_stage(state, checkpoint, "glossary", "frozen", hash=glossary.hash, version=glossary.version)
 
     reviews = work / "needs_review"
-    write_items(reviews, _initial_review_items(glossary, original_paths))
+    write_items(reviews, _initial_review_items(glossary, original_paths), archive_stale=True)
     if unresolved_items(reviews):
         errors.append("[btran] blocking glossary review items remain unresolved")
         _record_stage(state, checkpoint, "review", "blocked", count=len(unresolved_items(reviews)))
@@ -331,14 +418,24 @@ async def run(config: Config, on_page_error: PageErrorCallback | None = None) ->
         state["glossary"] = {"version": glossary.version, "hash": glossary.hash}
         _record_stage(state, checkpoint, "review", "applied", glossary_hash=glossary.hash)
 
+    expected_numbers = state["expected_pages"]
+    positions = {number: index for index, number in enumerate(expected_numbers)}
+
     async def translate(number: int, _: Path, frozen: TerminologyMap) -> list[TranslatedBlock]:
         source = extracted[number]
-        identity = translation_cache_identity(source_artifact_hash=_source_artifact_hash(source), glossary_hash=frozen.hash, source_lang=config.source_lang, target_lang=config.target_lang, model=config.model)
+        index = positions[number]
+        previous_page = extracted[expected_numbers[index - 1]] if index else None
+        next_page = extracted[expected_numbers[index + 1]] if index + 1 < len(expected_numbers) else None
+        identity = translation_cache_identity(source_artifact_hash=_translation_source_hash(source, previous_page, next_page), glossary_hash=frozen.hash, source_lang=config.source_lang, target_lang=config.target_lang, model=config.model)
         cache_path = work / "translation_cache" / f"{identity}.json"
         if not config.no_resume and cache_path.exists():
-            values = json.loads(cache_path.read_text())
-            return [TranslatedBlock.from_dict(item) for item in values]
-        value = await _with_retries(lambda: translate_blocks(source, frozen, model=config.model, pi_bin=config.pi_bin, timeout=config.timeout), config.max_retries)
+            try:
+                cached = _valid_translation_cache_entry(json.loads(cache_path.read_text()), source)
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                cached = None
+            if cached is not None:
+                return cached
+        value = await _with_retries(lambda: translate_blocks(source, frozen, model=config.model, pi_bin=config.pi_bin, timeout=config.timeout, previous_page=previous_page, next_page=next_page), config.max_retries)
         _atomic_json(cache_path, [item.to_dict() for item in value])
         return value
 
@@ -373,7 +470,7 @@ async def run(config: Config, on_page_error: PageErrorCallback | None = None) ->
         _record_stage(state, checkpoint, "reconciliation", "failed", reason=str(exc))
         _record_stage(state, checkpoint, "epub", "skipped", reason="reconciliation gate")
         return RunResult(errors)
-    write_items(reviews, _reconciliation_review_items(reconciliation, original_paths))
+    write_items(reviews, _reconciliation_review_items(reconciliation, original_paths), archive_stale=True)
     if reconciliation.glossary_diff:
         glossary = reconciliation.glossary_v2
         state["glossary"] = {"version": glossary.version, "hash": glossary.hash}
