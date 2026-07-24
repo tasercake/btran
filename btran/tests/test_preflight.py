@@ -1,16 +1,18 @@
 """Tests for image input preflight checks."""
 
+import os
 from pathlib import Path
 
 from PIL import Image
+import pytest
 
 from btran.preflight import (
     BLUR_VARIANCE_THRESHOLD,
     PreflightResult,
     check_blur,
     check_resolution,
-    correct_exif_orientation,
     detect_duplicates,
+    normalize_exif_orientation_copy,
     preflight_manifest,
 )
 from btran.schema import Manifest
@@ -36,21 +38,56 @@ def test_resolution_at_500px_on_smallest_side_passes():
     assert check_resolution(FIXTURES / "hi_res_page.png", page_number=1) is None
 
 
-def test_exif_orientation_is_corrected_in_place_and_warned(tmp_path):
+def test_preflight_reports_exif_orientation_without_rewriting_source(tmp_path):
     path = tmp_path / "rotated_page.jpg"
     _copy_image("rotated_page.jpg", path)
-    before = Image.open(path)
-    assert before.size == (800, 600)
-    assert before.getexif().get(274) == 6
+    source_bytes = path.read_bytes()
+    manifest = Manifest(
+        input_dir=str(tmp_path),
+        pages=[{"filename": path.name, "page_number": 1, "status": "pending"}],
+        total_pages=1,
+    )
 
-    issue = correct_exif_orientation(path, page_number=1)
+    result = preflight_manifest(manifest)
 
-    corrected = Image.open(path)
-    assert issue is not None
-    assert issue.severity == "warning"
-    assert issue.check == "orientation"
-    assert corrected.size == (600, 800)
-    assert corrected.getexif().get(274, 1) == 1
+    assert any(issue.check == "orientation" for issue in result.warnings)
+    assert path.read_bytes() == source_bytes
+
+
+def test_normalize_exif_orientation_copy_writes_normalized_copy_without_changing_source(tmp_path):
+    source = tmp_path / "rotated_page.jpg"
+    output = tmp_path / "normalized_page.jpg"
+    _copy_image("rotated_page.jpg", source)
+    source_bytes = source.read_bytes()
+
+    written_path = normalize_exif_orientation_copy(source, output)
+
+    normalized = Image.open(output)
+    assert written_path == output
+    assert source.read_bytes() == source_bytes
+    assert normalized.size == (600, 800)
+    assert normalized.getexif().get(274, 1) == 1
+
+
+def test_normalize_exif_orientation_copy_rejects_source_as_destination(tmp_path):
+    source = tmp_path / "rotated_page.jpg"
+    _copy_image("rotated_page.jpg", source)
+
+    with pytest.raises(ValueError, match="must differ"):
+        normalize_exif_orientation_copy(source, source)
+
+
+def test_normalize_exif_orientation_copy_rejects_hardlinked_source_destination(tmp_path):
+    source = tmp_path / "rotated_page.jpg"
+    output = tmp_path / "hardlinked_normalized_page.jpg"
+    _copy_image("rotated_page.jpg", source)
+    source_bytes = source.read_bytes()
+    os.link(source, output)
+
+    with pytest.raises(ValueError, match="must differ"):
+        normalize_exif_orientation_copy(source, output)
+
+    assert source.read_bytes() == source_bytes
 
 
 def test_sharp_image_passes_laplacian_blur_check():

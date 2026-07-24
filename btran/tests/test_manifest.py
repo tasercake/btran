@@ -72,6 +72,23 @@ class TestManifestValidation:
         assert [page["page_number"] for page in manifest.pages] == [1, 2]
         assert manifest.total_pages == 2
 
+    def test_validate_rejects_nonsequential_page_numbers_in_manifest_order(self, tmp_path):
+        _copy_image("hi_res_page.png", tmp_path / "page_001.png")
+        _copy_image("hi_res_page.png", tmp_path / "page_002.png")
+        from btran.schema import Manifest
+
+        manifest = Manifest(
+            input_dir=str(tmp_path),
+            pages=[
+                {"filename": "page_001.png", "page_number": 2, "status": "pending"},
+                {"filename": "page_002.png", "page_number": 1, "status": "pending"},
+            ],
+            total_pages=2,
+        )
+
+        with pytest.raises(ManifestValidationError, match="ordered sequentially"):
+            validate_manifest(manifest)
+
     def test_validate_rejects_missing_referenced_page(self, tmp_path):
         from btran.schema import Manifest
 

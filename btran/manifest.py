@@ -104,6 +104,11 @@ def validate_manifest(manifest: Manifest) -> None:
             raise ManifestValidationError(f"page {index} filename must be a bare filename: {filename}")
         if not isinstance(page_number, int) or isinstance(page_number, bool) or page_number < 1:
             raise ManifestValidationError(f"page {index} page_number must be a positive integer")
+        if page_number != index:
+            raise ManifestValidationError(
+                "manifest pages must be ordered sequentially "
+                f"(expected page_number {index}, got {page_number})"
+            )
         if page_number in page_numbers:
             raise ManifestValidationError(f"duplicate page_number: {page_number}")
         if filename in filenames:

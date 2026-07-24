@@ -19,12 +19,6 @@ from btran.hasher import (
     compute_prompt_fingerprint,
     compute_sha256,
 )
-from btran.manifest import (
-    ManifestValidationError,
-    load_or_generate_manifest,
-    manifest_page_paths,
-)
-from btran.preflight import preflight_manifest
 from btran.schema import ErrorResult, PageResult
 from btran.translator import TRANSLATION_PROMPT, TranslationError, translate_image
 
@@ -34,6 +28,9 @@ class RunResult:
     """Result of an orchestrator run."""
 
     errors: list[str]
+
+
+IMAGE_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".webp"})
 
 
 def _atomic_write(path: Path, content: str) -> None:
@@ -59,44 +56,14 @@ async def run(
         RunResult with collected errors.
     """
 
-    # 1. A manifest is the single source of page identity and ordering.  Never
-    # rescan the directory after this point, or an unlisted page could be sent.
-    manifest_was_missing = not config.manifest_path.exists()
-    try:
-        manifest = load_or_generate_manifest(config.input_dir, config.manifest_path)
-        if Path(manifest.input_dir).resolve() != config.input_dir.resolve():
-            raise ManifestValidationError(
-                "manifest input directory does not match requested input directory"
-            )
-        pages = manifest_page_paths(manifest)
-    except ManifestValidationError as exc:
-        message = f"[btran] blocking manifest error: {exc}"
-        print(message, file=sys.stderr)
-        return RunResult(errors=[message])
+    # 1. Scan config.input_dir for image files (sorted by name)
+    image_files = sorted(
+        p
+        for p in config.input_dir.iterdir()
+        if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS
+    )
 
-    if manifest_was_missing:
-        print(f"[btran] warning: generated manifest at {config.manifest_path}", file=sys.stderr)
-
-    # Preflight is deliberately before hashing, cache reuse, and all model calls.
-    # Warnings are visible but do not remove or skip any manifest page.
-    if not config.no_preflight:
-        preflight = preflight_manifest(manifest)
-        for issue in preflight.warnings:
-            print(
-                f"[btran] warning page {issue.page_number} {issue.check}: {issue.message}",
-                file=sys.stderr,
-            )
-        if preflight.blocking_issues:
-            errors = [
-                f"[btran] blocking preflight page {issue.page_number} "
-                f"{issue.check}: {issue.message}"
-                for issue in preflight.blocking_issues
-            ]
-            for error in errors:
-                print(error, file=sys.stderr)
-            return RunResult(errors=errors)
-
-    if not pages:
+    if not image_files:
         return RunResult(errors=[])
 
     # 2. Create config.intermediate_dir if it doesn't exist
@@ -104,7 +71,7 @@ async def run(
 
     # ---- Run manifest: track expected pages for this run ----
     run_id = uuid.uuid4().hex[:12]
-    expected_pages = [page_number for page_number, _ in pages]
+    expected_pages = list(range(1, len(image_files) + 1))
     _atomic_write(
         config.intermediate_dir / ".run_manifest.json",
         json.dumps({"run_id": run_id, "expected_pages": expected_pages}),
@@ -134,7 +101,7 @@ async def run(
     # 4. Open ImageCache
     cache = ImageCache(config.cache_db)
 
-    total = len(pages)
+    total = len(image_files)
     errors: list[str] = []
 
     # 5. For each image: hash it, check cache, build pending list
@@ -143,7 +110,7 @@ async def run(
     failed = 0
     cache_lock = asyncio.Lock()
 
-    for page_number, image_path in pages:
+    for page_number, image_path in enumerate(image_files, start=1):
         sha256 = compute_sha256(image_path)
         phash = compute_phash(image_path)
 

@@ -1,7 +1,8 @@
 """Image safety checks run before any page is sent to a model.
 
-Resolution and unreadable inputs block a run.  Orientation is corrected in
-place; blur and duplicate findings are warnings for the operator to review.
+Resolution and unreadable inputs block a run. Orientation, blur, and duplicate
+findings are warnings for the operator to review. Preflight never modifies a
+source image.
 """
 
 from __future__ import annotations
@@ -75,31 +76,48 @@ def check_resolution(image_path: Path | str, page_number: int) -> PreflightIssue
     )
 
 
-def correct_exif_orientation(
+def check_exif_orientation(
     image_path: Path | str, page_number: int
 ) -> PreflightIssue | None:
-    """Apply a non-normal EXIF orientation in place and return a warning."""
+    """Warn about a non-normal EXIF orientation without changing the source."""
     path = Path(image_path)
     with Image.open(path) as image:
         orientation = image.getexif().get(274, 1)
-        if orientation == 1:
-            return None
-        corrected = ImageOps.exif_transpose(image)
-        corrected.load()
-        image_format = image.format
-
-    exif = corrected.getexif()
-    exif[274] = 1
-    temporary_path = path.with_name(f".{path.name}.orientation-tmp")
-    corrected.save(temporary_path, format=image_format, exif=exif.tobytes())
-    temporary_path.replace(path)
+    if orientation == 1:
+        return None
     return _issue(
         page_number,
         path,
         "orientation",
         "warning",
-        f"EXIF orientation {orientation} was auto-corrected",
+        f"EXIF orientation {orientation} detected; source image was not modified",
     )
+
+
+def normalize_exif_orientation_copy(
+    image_path: Path | str, output_path: Path | str
+) -> Path:
+    """Write an EXIF-normalized copy without modifying ``image_path``.
+
+    The caller must choose a different destination; using the source as the
+    destination is rejected to preserve preflight's non-destructive contract.
+    """
+    source = Path(image_path)
+    destination = Path(output_path)
+    if source.resolve() == destination.resolve() or (
+        destination.exists() and source.samefile(destination)
+    ):
+        raise ValueError("output_path must differ from image_path")
+
+    with Image.open(source) as image:
+        normalized = ImageOps.exif_transpose(image)
+        normalized.load()
+        image_format = image.format
+
+    exif = normalized.getexif()
+    exif[274] = 1
+    normalized.save(destination, format=image_format, exif=exif.tobytes())
+    return destination
 
 
 def laplacian_variance(image_path: Path | str) -> float:
@@ -205,7 +223,7 @@ def preflight_manifest(manifest: Manifest) -> PreflightResult:
     readable_pages: list[tuple[int, Path]] = []
     for page_number, path in pages:
         try:
-            orientation_issue = correct_exif_orientation(path, page_number)
+            orientation_issue = check_exif_orientation(path, page_number)
             if orientation_issue is not None:
                 result.issues.append(orientation_issue)
             resolution_issue = check_resolution(path, page_number)
