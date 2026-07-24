@@ -34,10 +34,6 @@ class TestDefaults:
         cfg = load_config(["dummy_in", "dummy_out.epub", "--target-lang", "fr"])
         assert cfg.intermediate_dir == Path("./intermediate")
 
-    def test_default_cache_db_is_path(self):
-        cfg = load_config(["dummy_in", "dummy_out.epub", "--target-lang", "fr"])
-        assert cfg.cache_db == Path("./cache.sqlite")
-
     def test_default_pi_bin(self):
         cfg = load_config(["dummy_in", "dummy_out.epub", "--target-lang", "fr"])
         assert cfg.pi_bin == "pi"
@@ -107,11 +103,6 @@ class TestEnvVars:
         monkeypatch.setenv("BTRAN_INTERMEDIATE_DIR", "/tmp/work")
         cfg = load_config(["in", "out.epub", "--target-lang", "fr"])
         assert cfg.intermediate_dir == Path("/tmp/work")
-
-    def test_env_cache_db(self, monkeypatch):
-        monkeypatch.setenv("BTRAN_CACHE_DB", "/tmp/cache.db")
-        cfg = load_config(["in", "out.epub", "--target-lang", "fr"])
-        assert cfg.cache_db == Path("/tmp/cache.db")
 
     def test_env_pi_bin(self, monkeypatch):
         monkeypatch.setenv("BTRAN_PI_BIN", "/usr/local/bin/pi")
@@ -252,10 +243,6 @@ class TestPathObjects:
         cfg = load_config(["in", "out.epub", "--target-lang", "fr"])
         assert isinstance(cfg.intermediate_dir, Path)
 
-    def test_cache_db_is_path(self):
-        cfg = load_config(["in", "out.epub", "--target-lang", "fr"])
-        assert isinstance(cfg.cache_db, Path)
-
 
 class TestDotenvLoading:
     """Integration: .env file values are loaded."""
@@ -293,8 +280,6 @@ class TestNewConfigFields:
         assert cfg.manifest_path == Path("manifest.json")
         assert cfg.glossary_path == Path("glossary.json")
         assert cfg.glossary_budget == 100_000
-        assert cfg.review is False
-        assert cfg.preflight_only is False
 
     def test_environment_loading_and_types(self, monkeypatch):
         monkeypatch.setenv("BTRAN_EPUB_CHECK", "true")
@@ -317,7 +302,7 @@ class TestNewConfigFields:
         assert cfg.manifest_path == Path("/cli/manifest.json")
         assert cfg.glossary_budget == 200
 
-    def test_preflight_only_environment_control(self, monkeypatch):
+    def test_preflight_only_environment_control_is_rejected(self, monkeypatch):
         monkeypatch.setenv("BTRAN_PREFLIGHT_ONLY", "true")
-        cfg = load_config(["in", "out.epub", "--target-lang", "fr"])
-        assert cfg.preflight_only is True
+        with pytest.raises(ValueError, match="not supported"):
+            load_config(["in", "out.epub", "--target-lang", "fr"])

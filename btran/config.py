@@ -18,10 +18,13 @@ MAX_RETRIES_MAXIMUM = 10
 TIMEOUT_MAXIMUM = 3_600
 _ENV_PREFIX = "BTRAN_"
 _UNSUPPORTED_ENV_CONTROLS = {
+    "CACHE_DB": "the merged orchestrator uses its work-owned translation cache",
     "NO_PREFLIGHT": "preflight is always enabled",
     "EVAL_DIR": "the evaluation corpus is a developer harness, not a production control",
     "GLOSSARY_PATH": "glossary output paths are managed by the pipeline",
     "RECONCILIATION_ROUNDS": "reconciliation always uses one round",
+    "PREFLIGHT_ONLY": "the merged orchestrator always runs preflight as part of a full run",
+    "REVIEW": "the merged orchestrator automatically blocks on unresolved review items",
 }
 
 
@@ -40,7 +43,6 @@ class Config:
     max_retries: int = 3
     timeout: int = 120
     intermediate_dir: Path = Path("./intermediate")
-    cache_db: Path = Path("./cache.sqlite")
     pi_bin: str = "pi"
     title: str = "Translated Book"
     author: str = "Unknown"
@@ -54,8 +56,6 @@ class Config:
     # Internal pipeline artifact location; deliberately not a CLI/env control.
     glossary_path: Path = Path("glossary.json")
     glossary_budget: int = GLOSSARY_BUDGET_DEFAULT
-    review: bool = False
-    preflight_only: bool = False
 
 
 def _flag_env(value: str) -> bool:
@@ -76,7 +76,6 @@ _ENV_FIELDS: dict[str, tuple[str, Callable[[str], object]]] = {
     "max_retries": ("MAX_RETRIES", int),
     "timeout": ("TIMEOUT", int),
     "intermediate_dir": ("INTERMEDIATE_DIR", Path),
-    "cache_db": ("CACHE_DB", Path),
     "pi_bin": ("PI_BIN", str),
     "title": ("TITLE", str),
     "author": ("AUTHOR", str),
@@ -88,14 +87,11 @@ _ENV_FIELDS: dict[str, tuple[str, Callable[[str], object]]] = {
     "epub_check_path": ("EPUB_CHECK_PATH", str),
     "manifest_path": ("MANIFEST_PATH", Path),
     "glossary_budget": ("GLOSSARY_BUDGET", int),
-    "review": ("REVIEW", _flag_env),
-    "preflight_only": ("PREFLIGHT_ONLY", _flag_env),
 }
 _PATH_FIELDS = {
     "input_dir",
     "output_epub",
     "intermediate_dir",
-    "cache_db",
     "manifest_path",
 }
 
@@ -164,11 +160,6 @@ def _validate_config(
             parser.error(f"{field_name} must be positive")
         if value > maximum:
             parser.error(f"{field_name} must not exceed {maximum}")
-    if config.preflight_only and config.review:
-        parser.error("--preflight-only cannot be combined with --review")
-    if config.preflight_only and config.epub_check:
-        parser.error("--preflight-only cannot be combined with --epub-check")
-
     if config.epub_check and not config.epub_check_path.strip():
         parser.error("epub_check_path must not be empty when --epub-check is enabled")
 
@@ -196,7 +187,6 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-retries", type=int, default=None)
     parser.add_argument("--timeout", type=int, default=None)
     parser.add_argument("--intermediate-dir", default=None)
-    parser.add_argument("--cache-db", default=None)
     parser.add_argument("--title", default=None)
     parser.add_argument("--author", default=None)
     parser.add_argument("--embed-images", action="store_true", default=None)
@@ -206,6 +196,4 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--epub-check-path", default=None)
     parser.add_argument("--manifest-path", default=None)
     parser.add_argument("--glossary-budget", type=int, default=None)
-    parser.add_argument("--review", action="store_true", default=None)
-    parser.add_argument("--preflight-only", action="store_true", default=None)
     return parser

@@ -28,12 +28,20 @@ def test_explicit_manifest_cli_value_overrides_environment(monkeypatch):
     assert config.manifest_path == Path("/cli/manifest.json")
 
 
-def test_preflight_only_and_review_are_production_controls():
-    config = load_config([*_ARGS, "--preflight-only"])
-    assert config.preflight_only is True
+@pytest.mark.parametrize("banned_flag", ["--preflight-only", "--review"])
+def test_unimplemented_orchestrator_mode_flags_are_not_accepted(banned_flag):
+    with pytest.raises(SystemExit) as exc:
+        load_config([*_ARGS, banned_flag])
 
-    config = load_config([*_ARGS, "--review"])
-    assert config.review is True
+    assert exc.value.code == 2
+
+
+@pytest.mark.parametrize("environment", ["BTRAN_CACHE_DB", "BTRAN_PREFLIGHT_ONLY", "BTRAN_REVIEW"])
+def test_unimplemented_orchestrator_mode_environment_controls_are_rejected(monkeypatch, environment):
+    monkeypatch.setenv(environment, "1")
+
+    with pytest.raises(ValueError, match="not supported"):
+        load_config(_ARGS)
 
 
 @pytest.mark.parametrize(
@@ -75,18 +83,6 @@ def test_resource_controls_have_safe_upper_bounds(flag, value, message, capsys):
     assert message in capsys.readouterr().err
 
 
-@pytest.mark.parametrize(
-    "args",
-    [["--preflight-only", "--review"]],
-)
-def test_conflicting_production_modes_are_rejected(args, capsys):
-    with pytest.raises(SystemExit) as exc:
-        load_config([*_ARGS, *args])
-
-    assert exc.value.code == 2
-    assert "error:" in capsys.readouterr().err
-
-
 def test_epubcheck_path_can_be_configured_before_strict_check_is_enabled(monkeypatch):
     monkeypatch.setenv("BTRAN_EPUB_CHECK_PATH", "/opt/epubcheck")
 
@@ -120,10 +116,13 @@ def test_empty_explicit_paths_are_rejected(args):
     assert exc.value.code == 2
 
 
-@pytest.mark.parametrize("banned_flag", ["--no-preflight", "--eval-dir", "--reconciliation-rounds"])
-def test_banned_production_flags_are_not_accepted(banned_flag):
+@pytest.mark.parametrize(
+    ("banned_flag", "value"),
+    [("--cache-db", "/tmp/cache.sqlite"), ("--no-preflight", None), ("--eval-dir", "eval"), ("--reconciliation-rounds", "2")],
+)
+def test_banned_production_flags_are_not_accepted(banned_flag, value):
     with pytest.raises(SystemExit) as exc:
-        load_config([*_ARGS, banned_flag])
+        load_config([*_ARGS, banned_flag, *([] if value is None else [value])])
 
     assert exc.value.code == 2
 
@@ -138,7 +137,7 @@ def test_unsafe_legacy_preflight_environment_is_rejected(monkeypatch):
 def test_config_has_no_production_eval_or_bypass_fields():
     config_fields = set(Config.__dataclass_fields__)
 
-    assert {"eval_dir", "no_preflight"}.isdisjoint(config_fields)
+    assert {"cache_db", "eval_dir", "no_preflight", "preflight_only", "review"}.isdisjoint(config_fields)
     # Kept only as an internal artifact location required by the WP-7 runner;
     # it has no CLI or environment control.
     assert "glossary_path" in config_fields

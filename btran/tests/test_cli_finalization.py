@@ -1,4 +1,4 @@
-"""CLI boundary tests against the frozen Gate 1 fake orchestrator contract."""
+"""CLI boundary tests; real orchestrator integration lives in a companion suite."""
 
 from __future__ import annotations
 
@@ -68,17 +68,6 @@ def test_fake_contract_streams_page_error_before_completion(capsys):
 
     assert exc.value.code == 1
     assert "1 page(s) failed" in capsys.readouterr().err
-
-
-def test_preflight_only_does_not_require_pi_binary():
-    async def fake_runner(config: Config, on_page_error=None) -> RunResult:
-        assert config.preflight_only is True
-        return RunResult(errors=[])
-
-    with patch("btran.cli.load_config", return_value=_config(preflight_only=True)):
-        with patch("btran.cli.shutil.which", return_value=None):
-            with patch("btran.cli.orchestrator_run", new=fake_runner):
-                main()
 
 
 def test_input_path_must_be_a_directory(tmp_path, capsys):

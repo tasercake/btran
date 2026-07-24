@@ -16,33 +16,35 @@ btran ./photos/ output.epub --target-lang ja --model gemini-2.5-flash
 
 The CLI requires `INPUT_DIR`, `OUTPUT_EPUB`, and a target language (flag or
 `BTRAN_TARGET_LANG`). CLI options override `.env` values. See `.env.example`
-for the complete production configuration surface.
+for the complete supported production configuration surface.
 
-Useful final-run controls (consumed by the Gate 1 orchestration integration):
+## Integrated pipeline
 
-- `--manifest-path PATH` selects a manifest explicitly. The default is
-  `INPUT_DIR/manifest.json`; relative paths also resolve beneath `INPUT_DIR`,
-  never from the caller's cwd.
+Each run loads or creates a manifest, preflights every listed page, extracts
+source blocks, freezes a glossary, translates, performs the fixed single
+reconciliation pass, validates the results, and writes the EPUB. Any terminal
+page or gate failure prevents EPUB output and returns a nonzero exit status.
+Terminal page failures stream to stderr once as they occur; the CLI emits one
+final failure summary.
+
+Preflight is mandatory and unresolved glossary or terminology review items
+block the run until their resolution artifacts are supplied in the work
+directory. These are pipeline gates, not optional CLI modes. Reconciliation is
+fixed to one pass and the eval corpus is a developer harness, not a production
+control.
+
+## Production controls
+
+- `--manifest-path PATH` selects a manifest explicitly. Without it, the runner
+  creates or loads `INPUT_DIR/manifest.json`. Relative manifest paths are
+  resolved beneath `INPUT_DIR`, never from the caller's cwd.
+- `--glossary-budget N` controls the terminology consolidation budget. It
+  defaults to 100,000 and is capped at 120,000.
 - `--epub-check [--epub-check-path PATH]` strictly validates the generated
-  EPUB; the checker must be resolvable on `PATH` (or supplied explicitly).
-- `--review` enables the one allowed review/resolution pass.
-- `--preflight-only` runs input validation without requiring `pi`.
-- `--glossary-budget N` defaults to 100,000 and is capped at 120,000.
+  EPUB with the named checker; supply a path when it is not on `PATH`.
+- `--embed-images` embeds original page images in the generated EPUB.
+- `--no-resume` bypasses the work-owned translation cache for this run.
 
-Resource bounds: concurrency is 1–32, `--max-retries` is 1–10 total attempts
-(the existing pipeline meaning of that flag), and timeout is 1–3,600 seconds.
-
-Preflight is always enabled. Reconciliation is fixed to one round, and the eval
-corpus remains a developer harness rather than a production CLI control.
-
-This CLI/configuration boundary intentionally does not alter orchestration.
-The WP-7 runner consumes these controls; until that runner is integrated, the
-legacy runner does not implement manifest, preflight-only, review, or EPUBCheck
-behavior.
-
-## Pipeline behavior after WP-7 integration
-
-1. Builds or loads an input manifest and preflights every page
-2. Translates pages through `pi` with bounded concurrency and attempts
-3. Streams terminal page errors to stderr and fails the run if any page fails
-4. Compiles all successful results into an EPUB with `ebooklib`
+Resource bounds: concurrency is 1–32, `--max-retries` is 1–10 total attempts,
+and timeout is 1–3,600 seconds. `--pi-bin` selects the `pi` executable used by
+the model leaves.

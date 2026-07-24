@@ -11,9 +11,6 @@ from btran.orchestrator import orchestrator_run
 from btran.orchestrator_contract import OrchestratorCallable, RunResult
 
 
-IMAGE_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".webp"})
-
-
 def main() -> None:
     """Run the production CLI against the frozen orchestrator callable."""
     try:
@@ -30,20 +27,11 @@ def main() -> None:
     if not config.input_dir.is_dir():
         print(f"Error: input_dir is not a directory: {config.input_dir}", file=sys.stderr)
         raise SystemExit(1)
-    if not config.preflight_only and not shutil.which(config.pi_bin):
+    if not shutil.which(config.pi_bin):
         print(f"Error: pi_bin not found: {config.pi_bin}", file=sys.stderr)
         raise SystemExit(1)
-    try:
-        image_count = sum(
-            1
-            for path in config.input_dir.iterdir()
-            if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
-        )
-    except OSError:
-        image_count = 0
-
     print(
-        f"btran — translating {image_count} images from {config.source_lang}"
+        f"btran — translating images from {config.source_lang}"
         f" → {config.target_lang} using {config.model}"
     )
 
