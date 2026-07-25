@@ -31,7 +31,7 @@ def _translations(source: PageExtraction) -> list[TranslatedBlock]:
 
 
 def _argv(input_dir: Path, output: Path, work: Path, *options: str) -> list[str]:
-    return ["btran", str(input_dir), str(output), "--source-lang", "ja", "--target-lang", "en", "--intermediate-dir", str(work), *options]
+    return ["btran", str(input_dir), str(output), "--target-lang", "en", "--intermediate-dir", str(work), *options]
 
 
 def test_cli_runs_merged_orchestrator_with_default_manifest_budget_and_epubcheck(tmp_path: Path):
@@ -62,6 +62,7 @@ def test_cli_runs_merged_orchestrator_with_default_manifest_budget_and_epubcheck
         main()
 
     assert extract.await_count == 1
+    assert captured["source_lang"] == "ja"
     assert captured["token_budget"] == 99_999
     assert (input_dir / "manifest.json").is_file()
     assert build.call_args.kwargs["epub_check"] is True
@@ -91,7 +92,7 @@ def test_cli_uses_explicit_manifest_and_streams_one_terminal_page_error(tmp_path
     assert exc.value.code == 1
     assert extract.await_count == 1
     captured = capsys.readouterr()
-    assert "btran — translating images from ja → en" in captured.out
+    assert "btran — auto-detecting source languages → en" in captured.out
     assert "translating 2 images" not in captured.out
     stderr = captured.err
     assert stderr.count("[btran] page 1 failed: RuntimeError: OCR unavailable") == 1

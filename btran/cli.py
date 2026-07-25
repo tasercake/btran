@@ -31,7 +31,7 @@ def main() -> None:
         print(f"Error: pi_bin not found: {config.pi_bin}", file=sys.stderr)
         raise SystemExit(1)
     print(
-        f"btran — translating images from {config.source_lang}"
+        f"btran — auto-detecting source languages"
         f" → {config.target_lang} using {config.model}"
     )
 

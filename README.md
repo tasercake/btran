@@ -15,7 +15,8 @@ btran ./photos/ output.epub --target-lang ja --model gemini-2.5-flash
 ```
 
 The CLI requires `INPUT_DIR`, `OUTPUT_EPUB`, and a target language (flag or
-`BTRAN_TARGET_LANG`). CLI options override `.env` values. See `.env.example`
+`BTRAN_TARGET_LANG`). It detects the source language for every page during
+extraction. CLI options override `.env` values. See `.env.example`
 for the complete supported production configuration surface.
 
 ## Integrated pipeline

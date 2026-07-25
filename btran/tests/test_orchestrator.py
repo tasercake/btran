@@ -14,7 +14,7 @@ from btran.schema import PageExtraction, SourceBlock, TranslatedBlock
 
 
 def _config(tmp_path: Path) -> Config:
-    return Config(input_dir=tmp_path / "in", output_epub=tmp_path / "out.epub", intermediate_dir=tmp_path / "work", source_lang="ja", target_lang="en", max_retries=1)
+    return Config(input_dir=tmp_path / "in", output_epub=tmp_path / "out.epub", intermediate_dir=tmp_path / "work", target_lang="en", max_retries=1)
 
 
 def _image(path: Path) -> None:

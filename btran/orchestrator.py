@@ -141,7 +141,6 @@ def _valid_source_cache_entry(
     image_path: Path,
     sha256: str,
     phash: str,
-    source_lang: str,
     model: str,
 ) -> bool:
     try:
@@ -153,9 +152,14 @@ def _valid_source_cache_entry(
         and artifact.image_path == str(image_path)
         and artifact.sha256 == sha256
         and artifact.phash == phash
-        and artifact.source_lang == source_lang
         and artifact.model == model
     )
+
+
+def _corpus_source_lang(extractions: dict[int, PageExtraction]) -> str:
+    """Summarize the source language detected across the extracted corpus."""
+    languages = {extraction.source_lang for extraction in extractions.values()}
+    return next(iter(languages)) if len(languages) == 1 else "mixed"
 
 
 def _result_from(extraction: PageExtraction, translated: list[TranslatedBlock], target_lang: str) -> PageResult:
@@ -332,7 +336,7 @@ async def run(config: Config, on_page_error: PageErrorCallback | None = None) ->
 
     async def extract(number: int, path: Path) -> PageExtraction:
         sha, phash = hashes[number]
-        source_cache = work / "source_cache" / f"{extraction_cache_identity(sha, config.source_lang, config.model)}.json"
+        source_cache = work / "source_cache" / f"{extraction_cache_identity(sha, config.model)}.json"
         if not config.no_resume and source_cache.exists():
             try:
                 cached = PageExtraction.from_file(source_cache)
@@ -340,17 +344,17 @@ async def run(config: Config, on_page_error: PageErrorCallback | None = None) ->
                 cached = None
             if cached is not None and _valid_source_cache_entry(
                 cached, page_number=number, image_path=original_paths[number], sha256=sha, phash=phash,
-                source_lang=config.source_lang, model=config.model,
+                model=config.model,
             ):
                 to_file(cached, work / "source" / f"page_{number:04d}.json")
                 return cached
-        result = await _with_retries(lambda: extract_page(path, config.source_lang, config.model, sha, phash, number, config.pi_bin, config.timeout), config.max_retries)
+        result = await _with_retries(lambda: extract_page(path, config.model, sha, phash, number, config.pi_bin, config.timeout), config.max_retries)
         # The artifact refers to the source photo, even if a safe normalized copy was sent to Pi.
         result.image_path = str(original_paths[number])
         to_file(result, work / "source" / f"page_{number:04d}.json")
         if _valid_source_cache_entry(
             result, page_number=number, image_path=original_paths[number], sha256=sha, phash=phash,
-            source_lang=config.source_lang, model=config.model,
+            model=config.model,
         ):
             to_file(result, source_cache)
         return result
@@ -382,13 +386,14 @@ async def run(config: Config, on_page_error: PageErrorCallback | None = None) ->
 
     # Gate 1: complete source corpus before consolidation; only terminology Pi is allowed here.
     mentions = [mention for number in state["expected_pages"] for mention in extracted[number].term_mentions]
+    detected_source_lang = _corpus_source_lang(extracted)
     _record_stage(state, checkpoint, "glossary", "running")
     try:
         if mentions:
             pi_call = make_pi_consolidation_call(pi_bin=config.pi_bin, model=config.model, timeout=config.timeout)
-            glossary = consolidate_terminology(mentions, source_lang=config.source_lang, target_lang=config.target_lang, pi_call=pi_call, token_budget=config.glossary_budget)
+            glossary = consolidate_terminology(mentions, source_lang=detected_source_lang, target_lang=config.target_lang, pi_call=pi_call, token_budget=config.glossary_budget)
         else:
-            glossary = freeze_terminology([], source_lang=config.source_lang, target_lang=config.target_lang)
+            glossary = freeze_terminology([], source_lang=detected_source_lang, target_lang=config.target_lang)
         glossary_file = Path(config.glossary_path) if Path(config.glossary_path).is_absolute() else work / Path(config.glossary_path)
         _atomic_json(glossary_file, glossary.to_dict())
     except Exception as exc:
@@ -426,7 +431,7 @@ async def run(config: Config, on_page_error: PageErrorCallback | None = None) ->
         index = positions[number]
         previous_page = extracted[expected_numbers[index - 1]] if index else None
         next_page = extracted[expected_numbers[index + 1]] if index + 1 < len(expected_numbers) else None
-        identity = translation_cache_identity(source_artifact_hash=_translation_source_hash(source, previous_page, next_page), glossary_hash=frozen.hash, source_lang=config.source_lang, target_lang=config.target_lang, model=config.model)
+        identity = translation_cache_identity(source_artifact_hash=_translation_source_hash(source, previous_page, next_page), glossary_hash=frozen.hash, target_lang=config.target_lang, model=config.model)
         cache_path = work / "translation_cache" / f"{identity}.json"
         if not config.no_resume and cache_path.exists():
             try:
@@ -508,7 +513,7 @@ async def run(config: Config, on_page_error: PageErrorCallback | None = None) ->
 
     try:
         build_epub(results, Path(config.output_epub), title=config.title, author=config.author,
-                   source_lang=config.source_lang, target_lang=config.target_lang, embed_images=config.embed_images,
+                   target_lang=config.target_lang, embed_images=config.embed_images,
                    epub_check=config.epub_check, epub_check_path=config.epub_check_path)
     except Exception as exc:
         errors.append(f"[btran] EPUB failed: {type(exc).__name__}: {exc}")

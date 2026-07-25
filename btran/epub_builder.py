@@ -256,7 +256,6 @@ def build_epub(
     output_path: Path,
     title: str = "Translated Book",
     author: str = "Unknown",
-    source_lang: str = "en",
     target_lang: str = "en",
     embed_images: bool = False,
     epub_check: bool = False,

@@ -14,9 +14,9 @@ class TestDefaults:
         cfg = load_config(["dummy_in", "dummy_out.epub", "--target-lang", "fr"])
         assert cfg.model == "gemini-2.5-flash"
 
-    def test_default_source_lang(self):
+    def test_source_language_is_not_a_runtime_setting(self):
         cfg = load_config(["dummy_in", "dummy_out.epub", "--target-lang", "fr"])
-        assert cfg.source_lang == "en"
+        assert not hasattr(cfg, "source_lang")
 
     def test_default_concurrency(self):
         cfg = load_config(["dummy_in", "dummy_out.epub", "--target-lang", "fr"])
@@ -70,11 +70,6 @@ class TestEnvVars:
         monkeypatch.setenv("BTRAN_MODEL", "gpt-4o")
         cfg = load_config(["in", "out.epub", "--target-lang", "fr"])
         assert cfg.model == "gpt-4o"
-
-    def test_env_source_lang(self, monkeypatch):
-        monkeypatch.setenv("BTRAN_SOURCE_LANG", "ja")
-        cfg = load_config(["in", "out.epub", "--target-lang", "fr"])
-        assert cfg.source_lang == "ja"
 
     def test_env_target_lang(self, monkeypatch):
         monkeypatch.setenv("BTRAN_TARGET_LANG", "zh")
@@ -140,11 +135,6 @@ class TestCLIOverridesEnv:
         cfg = load_config(["in", "out.epub", "--target-lang", "fr", "--model", "claude-sonnet"])
         assert cfg.model == "claude-sonnet"
 
-    def test_cli_source_lang_overrides_env(self, monkeypatch):
-        monkeypatch.setenv("BTRAN_SOURCE_LANG", "ja")
-        cfg = load_config(["in", "out.epub", "--target-lang", "fr", "--source-lang", "ko"])
-        assert cfg.source_lang == "ko"
-
     def test_cli_target_lang_overrides_env(self, monkeypatch):
         monkeypatch.setenv("BTRAN_TARGET_LANG", "zh")
         cfg = load_config(["in", "out.epub", "--target-lang", "es"])
@@ -204,7 +194,6 @@ class TestMissingTargetLang:
     def test_missing_even_with_other_env(self, monkeypatch):
         """Even with other env vars set, missing target_lang still raises."""
         monkeypatch.setenv("BTRAN_MODEL", "gpt-5")
-        monkeypatch.setenv("BTRAN_SOURCE_LANG", "de")
         with pytest.raises(ValueError, match="target_lang"):
             load_config(["in", "out.epub"])
 

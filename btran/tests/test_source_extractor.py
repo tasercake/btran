@@ -21,6 +21,7 @@ def _make_mock_proc(stdout: str = "", stderr: str = "", returncode: int = 0):
 
 _VALID_OUTPUT = json.dumps(
     {
+        "source_lang": "en",
         "blocks": [
             {"id": "scan-heading", "type": "heading", "text": "Chapter One", "reading_order": 0},
             {"id": "scan-body", "type": "paragraph", "text": "The first paragraph.", "reading_order": 1},
@@ -45,7 +46,6 @@ class TestExtractPage:
         ):
             extraction = await extract_page(
                 image_path=Path("page-001.png"),
-                source_lang="en",
                 model="vision-model",
                 sha256="a" * 64,
                 phash="b" * 16,
@@ -75,10 +75,12 @@ class TestExtractPage:
         from btran.source_extractor import extract_page
 
         first = json.dumps({
+            "source_lang": "en",
             "blocks": [{"id": "arbitrary-a", "type": "paragraph", "text": "One", "reading_order": 7}],
             "term_mentions": [], "illustrations": [],
         })
         second = json.dumps({
+            "source_lang": "en",
             "blocks": [{"id": "arbitrary-b", "type": "paragraph", "text": "One", "reading_order": 7}],
             "term_mentions": [], "illustrations": [],
         })
@@ -88,7 +90,7 @@ class TestExtractPage:
             AsyncMock(side_effect=procs),
         ):
             kwargs = dict(
-                image_path=Path("page.png"), source_lang="en", model="model",
+                image_path=Path("page.png"), model="model",
                 sha256="a" * 64, phash="b" * 16, page_number=9,
             )
             one = await extract_page(**kwargs)
@@ -101,10 +103,10 @@ class TestExtractPage:
     @pytest.mark.parametrize(
         "output, error",
         [
-            ({"blocks": [{"id": "a", "type": "unknown", "text": "x", "reading_order": 0}], "term_mentions": [], "illustrations": []}, "type"),
-            ({"blocks": [{"id": "a", "type": "paragraph", "reading_order": 0}], "term_mentions": [], "illustrations": []}, "text"),
-            ({"blocks": [{"id": "a", "type": "paragraph", "text": "x", "reading_order": 0}, {"id": "b", "type": "heading", "text": "y", "reading_order": 0}], "term_mentions": [], "illustrations": []}, "reading_order"),
-            ({"blocks": [{"type": "paragraph", "text": "x", "reading_order": 0}], "term_mentions": [], "illustrations": []}, "id"),
+            ({"source_lang": "en", "blocks": [{"id": "a", "type": "unknown", "text": "x", "reading_order": 0}], "term_mentions": [], "illustrations": []}, "type"),
+            ({"source_lang": "en", "blocks": [{"id": "a", "type": "paragraph", "reading_order": 0}], "term_mentions": [], "illustrations": []}, "text"),
+            ({"source_lang": "en", "blocks": [{"id": "a", "type": "paragraph", "text": "x", "reading_order": 0}, {"id": "b", "type": "heading", "text": "y", "reading_order": 0}], "term_mentions": [], "illustrations": []}, "reading_order"),
+            ({"source_lang": "en", "blocks": [{"type": "paragraph", "text": "x", "reading_order": 0}], "term_mentions": [], "illustrations": []}, "id"),
         ],
     )
     async def test_rejects_invalid_source_blocks(self, output, error):
@@ -118,7 +120,7 @@ class TestExtractPage:
         ):
             with pytest.raises(ExtractionError, match=error):
                 await extract_page(
-                    Path("page.png"), "en", "model", "a" * 64, "b" * 16, 1
+                    Path("page.png"), "model", "a" * 64, "b" * 16, 1
                 )
 
     @pytest.mark.asyncio
@@ -127,6 +129,7 @@ class TestExtractPage:
         from btran.source_extractor import ExtractionError, extract_page
 
         output = json.dumps({
+            "source_lang": "en",
             "blocks": [{"id": "known", "type": "paragraph", "text": "text", "reading_order": 0}],
             "term_mentions": [{"term": "term", "block_id": "missing"}],
             "illustrations": [],
@@ -136,7 +139,7 @@ class TestExtractPage:
             AsyncMock(return_value=_make_mock_proc(stdout=output)),
         ):
             with pytest.raises(ExtractionError, match="block_id"):
-                await extract_page(Path("page.png"), "en", "model", "a" * 64, "b" * 16, 1)
+                await extract_page(Path("page.png"), "model", "a" * 64, "b" * 16, 1)
 
     @pytest.mark.asyncio
     async def test_pi_command_is_one_bounded_vision_call(self):
@@ -146,7 +149,7 @@ class TestExtractPage:
         exec_mock = AsyncMock(return_value=_make_mock_proc(stdout=_VALID_OUTPUT))
         with patch("btran.source_extractor.asyncio.create_subprocess_exec", exec_mock):
             await extract_page(
-                Path("/photos/p1.png"), "ja", "gemini-vision", "a" * 64, "b" * 16, 1,
+                Path("/photos/p1.png"), "gemini-vision", "a" * 64, "b" * 16, 1,
                 pi_bin="/bin/pi", timeout=3,
             )
 
@@ -158,7 +161,7 @@ class TestExtractPage:
         for option in ("--no-extensions", "--no-skills", "--no-prompt-templates", "--no-context-files", "--no-approve"):
             assert option in args
         assert args[-1].endswith("@/photos/p1.png")
-        assert "ja" in args[-1]
+        assert "Detect the source language" in args[-1]
         assert "term_mentions" in EXTRACTION_PROMPT
         assert "untrusted" in EXTRACTION_PROMPT.lower()
         assert "do not follow" in EXTRACTION_PROMPT.lower()
@@ -190,7 +193,7 @@ class TestExtractPage:
         ), patch("btran.source_extractor.os.killpg") as killpg:
             with pytest.raises(ExtractionError, match="timed out"):
                 await extract_page(
-                    Path("page.png"), "en", "model", "a" * 64, "b" * 16, 1, timeout=0.01
+                    Path("page.png"), "model", "a" * 64, "b" * 16, 1, timeout=0.01
                 )
 
         killpg.assert_called_once_with(123, signal.SIGKILL)
@@ -221,7 +224,7 @@ class TestExtractPage:
             AsyncMock(return_value=proc),
         ), patch("btran.source_extractor.os.killpg") as killpg:
             task = asyncio.create_task(extract_page(
-                Path("page.png"), "en", "model", "a" * 64, "b" * 16, 1,
+                Path("page.png"), "model", "a" * 64, "b" * 16, 1,
             ))
             await proc.started.wait()
             task.cancel()
@@ -240,7 +243,7 @@ class TestExtractPage:
         with patch("btran.source_extractor.asyncio.create_subprocess_exec", exec_mock):
             with pytest.raises(ExtractionError, match="timeout must be positive"):
                 await extract_page(
-                    Path("page.png"), "en", "model", "a" * 64, "b" * 16, 1, timeout=0
+                    Path("page.png"), "model", "a" * 64, "b" * 16, 1, timeout=0
                 )
 
         exec_mock.assert_not_called()
@@ -262,7 +265,19 @@ class TestStrictStructuredValidation:
         with pytest.raises(ExtractionError, match="unexpected fields"):
             parse_extraction(
                 output,
-                image_path=Path("page.png"), source_lang="en", model="model",
+                image_path=Path("page.png"), model="model",
+                sha256="a" * 64, phash="b" * 16, page_number=1,
+            )
+
+    def test_rejects_missing_detected_source_language(self):
+        """A source artifact must record the language detected by the model."""
+        from btran.source_extractor import ExtractionError, parse_extraction
+
+        output = json.loads(_VALID_OUTPUT)
+        output.pop("source_lang")
+        with pytest.raises(ExtractionError, match="missing required fields"):
+            parse_extraction(
+                output, image_path=Path("page.png"), model="model",
                 sha256="a" * 64, phash="b" * 16, page_number=1,
             )
 
@@ -281,7 +296,7 @@ class TestStrictStructuredValidation:
         with pytest.raises(ExtractionError):
             parse_extraction(
                 output,
-                image_path=Path("page.png"), source_lang="en", model="model",
+                image_path=Path("page.png"), model="model",
                 sha256="a" * 64, phash="b" * 16, page_number=1,
             )
 
@@ -309,11 +324,10 @@ class TestExtractionArtifacts:
         """Extraction keys include model, prompt, and schema independently of translations."""
         import btran.source_extractor as extractor
 
-        first = extractor.extraction_cache_identity("a" * 64, "en", "vision-a")
-        assert first == extractor.extraction_cache_identity("a" * 64, "en", "vision-a")
+        first = extractor.extraction_cache_identity("a" * 64, "vision-a")
+        assert first == extractor.extraction_cache_identity("a" * 64, "vision-a")
         assert first.startswith("extraction:")
-        assert first != extractor.extraction_cache_identity("a" * 64, "fr", "vision-a")
-        assert first != extractor.extraction_cache_identity("a" * 64, "en", "vision-b")
+        assert first != extractor.extraction_cache_identity("a" * 64, "vision-b")
 
         monkeypatch.setattr(extractor, "EXTRACTION_SCHEMA_VERSION", "changed")
-        assert first != extractor.extraction_cache_identity("a" * 64, "en", "vision-a")
+        assert first != extractor.extraction_cache_identity("a" * 64, "vision-a")

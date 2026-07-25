@@ -37,7 +37,6 @@ class Config:
     """
 
     model: str = "gemini-2.5-flash"
-    source_lang: str = "en"
     target_lang: str = ""
     concurrency: int = 4
     max_retries: int = 3
@@ -70,7 +69,6 @@ def _flag_env(value: str) -> bool:
 
 _ENV_FIELDS: dict[str, tuple[str, Callable[[str], object]]] = {
     "model": ("MODEL", str),
-    "source_lang": ("SOURCE_LANG", str),
     "target_lang": ("TARGET_LANG", str),
     "concurrency": ("CONCURRENCY", int),
     "max_retries": ("MAX_RETRIES", int),
@@ -180,7 +178,6 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="btran — translate book photos to EPUB")
     parser.add_argument("INPUT_DIR", help="Directory containing book page images")
     parser.add_argument("OUTPUT_EPUB", help="Output EPUB file path")
-    parser.add_argument("--source-lang", default=None)
     parser.add_argument("--target-lang", default=None)
     parser.add_argument("--model", default=None)
     parser.add_argument("--concurrency", type=int, default=None)

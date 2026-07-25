@@ -94,7 +94,6 @@ def translation_cache_identity(
     *,
     source_artifact_hash: str,
     glossary_hash: str,
-    source_lang: str,
     target_lang: str,
     model: str,
 ) -> str:
@@ -102,7 +101,6 @@ def translation_cache_identity(
     context = {
         "source_artifact_hash": source_artifact_hash,
         "glossary_hash": glossary_hash,
-        "source_lang": source_lang,
         "target_lang": target_lang,
         "model": model,
         "prompt": TRANSLATION_PROMPT,

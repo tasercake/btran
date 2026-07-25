@@ -60,7 +60,7 @@ No heavy frameworks. All pip-installable.
 - Override with CLI flags (argparse)
 - Config keys:
   - `MODEL` — vision model ID (default: `gemini-2.5-flash`)
-  - `SOURCE_LANG` — source language (default: `en`)
+  - Source language is detected from each page during extraction; it is not configurable.
   - `TARGET_LANG` — target language (required, no default)
   - `CONCURRENCY` — max parallel pi processes (default: `4`)
   - `MAX_RETRIES` — max retries per image (default: `3`)
@@ -75,7 +75,8 @@ No heavy frameworks. All pip-installable.
 
 ### 2. Intermediate JSON Schema (`schema.py`)
 
-Each page produces one JSON file in `intermediate/`:
+Each page produces one JSON file in `intermediate/`; `source_lang` is detected
+from the page image, never supplied as configuration:
 
 ```json
 {
@@ -191,7 +192,6 @@ positional arguments:
   OUTPUT_EPUB           Output EPUB file path
 
 options:
-  --source-lang LANG    Source language code (default: en)
   --target-lang LANG    Target language code (required)
   --model MODEL         Vision model ID (default: gemini-2.5-flash)
   --concurrency N       Max parallel translations (default: 4)

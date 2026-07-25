@@ -116,46 +116,24 @@ def test_translation_cache_identity_changes_for_source_artifact_or_glossary():
     from btran.translator import translation_cache_identity
 
     baseline = translation_cache_identity(
-        source_artifact_hash="source-a",
-        glossary_hash="glossary-a",
-        source_lang="ja",
-        target_lang="en",
-        model="text-model",
+        source_artifact_hash="source-a", glossary_hash="glossary-a",
+        target_lang="en", model="text-model",
     )
     assert baseline != translation_cache_identity(
-        source_artifact_hash="source-b",
-        glossary_hash="glossary-a",
-        source_lang="ja",
-        target_lang="en",
-        model="text-model",
+        source_artifact_hash="source-b", glossary_hash="glossary-a",
+        target_lang="en", model="text-model",
     )
     assert baseline != translation_cache_identity(
-        source_artifact_hash="source-a",
-        glossary_hash="glossary-b",
-        source_lang="ja",
-        target_lang="en",
-        model="text-model",
+        source_artifact_hash="source-a", glossary_hash="glossary-b",
+        target_lang="en", model="text-model",
     )
     assert baseline != translation_cache_identity(
-        source_artifact_hash="source-a",
-        glossary_hash="glossary-a",
-        source_lang="ko",
-        target_lang="en",
-        model="text-model",
+        source_artifact_hash="source-a", glossary_hash="glossary-a",
+        target_lang="fr", model="text-model",
     )
     assert baseline != translation_cache_identity(
-        source_artifact_hash="source-a",
-        glossary_hash="glossary-a",
-        source_lang="ja",
-        target_lang="fr",
-        model="text-model",
-    )
-    assert baseline != translation_cache_identity(
-        source_artifact_hash="source-a",
-        glossary_hash="glossary-a",
-        source_lang="ja",
-        target_lang="en",
-        model="other-text-model",
+        source_artifact_hash="source-a", glossary_hash="glossary-a",
+        target_lang="en", model="other-text-model",
     )
 
 
@@ -185,27 +163,18 @@ def test_translation_cache_identity_binds_prompt_and_output_schema():
     import btran.translator as translator
 
     baseline = translator.translation_cache_identity(
-        source_artifact_hash="source-a",
-        glossary_hash="glossary-a",
-        source_lang="ja",
-        target_lang="en",
-        model="text-model",
+        source_artifact_hash="source-a", glossary_hash="glossary-a",
+        target_lang="en", model="text-model",
     )
     with patch.object(translator, "TRANSLATION_PROMPT", "different prompt"):
         assert baseline != translator.translation_cache_identity(
-            source_artifact_hash="source-a",
-            glossary_hash="glossary-a",
-            source_lang="ja",
-            target_lang="en",
-            model="text-model",
+            source_artifact_hash="source-a", glossary_hash="glossary-a",
+            target_lang="en", model="text-model",
         )
     with patch.object(translator, "TRANSLATION_OUTPUT_SCHEMA", {"version": "different"}):
         assert baseline != translator.translation_cache_identity(
-            source_artifact_hash="source-a",
-            glossary_hash="glossary-a",
-            source_lang="ja",
-            target_lang="en",
-            model="text-model",
+            source_artifact_hash="source-a", glossary_hash="glossary-a",
+            target_lang="en", model="text-model",
         )
 
 

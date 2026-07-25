@@ -23,7 +23,7 @@ def config(tmp_path: Path, **changes: object) -> Config:
     values = dict(
         input_dir=tmp_path / "input", output_epub=tmp_path / "book.epub",
         intermediate_dir=tmp_path / "work",
-        source_lang="ja", target_lang="en", max_retries=1, concurrency=2,
+        target_lang="en", max_retries=1, concurrency=2,
     )
     values.update(changes)
     return Config(**values)
@@ -70,9 +70,9 @@ async def test_source_extraction_cache_reuses_valid_run_owned_artifact(tmp_path:
     source_path = cfg.input_dir / "a.png"
     image(source_path, (1, 2, 3))
 
-    async def extract(path, source_lang, model, sha256, phash, page, *_):
+    async def extract(path, model, sha256, phash, page, *_):
         return PageExtraction(
-            page, str(path), sha256, phash, source_lang, model,
+            page, str(path), sha256, phash, "ja", model,
             blocks=[SourceBlock(f"page_{page}_block_0", "paragraph", "source", 0)],
         )
 
@@ -98,13 +98,13 @@ async def test_corrupt_source_cache_is_a_miss_and_is_replaced(tmp_path: Path):
     image(source_path, (1, 2, 3))
     from btran.source_extractor import extraction_cache_identity
     from btran.hasher import compute_sha256
-    cache_path = cfg.intermediate_dir / "source_cache" / f"{extraction_cache_identity(compute_sha256(source_path), 'ja', cfg.model)}.json"
+    cache_path = cfg.intermediate_dir / "source_cache" / f"{extraction_cache_identity(compute_sha256(source_path), cfg.model)}.json"
     cache_path.parent.mkdir(parents=True)
     cache_path.write_text("not extraction JSON")
 
-    async def extract(path, source_lang, model, sha256, phash, page, *_):
+    async def extract(path, model, sha256, phash, page, *_):
         return PageExtraction(
-            page, str(path), sha256, phash, source_lang, model,
+            page, str(path), sha256, phash, "ja", model,
             blocks=[SourceBlock(f"page_{page}_block_0", "paragraph", "source", 0)],
         )
 
@@ -125,9 +125,9 @@ async def test_corrupt_translation_cache_is_a_miss_and_is_replaced(tmp_path: Pat
     source_path = cfg.input_dir / "a.png"
     image(source_path, (1, 2, 3))
 
-    async def extract(path, source_lang, model, sha256, phash, page, *_):
+    async def extract(path, model, sha256, phash, page, *_):
         return PageExtraction(
-            page, str(path), sha256, phash, source_lang, model,
+            page, str(path), sha256, phash, "ja", model,
             blocks=[SourceBlock(f"page_{page}_block_0", "paragraph", "source", 0)],
         )
 
@@ -199,7 +199,10 @@ async def test_glossary_is_frozen_before_translation_and_cache_key_changes_with_
     cfg = config(tmp_path)
     cfg.input_dir.mkdir(); image(cfg.input_dir / "a.png", (1, 2, 3))
     source = extraction(1, cfg.input_dir / "a.png", "島")
-    glossary = freeze_terminology([TerminologyEntry("island", ["島"], "island", [source.blocks[0].id], 1.0)], source_lang="ja", target_lang="en")
+    glossary = freeze_terminology(
+        [TerminologyEntry("island", ["島"], "island", [source.blocks[0].id], 1.0)],
+        source_lang=source.source_lang, target_lang="en",
+    )
     order: list[str] = []
     def pi_factory(**_: object):
         order.append("freeze")
@@ -225,8 +228,14 @@ async def test_reconciliation_retranslates_only_affected_pages_once(tmp_path: Pa
     cfg = config(tmp_path)
     cfg.input_dir.mkdir(); image(cfg.input_dir / "a.png", (1, 2, 3)); image(cfg.input_dir / "b.png", (4, 5, 6))
     sources = [extraction(1, cfg.input_dir / "a.png", "島"), extraction(2, cfg.input_dir / "b.png")]
-    glossary = freeze_terminology([TerminologyEntry("island", ["島"], "island", [sources[0].blocks[0].id], 1)], source_lang="ja", target_lang="en")
-    revised = freeze_terminology([TerminologyEntry("island", ["島"], "isle", [sources[0].blocks[0].id], 1)], source_lang="ja", target_lang="en", version="2")
+    glossary = freeze_terminology(
+        [TerminologyEntry("island", ["島"], "island", [sources[0].blocks[0].id], 1)],
+        source_lang=sources[0].source_lang, target_lang="en",
+    )
+    revised = freeze_terminology(
+        [TerminologyEntry("island", ["島"], "isle", [sources[0].blocks[0].id], 1)],
+        source_lang=sources[0].source_lang, target_lang="en", version="2",
+    )
     from btran.reconciliation import GlossaryChange, ReconciliationResult
     reconciliation = ReconciliationResult(revised, [GlossaryChange("island", "island", "isle")], [], [1])
     translated_pages: list[int] = []
@@ -251,7 +260,7 @@ async def test_source_failure_callback_arrives_before_another_page_finishes(tmp_
     failed_in_leaf = asyncio.Event()
     release_second_page = asyncio.Event()
 
-    async def extract(_path, _source_lang, _model, _sha, _phash, page_number, _pi_bin, _timeout):
+    async def extract(_path, _model, _sha, _phash, page_number, _pi_bin, _timeout):
         if page_number == 1:
             failed_in_leaf.set()
             raise RuntimeError("bad OCR")

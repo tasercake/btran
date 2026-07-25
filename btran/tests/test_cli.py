@@ -36,7 +36,6 @@ class TestValidRun:
         config = Config(
             input_dir=Path("/tmp"),
             output_epub=Path("/tmp/out.epub"),
-            source_lang="en",
             target_lang="es",
             model="gpt-4o",
             intermediate_dir=Path("/tmp/btran_test_work"),
@@ -61,7 +60,6 @@ class TestValidation:
         config = Config(
             input_dir=Path("/tmp"),
             output_epub=Path("/tmp/out.epub"),
-            source_lang="en",
             target_lang="es",
             model="gpt-4o",
             intermediate_dir=Path("/tmp/btran_test_work"),
@@ -80,7 +78,6 @@ class TestValidation:
         config = Config(
             input_dir=Path("/nonexistent/input/dir"),
             output_epub=Path("/tmp/out.epub"),
-            source_lang="en",
             target_lang="es",
             model="gpt-4o",
             intermediate_dir=Path("/tmp/work"),
@@ -102,7 +99,6 @@ class TestKeyboardInterrupt:
         config = Config(
             input_dir=Path("/tmp"),
             output_epub=Path("/tmp/out.epub"),
-            source_lang="en",
             target_lang="es",
             model="gpt-4o",
             intermediate_dir=Path("/tmp/btran_test_work"),
@@ -126,7 +122,6 @@ class TestFailureExit:
         config = Config(
             input_dir=Path("/tmp"),
             output_epub=Path("/tmp/out.epub"),
-            source_lang="en",
             target_lang="es",
             model="gpt-4o",
             intermediate_dir=Path("/tmp/btran_test_work"),
@@ -153,7 +148,7 @@ class TestFailureExit:
 
     def test_global_error_uses_truthful_run_summary_not_page_count(self, capsys):
         """Manifest/glossary/EPUB failures are not falsely reported as page failures."""
-        config = Config(input_dir=Path("/tmp"), output_epub=Path("/tmp/out.epub"), source_lang="en", target_lang="es")
+        config = Config(input_dir=Path("/tmp"), output_epub=Path("/tmp/out.epub"), target_lang="es")
         with patch("btran.cli.load_config", return_value=config), \
              patch("btran.cli.shutil.which", return_value="/usr/bin/pi"), \
              patch("btran.cli.orchestrator_run", new=AsyncMock(return_value=RunResult(errors=["[btran] glossary failed: unavailable"]))):
@@ -168,7 +163,6 @@ class TestFailureExit:
         config = Config(
             input_dir=Path("/tmp"),
             output_epub=Path("/tmp/out.epub"),
-            source_lang="en",
             target_lang="es",
             model="gpt-4o",
             intermediate_dir=Path("/tmp/btran_test_work"),
@@ -186,7 +180,6 @@ class TestFailureExit:
         config = Config(
             input_dir=Path("/tmp"),
             output_epub=Path("/tmp/out.epub"),
-            source_lang="en",
             target_lang="es",
             model="gpt-4o",
             intermediate_dir=Path("/tmp/btran_test_work"),

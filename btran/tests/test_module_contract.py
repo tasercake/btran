@@ -78,6 +78,7 @@ async def test_wave_one_modules_exchange_representative_typed_artifacts(tmp_path
     assert ErrorResult(page_number=1, error="failed").error == "failed"
 
     extraction_response = {
+        "source_lang": "en",
         "blocks": [
             {"id": "heading", "type": "heading", "text": "Chapter One", "reading_order": 0},
             {"id": "body", "type": "paragraph", "text": "An island appears.", "reading_order": 1},
@@ -96,7 +97,6 @@ async def test_wave_one_modules_exchange_representative_typed_artifacts(tmp_path
     ):
         extraction = await source_extractor.extract_page(
             image_path=tmp_path / "page-001.png",
-            source_lang="en",
             model="vision-model",
             sha256="a" * 64,
             phash="b" * 16,
@@ -120,7 +120,7 @@ async def test_wave_one_modules_exchange_representative_typed_artifacts(tmp_path
 
     glossary = terminology.consolidate_terminology(
         extraction.term_mentions,
-        source_lang="en",
+        source_lang=extraction.source_lang,
         target_lang="en",
         pi_call=consolidate_pi,
     )
