@@ -404,7 +404,7 @@ async def run(config: Config, on_page_error: PageErrorCallback | None = None) ->
     _record_stage(state, checkpoint, "glossary", "frozen", hash=glossary.hash, version=glossary.version)
 
     reviews = work / "needs_review"
-    write_items(reviews, _initial_review_items(glossary, original_paths), archive_stale=True)
+    write_items(reviews, _initial_review_items(glossary, original_paths))
     if unresolved_items(reviews):
         errors.append("[btran] blocking glossary review items remain unresolved")
         _record_stage(state, checkpoint, "review", "blocked", count=len(unresolved_items(reviews)))
@@ -475,7 +475,11 @@ async def run(config: Config, on_page_error: PageErrorCallback | None = None) ->
         _record_stage(state, checkpoint, "reconciliation", "failed", reason=str(exc))
         _record_stage(state, checkpoint, "epub", "skipped", reason="reconciliation gate")
         return RunResult(errors)
-    write_items(reviews, _reconciliation_review_items(reconciliation, original_paths), archive_stale=True)
+    write_items(
+        reviews,
+        _reconciliation_review_items(reconciliation, original_paths),
+        archive_stale=True,
+    )
     if reconciliation.glossary_diff:
         glossary = reconciliation.glossary_v2
         state["glossary"] = {"version": glossary.version, "hash": glossary.hash}

@@ -133,15 +133,24 @@ def _request_items(groups: Sequence[TermGroup]) -> list[dict[str, object]]:
     ]
 
 
-def _consolidation_prompt(groups: Sequence[TermGroup]) -> str:
+def _consolidation_prompt(
+    groups: Sequence[TermGroup], *, source_lang: str = "", target_lang: str = ""
+) -> str:
     payload = {"items": _request_items(groups)}
+    language_instruction = (
+        f" Translate each target_term from {source_lang} into {target_lang}."
+        if source_lang and target_lang
+        else ""
+    )
     return (
         "Consolidate these source terminology candidates. Return JSON only as "
         '{"entries": [{"concept_id": str, "source_terms": [str], '
         '"target_term": str, "provenance": [str], "confidence": number, '
         '"notes": str}]}. Preserve every supplied source spelling and block ID. '
         "Do not invent aliases. Keep distinct senses, context variants, conflicts, and "
-        "low-confidence candidates as separate entries.\n"
+        "low-confidence candidates as separate entries."
+        + language_instruction
+        + "\n"
         + json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     )
 
@@ -341,7 +350,9 @@ def consolidate_terminology(
         batches = batch_term_groups(groups, token_budget)
         results: list[TerminologyEntry] = []
         for batch in batches:
-            prompt = _consolidation_prompt(batch.groups)
+            prompt = _consolidation_prompt(
+                batch.groups, source_lang=source_lang, target_lang=target_lang
+            )
             prompt_tokens = estimate_tokens(prompt)
             if prompt_tokens > token_budget:
                 raise AssertionError("batching produced an over-budget consolidation request")

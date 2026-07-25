@@ -90,7 +90,7 @@ def test_cli_uses_explicit_manifest_and_streams_one_terminal_page_error(tmp_path
             main()
 
     assert exc.value.code == 1
-    assert extract.await_count == 1
+    assert extract.await_count == 2
     captured = capsys.readouterr()
     assert "btran — auto-detecting source languages → en" in captured.out
     assert "translating 2 images" not in captured.out

@@ -119,6 +119,7 @@ def test_consolidation_uses_text_only_calls_and_returns_valid_frozen_map():
 
     assert len(prompts) == 1
     assert all(isinstance(prompt, str) and "@" not in prompt for prompt in prompts)
+    assert "Translate each target_term from en into fr." in prompts[0]
     assert glossary.version == "1"
     assert glossary.hash
     assert glossary.entries[0].target_term == "translated"

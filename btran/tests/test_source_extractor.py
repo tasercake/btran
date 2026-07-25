@@ -160,7 +160,7 @@ class TestExtractPage:
         assert "--no-tools" in args
         for option in ("--no-extensions", "--no-skills", "--no-prompt-templates", "--no-context-files", "--no-approve"):
             assert option in args
-        assert args[-1].endswith("@/photos/p1.png")
+        assert args[-2] == "@/photos/p1.png"
         assert "Detect the source language" in args[-1]
         assert "term_mentions" in EXTRACTION_PROMPT
         assert "untrusted" in EXTRACTION_PROMPT.lower()
