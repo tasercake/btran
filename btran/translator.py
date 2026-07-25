@@ -191,9 +191,10 @@ async def translate_blocks(
         isinstance(timeout, bool)
         or not isinstance(timeout, (int, float))
         or not math.isfinite(timeout)
-        or timeout <= 0
+        or timeout < 0
     ):
-        raise TranslationError("timeout must be positive and finite")
+        raise TranslationError("timeout must be non-negative and finite")
+    deadline = None if timeout == 0 else timeout
     context = _translation_context(extraction, glossary, previous_page, next_page)
     prompt = TRANSLATION_PROMPT.format(
         source_lang=extraction.source_lang,
@@ -221,7 +222,9 @@ async def translate_blocks(
             env={**os.environ, "PI_OFFLINE": "0"},
             start_new_session=os.name == "posix",
         )
-        stdout_bytes, stderr_bytes = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        stdout_bytes, stderr_bytes = await asyncio.wait_for(
+            proc.communicate(), timeout=deadline
+        )
     except asyncio.TimeoutError:
         if proc is not None:
             await _reap_process(proc)

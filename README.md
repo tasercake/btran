@@ -46,9 +46,10 @@ control.
 - `--embed-images` embeds original page images in the generated EPUB.
 - `--no-resume` bypasses the work-owned translation cache for this run.
 
-Resource bounds: concurrency is 1–32, `--max-retries` is 1–10 total attempts,
-and timeout is 1–3,600 seconds. `--pi-bin` selects the `pi` executable used by
-the model leaves.
+Resource minimums: concurrency is 1, while `--max-retries` and `--timeout` are 0.
+These controls have no configured upper bounds. A timeout of 0 disables the
+request deadline; zero retries still performs the initial attempt. `--pi-bin`
+selects the `pi` executable used by the model leaves.
 
 ## Deterministic eval corpus
 

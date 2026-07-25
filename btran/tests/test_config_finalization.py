@@ -47,10 +47,10 @@ def test_unimplemented_orchestrator_mode_environment_controls_are_rejected(monke
 @pytest.mark.parametrize(
     ("flag", "value", "message"),
     [
-        ("--concurrency", "0", "concurrency must be positive"),
-        ("--max-retries", "0", "max_retries must be positive"),
-        ("--timeout", "0", "timeout must be positive"),
-        ("--glossary-budget", "0", "glossary_budget must be positive"),
+        ("--concurrency", "0", "concurrency must be at least 1"),
+        ("--max-retries", "-1", "max_retries must be at least 0"),
+        ("--timeout", "-1", "timeout must be at least 0"),
+        ("--glossary-budget", "0", "glossary_budget must be at least 1"),
         ("--glossary-budget", "120001", "glossary_budget must not exceed 120000"),
     ],
 )
@@ -67,20 +67,29 @@ def test_glossary_budget_defaults_to_100k_and_accepts_120k_cap():
     assert load_config([*_ARGS, "--glossary-budget", "120000"]).glossary_budget == 120_000
 
 
-@pytest.mark.parametrize(
-    ("flag", "value", "message"),
-    [
-        ("--concurrency", "33", "concurrency must not exceed 32"),
-        ("--max-retries", "11", "max_retries must not exceed 10"),
-        ("--timeout", "3601", "timeout must not exceed 3600"),
-    ],
-)
-def test_resource_controls_have_safe_upper_bounds(flag, value, message, capsys):
-    with pytest.raises(SystemExit) as exc:
-        load_config([*_ARGS, flag, value])
+def test_resource_controls_accept_their_lower_bounds():
+    config = load_config(
+        [*_ARGS, "--concurrency", "1", "--max-retries", "0", "--timeout", "0"]
+    )
 
-    assert exc.value.code == 2
-    assert message in capsys.readouterr().err
+    assert config.concurrency == 1
+    assert config.max_retries == 0
+    assert config.timeout == 0
+
+
+def test_resource_controls_have_no_configured_upper_bounds():
+    config = load_config(
+        [
+            *_ARGS,
+            "--concurrency", "10000",
+            "--max-retries", "10000",
+            "--timeout", "10000000",
+        ]
+    )
+
+    assert config.concurrency == 10_000
+    assert config.max_retries == 10_000
+    assert config.timeout == 10_000_000
 
 
 def test_epubcheck_path_can_be_configured_before_strict_check_is_enabled(monkeypatch):

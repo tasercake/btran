@@ -263,9 +263,9 @@ async def _parallel_pages(
     return successes, failures
 
 
-async def _with_retries(action: Callable[[], Awaitable[T]], attempts: int) -> T:
+async def _with_retries(action: Callable[[], Awaitable[T]], retries: int) -> T:
     last: Exception | None = None
-    for _ in range(max(1, attempts)):
+    for _ in range(retries + 1):
         try:
             return await action()
         except Exception as exc:

@@ -220,10 +220,9 @@ def test_consolidation_fails_when_multiple_batches_do_not_reduce_without_target_
         )
 
 
-@pytest.mark.parametrize("timeout", [0, -1, float("nan"), True])
+@pytest.mark.parametrize("timeout", [-1, float("nan"), True])
 def test_pi_consolidation_rejects_invalid_timeout_before_constructing_leaf(timeout):
-    """Direct callers cannot create unbounded or nonsensical Pi workers."""
-    with pytest.raises(ValueError, match="timeout must be positive and finite"):
+    with pytest.raises(ValueError, match="timeout must be non-negative and finite"):
         make_pi_consolidation_call(pi_bin="pi", model="test-model", timeout=timeout)
 
 
@@ -238,9 +237,10 @@ def test_tool_less_ephemeral_pi_call_returns_stdout_and_cleans_up_timeout(tmp_pa
         "    print(json.dumps(sys.argv[1:]))\n"
     )
     fake_pi.chmod(0o755)
-    pi_call = make_pi_consolidation_call(pi_bin=str(fake_pi), model="test-model", timeout=1)
-
-    arguments = json.loads(pi_call("prompt"))
+    no_timeout_call = make_pi_consolidation_call(
+        pi_bin=str(fake_pi), model="test-model", timeout=0
+    )
+    arguments = json.loads(no_timeout_call("prompt"))
     assert "--no-session" in arguments
     assert "--no-tools" in arguments
     assert "--no-extensions" in arguments
@@ -249,8 +249,12 @@ def test_tool_less_ephemeral_pi_call_returns_stdout_and_cleans_up_timeout(tmp_pa
     assert "--no-context-files" in arguments
     assert "--no-approve" in arguments
     assert arguments[-1] == "prompt"
+
+    bounded_call = make_pi_consolidation_call(
+        pi_bin=str(fake_pi), model="test-model", timeout=1
+    )
     with pytest.raises(PiConsolidationError, match="timed out"):
-        pi_call("sleep")
+        bounded_call("sleep")
 
 
 def test_stable_sharding_builds_alias_index_for_oversized_map():

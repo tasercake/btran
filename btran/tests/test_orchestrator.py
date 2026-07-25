@@ -9,7 +9,7 @@ import pytest
 from PIL import Image
 
 from btran.config import Config
-from btran.orchestrator import _atomic_write, orchestrator_run, run
+from btran.orchestrator import _atomic_write, _with_retries, orchestrator_run, run
 from btran.schema import PageExtraction, SourceBlock, TranslatedBlock
 
 
@@ -31,6 +31,31 @@ def test_atomic_write_replaces_complete_checkpoint_without_temp_residue(tmp_path
     _atomic_write(path, "second")
     assert path.read_text() == "second"
     assert not list(tmp_path.glob("*.tmp"))
+
+
+@pytest.mark.asyncio
+async def test_retry_count_excludes_the_initial_attempt():
+    attempts = 0
+
+    async def action() -> str:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise RuntimeError("retry")
+        return "done"
+
+    assert await _with_retries(action, retries=2) == "done"
+    assert attempts == 3
+
+
+@pytest.mark.asyncio
+async def test_zero_retries_still_makes_the_initial_attempt():
+    action = AsyncMock(side_effect=RuntimeError("failed"))
+
+    with pytest.raises(RuntimeError, match="failed"):
+        await _with_retries(action, retries=0)
+
+    action.assert_awaited_once_with()
 
 
 @pytest.mark.asyncio

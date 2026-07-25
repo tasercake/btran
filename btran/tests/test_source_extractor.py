@@ -235,18 +235,31 @@ class TestExtractPage:
         proc.kill.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_non_positive_timeout_rejected_before_spawning_pi(self):
-        """A non-positive timeout is not a bounded extraction request."""
+    async def test_negative_timeout_rejected_before_spawning_pi(self):
         from btran.source_extractor import ExtractionError, extract_page
 
         exec_mock = AsyncMock()
         with patch("btran.source_extractor.asyncio.create_subprocess_exec", exec_mock):
-            with pytest.raises(ExtractionError, match="timeout must be positive"):
+            with pytest.raises(ExtractionError, match="timeout must be non-negative"):
                 await extract_page(
-                    Path("page.png"), "model", "a" * 64, "b" * 16, 1, timeout=0
+                    Path("page.png"), "model", "a" * 64, "b" * 16, 1, timeout=-1
                 )
 
         exec_mock.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_zero_timeout_disables_the_extraction_deadline(self):
+        from btran.source_extractor import extract_page
+
+        with patch(
+            "btran.source_extractor.asyncio.create_subprocess_exec",
+            AsyncMock(return_value=_make_mock_proc(stdout=_VALID_OUTPUT)),
+        ):
+            extraction = await extract_page(
+                Path("page.png"), "model", "a" * 64, "b" * 16, 1, timeout=0
+            )
+
+        assert extraction.page_number == 1
 
 
 class TestStrictStructuredValidation:

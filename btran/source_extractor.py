@@ -191,15 +191,16 @@ async def extract_page(
     pi_bin: str = "pi",
     timeout: int = 120,
 ) -> PageExtraction:
-    """Run exactly one bounded vision Pi invocation and validate its extraction."""
+    """Run exactly one vision Pi invocation and validate its extraction."""
     if (
         isinstance(timeout, bool)
         or not isinstance(timeout, (int, float))
         or not math.isfinite(timeout)
-        or timeout <= 0
+        or timeout < 0
     ):
-        raise ExtractionError("timeout must be positive and finite")
+        raise ExtractionError("timeout must be non-negative and finite")
 
+    deadline = None if timeout == 0 else timeout
     prompt = EXTRACTION_PROMPT
     proc: asyncio.subprocess.Process | None = None
     try:
@@ -221,7 +222,9 @@ async def extract_page(
             env={**os.environ, "PI_OFFLINE": "0"},
             start_new_session=os.name == "posix",
         )
-        stdout_bytes, stderr_bytes = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        stdout_bytes, stderr_bytes = await asyncio.wait_for(
+            proc.communicate(), timeout=deadline
+        )
     except asyncio.TimeoutError:
         if proc is not None:
             await _kill_and_reap(proc)

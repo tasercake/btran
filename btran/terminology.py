@@ -223,14 +223,15 @@ def _validate_entries_against_groups(
 def make_pi_consolidation_call(
     *, pi_bin: str = "pi", model: str, timeout: float = 120
 ) -> Callable[[str], str]:
-    """Create an ephemeral, tool-less text Pi caller with bounded cleanup."""
+    """Create an ephemeral, tool-less text Pi caller with optional timeout."""
     if (
         isinstance(timeout, bool)
         or not isinstance(timeout, (int, float))
         or not math.isfinite(timeout)
-        or timeout <= 0
+        or timeout < 0
     ):
-        raise ValueError("timeout must be positive and finite")
+        raise ValueError("timeout must be non-negative and finite")
+    deadline = None if timeout == 0 else timeout
 
     def pi_call(prompt: str) -> str:
         if not isinstance(prompt, str):
@@ -261,7 +262,7 @@ def make_pi_consolidation_call(
         except OSError as exc:
             raise PiConsolidationError(f"could not start Pi: {exc}") from exc
         try:
-            stdout, stderr = proc.communicate(timeout=timeout)
+            stdout, stderr = proc.communicate(timeout=deadline)
         except subprocess.TimeoutExpired:
             if os.name == "posix":
                 os.killpg(proc.pid, signal.SIGKILL)

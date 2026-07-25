@@ -13,9 +13,6 @@ from dotenv import find_dotenv, load_dotenv
 
 GLOSSARY_BUDGET_DEFAULT = 100_000
 GLOSSARY_BUDGET_MAXIMUM = 120_000
-CONCURRENCY_MAXIMUM = 32
-MAX_RETRIES_MAXIMUM = 10
-TIMEOUT_MAXIMUM = 3_600
 _ENV_PREFIX = "BTRAN_"
 _UNSUPPORTED_ENV_CONTROLS = {
     "CACHE_DB": "the merged orchestrator uses its work-owned translation cache",
@@ -146,18 +143,19 @@ def _validate_config(
             "target_lang is required. Set BTRAN_TARGET_LANG in .env or "
             "pass --target-lang on the command line."
         )
-    limits = {
-        "concurrency": CONCURRENCY_MAXIMUM,
-        "max_retries": MAX_RETRIES_MAXIMUM,
-        "timeout": TIMEOUT_MAXIMUM,
-        "glossary_budget": GLOSSARY_BUDGET_MAXIMUM,
+    minimums = {
+        "concurrency": 1,
+        "max_retries": 0,
+        "timeout": 0,
+        "glossary_budget": 1,
     }
-    for field_name, maximum in limits.items():
-        value = getattr(config, field_name)
-        if value <= 0:
-            parser.error(f"{field_name} must be positive")
-        if value > maximum:
-            parser.error(f"{field_name} must not exceed {maximum}")
+    for field_name, minimum in minimums.items():
+        if getattr(config, field_name) < minimum:
+            parser.error(f"{field_name} must be at least {minimum}")
+    if config.glossary_budget > GLOSSARY_BUDGET_MAXIMUM:
+        parser.error(
+            f"glossary_budget must not exceed {GLOSSARY_BUDGET_MAXIMUM}"
+        )
     if config.epub_check and not config.epub_check_path.strip():
         parser.error("epub_check_path must not be empty when --epub-check is enabled")
 

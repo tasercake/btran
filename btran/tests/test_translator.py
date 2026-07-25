@@ -268,13 +268,33 @@ async def test_translate_blocks_terminates_child_on_cancellation():
 
 
 @pytest.mark.asyncio
-async def test_translate_blocks_rejects_non_positive_timeout_before_spawning_pi():
-    """A direct caller cannot create an unbounded/instant Pi leaf."""
+async def test_translate_blocks_rejects_negative_timeout_before_spawning_pi():
     from btran.translator import TranslationError, translate_blocks
 
     exec_mock = AsyncMock()
     with patch("btran.translator.asyncio.create_subprocess_exec", exec_mock):
-        with pytest.raises(TranslationError, match="timeout must be positive"):
-            await translate_blocks(_page(), _glossary(), model="text-model", timeout=0)
+        with pytest.raises(TranslationError, match="timeout must be non-negative"):
+            await translate_blocks(_page(), _glossary(), model="text-model", timeout=-1)
 
     exec_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_translate_blocks_accepts_zero_as_no_timeout():
+    from btran.translator import translate_blocks
+
+    payload = {
+        "blocks": [
+            {"block_id": "p7_b1", "translated_text": "one"},
+            {"block_id": "p7_b2", "translated_text": "two"},
+        ]
+    }
+    with patch(
+        "btran.translator.asyncio.create_subprocess_exec",
+        AsyncMock(return_value=_proc(payload)),
+    ):
+        translated = await translate_blocks(
+            _page(), _glossary(), model="text-model", timeout=0
+        )
+
+    assert [block.translated_text for block in translated] == ["one", "two"]
