@@ -264,19 +264,19 @@ class TestNewConfigFields:
 
     def test_defaults(self):
         cfg = load_config(["in", "out.epub", "--target-lang", "fr"])
-        assert cfg.epub_check is False
+        assert cfg.epub_check is True
         assert cfg.epub_check_path == "epubcheck"
         assert cfg.manifest_path == Path("manifest.json")
         assert cfg.glossary_path == Path("glossary.json")
         assert cfg.glossary_budget == 100_000
 
     def test_environment_loading_and_types(self, monkeypatch):
-        monkeypatch.setenv("BTRAN_EPUB_CHECK", "true")
+        monkeypatch.setenv("BTRAN_EPUB_CHECK", "false")
         monkeypatch.setenv("BTRAN_EPUB_CHECK_PATH", "/opt/epubcheck")
         monkeypatch.setenv("BTRAN_MANIFEST_PATH", "/tmp/manifest.json")
         monkeypatch.setenv("BTRAN_GLOSSARY_BUDGET", "120000")
         cfg = load_config(["in", "out.epub", "--target-lang", "fr"])
-        assert cfg.epub_check is True
+        assert cfg.epub_check is False
         assert cfg.epub_check_path == "/opt/epubcheck"
         assert cfg.manifest_path == Path("/tmp/manifest.json")
         assert cfg.glossary_budget == 120_000

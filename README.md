@@ -41,8 +41,9 @@ control.
   resolved beneath `INPUT_DIR`, never from the caller's cwd.
 - `--glossary-budget N` controls the terminology consolidation budget. It
   defaults to 100,000 and is capped at 120,000.
-- `--epub-check [--epub-check-path PATH]` strictly validates the generated
-  EPUB with the named checker; supply a path when it is not on `PATH`.
+- EPUBCheck validation is enabled by default and strictly validates the generated
+  EPUB. `--epub-check-path PATH` selects the checker when it is not on `PATH`;
+  set `BTRAN_EPUB_CHECK=false` to disable validation explicitly.
 - `--embed-images` embeds original page images in the generated EPUB.
 - `--no-resume` bypasses the work-owned translation cache for this run.
 

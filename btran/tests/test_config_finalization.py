@@ -92,12 +92,12 @@ def test_resource_controls_have_no_configured_upper_bounds():
     assert config.timeout == 10_000_000
 
 
-def test_epubcheck_path_can_be_configured_before_strict_check_is_enabled(monkeypatch):
+def test_epubcheck_path_can_be_configured_with_validation_enabled_by_default(monkeypatch):
     monkeypatch.setenv("BTRAN_EPUB_CHECK_PATH", "/opt/epubcheck")
 
     config = load_config(_ARGS)
 
-    assert config.epub_check is False
+    assert config.epub_check is True
     assert config.epub_check_path == "/opt/epubcheck"
 
 

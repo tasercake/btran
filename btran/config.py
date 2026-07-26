@@ -46,7 +46,7 @@ class Config:
     output_epub: Path = Path("output.epub")
     embed_images: bool = False
     no_resume: bool = False
-    epub_check: bool = False
+    epub_check: bool = True
     epub_check_path: str = "epubcheck"
     manifest_path: Path = Path("manifest.json")
     # Internal pipeline artifact location; deliberately not a CLI/env control.
