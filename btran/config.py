@@ -37,7 +37,7 @@ class Config:
     target_lang: str = ""
     concurrency: int = 4
     max_retries: int = 3
-    timeout: int = 120
+    timeout: int = 0
     intermediate_dir: Path = Path("./intermediate")
     pi_bin: str = "pi"
     title: str = "Translated Book"

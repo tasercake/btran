@@ -69,7 +69,7 @@ No heavy frameworks. All pip-installable.
   - `INTERMEDIATE_DIR` — intermediate JSON output dir (default: `./intermediate`)
   - `CACHE_DB` — SQLite cache path (default: `./cache.sqlite`)
   - `PI_BIN` — path to pi binary (default: `pi`)
-  - `TIMEOUT` — per-image pi timeout in seconds (default: `120`)
+  - `TIMEOUT` — per-image pi timeout in seconds (default: `0`, no timeout)
   - `TITLE` — EPUB book title
   - `AUTHOR` — EPUB book author
 
@@ -196,7 +196,7 @@ options:
   --model MODEL         Vision model ID (default: gemini-2.5-flash)
   --concurrency N       Max parallel translations (default: 4)
   --max-retries N       Max retries per image (default: 3)
-  --timeout SECONDS     Per-image timeout (default: 120)
+  --timeout SECONDS     Per-image timeout (default: 0, no timeout)
   --intermediate-dir DIR  Intermediate JSON directory (default: ./intermediate)
   --cache-db PATH       SQLite cache path (default: ./cache.sqlite)
   --title TITLE         EPUB book title

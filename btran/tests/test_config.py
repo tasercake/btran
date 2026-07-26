@@ -28,7 +28,7 @@ class TestDefaults:
 
     def test_default_timeout(self):
         cfg = load_config(["dummy_in", "dummy_out.epub", "--target-lang", "fr"])
-        assert cfg.timeout == 120
+        assert cfg.timeout == 0
 
     def test_default_intermediate_dir_is_path(self):
         cfg = load_config(["dummy_in", "dummy_out.epub", "--target-lang", "fr"])
