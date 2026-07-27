@@ -5,6 +5,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import tempfile
 import uuid
 from collections.abc import Awaitable, Callable
@@ -204,6 +205,19 @@ def _apply_review_corrections(glossary: TerminologyMap, reviewed: dict[str, str]
     )
 
 
+_CANONICAL_BLOCK_ID = re.compile(r"^page_([1-9][0-9]*)_block_(0|[1-9][0-9]*)$")
+
+
+def _review_page(provenance: list[str], paths: dict[int, Path]) -> int | None:
+    """Select the first exact canonical provenance page that has an input path."""
+    pages = sorted({
+        int(match.group(1))
+        for block_id in provenance
+        if (match := _CANONICAL_BLOCK_ID.fullmatch(block_id)) is not None
+    })
+    return next((page for page in pages if page in paths), None)
+
+
 def _initial_review_items(glossary: TerminologyMap, paths: dict[int, Path]) -> list[ReviewItem]:
     items: list[ReviewItem] = []
     aliases: dict[str, list[str]] = {}
@@ -211,7 +225,7 @@ def _initial_review_items(glossary: TerminologyMap, paths: dict[int, Path]) -> l
         for term in entry.source_terms:
             aliases.setdefault(term.casefold(), []).append(entry.concept_id)
         if entry.confidence < _GLOSSARY_REVIEW_THRESHOLD:
-            page = next((number for number, path in paths.items() if str(number) in entry.provenance[0]), None) if entry.provenance else None
+            page = _review_page(entry.provenance, paths)
             items.append(ReviewItem(
                 _review_id("low-confidence", entry.concept_id, page), "low_confidence", True,
                 {"concept_id": entry.concept_id, "confidence": entry.confidence, "target_term": entry.target_term,
@@ -404,7 +418,15 @@ async def run(config: Config, on_page_error: PageErrorCallback | None = None) ->
     _record_stage(state, checkpoint, "glossary", "frozen", hash=glossary.hash, version=glossary.version)
 
     reviews = work / "needs_review"
-    write_items(reviews, _initial_review_items(glossary, original_paths))
+    # Only this frozen glossary's stable concept IDs may participate in review
+    # or correction. Archive prior-run artifacts so stale corrections cannot be
+    # applied to a regenerated glossary; malformed artifacts for a current ID
+    # remain in place and therefore fail closed.
+    write_items(
+        reviews,
+        _initial_review_items(glossary, original_paths),
+        archive_stale=True,
+    )
     if unresolved_items(reviews):
         errors.append("[btran] blocking glossary review items remain unresolved")
         _record_stage(state, checkpoint, "review", "blocked", count=len(unresolved_items(reviews)))

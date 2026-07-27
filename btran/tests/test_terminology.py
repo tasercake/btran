@@ -126,6 +126,94 @@ def test_consolidation_uses_text_only_calls_and_returns_valid_frozen_map():
     assert glossary.entries[0].source_terms == [f"term-{number}" for number in range(8)]
 
 
+def test_consolidation_replaces_arbitrary_model_ids_with_stable_evidence_ids():
+    mentions = [
+        TermMention(term="ధ్యాన ఆరోగ్యం ఇష్ట విధానం", block_id="page_2_block_5"),
+        TermMention(term="4జీబిట్స్", block_id="page_39_block_0"),
+    ]
+
+    def response(ids: tuple[str, str], targets: tuple[str, str], reverse: bool = False):
+        entries = [
+            {
+                "concept_id": ids[0],
+                "source_terms": ["ధ్యాన ఆరోగ్యం ఇష్ట విధానం"],
+                "target_term": targets[0],
+                "provenance": ["page_2_block_5"],
+                "confidence": 0.72,
+                "notes": "first wording",
+            },
+            {
+                "concept_id": ids[1],
+                "source_terms": ["4జీబిట్స్"],
+                "target_term": targets[1],
+                "provenance": ["page_39_block_0"],
+                "confidence": 0.91,
+                "notes": "second wording",
+            },
+        ]
+        if reverse:
+            entries.reverse()
+        return lambda _: json.dumps({"entries": entries})
+
+    first = consolidate_terminology(
+        mentions, source_lang="te", target_lang="en",
+        pi_call=response(
+            ("meditation_health_preferred_method", "4gbits"),
+            ("preferred meditation health method", "4 GB"),
+        ),
+    )
+    second = consolidate_terminology(
+        mentions, source_lang="te", target_lang="en",
+        pi_call=response(
+            ("c086", "c001"),
+            ("desired meditation health method", "4G bits"),
+            reverse=True,
+        ),
+    )
+
+    first_ids = {entry.source_terms[0]: entry.concept_id for entry in first.entries}
+    second_ids = {entry.source_terms[0]: entry.concept_id for entry in second.entries}
+    assert first_ids == second_ids
+    assert all(value.startswith("concept-") for value in first_ids.values())
+    assert not {"meditation_health_preferred_method", "4gbits", "c086", "c001"} & set(first_ids.values())
+
+
+def test_identical_evidence_context_variants_get_order_independent_unique_ids():
+    mentions = [TermMention(term="bank", block_id="page_1_block_1")]
+
+    def response(entries):
+        return lambda _: json.dumps({"entries": entries})
+
+    variants = [
+        {
+            "concept_id": "river-model-id", "source_terms": ["bank"],
+            "target_term": "rive", "provenance": ["page_1_block_1"],
+            "confidence": 0.8, "notes": "river",
+        },
+        {
+            "concept_id": "finance-model-id", "source_terms": ["bank"],
+            "target_term": "banque", "provenance": ["page_1_block_1"],
+            "confidence": 0.8, "notes": "finance",
+        },
+    ]
+    first = consolidate_terminology(
+        mentions, source_lang="en", target_lang="fr", pi_call=response(variants),
+    )
+    renamed_reversed = [
+        {**variants[1], "concept_id": "c2"},
+        {**variants[0], "concept_id": "c1"},
+    ]
+    second = consolidate_terminology(
+        mentions, source_lang="en", target_lang="fr", pi_call=response(renamed_reversed),
+    )
+
+    first_ids = {entry.target_term: entry.concept_id for entry in first.entries}
+    second_ids = {entry.target_term: entry.concept_id for entry in second.entries}
+    assert first_ids == second_ids
+    assert len(set(first_ids.values())) == 2
+    assert all(value.rsplit("-", 1)[-1] in {"1", "2"} for value in first_ids.values())
+
+
 def test_consolidation_rejects_untrusted_entries_that_drop_input_provenance():
     def pi_call(_: str) -> str:
         return json.dumps(

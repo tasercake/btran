@@ -297,6 +297,81 @@ def _groups_from_entries(entries: Iterable[TerminologyEntry]) -> list[TermGroup]
     ]
 
 
+def _stable_concept_evidence(
+    entry: TerminologyEntry,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Return the model-independent evidence that identifies one concept grouping."""
+    return (
+        tuple(sorted(set(entry.source_terms), key=lambda value: (normalize_term(value), value))),
+        tuple(sorted(set(entry.provenance))),
+    )
+
+
+def _stable_concept_base(evidence: tuple[tuple[str, ...], tuple[str, ...]]) -> str:
+    source_terms, provenance = evidence
+    payload = json.dumps(
+        {"source_terms": source_terms, "provenance": provenance},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return "concept-" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _stabilize_concept_ids(
+    entries: Iterable[TerminologyEntry],
+) -> list[TerminologyEntry]:
+    """Replace untrusted model IDs with IDs derived from canonical source evidence.
+
+    Source terms plus their canonical block provenance are the durable identity.
+    Target wording, confidence, notes, model-provided IDs, and response ordering do
+    not affect the usual one-entry identity. If the model emits multiple distinct
+    sense variants with identical evidence, deterministic ordinals keep all of
+    them collision-free. With no distinguishing source evidence, those ordinals
+    identify canonical variant order rather than an unknowable semantic identity.
+    """
+    grouped: dict[
+        tuple[tuple[str, ...], tuple[str, ...]],
+        dict[tuple[str, float, str], TerminologyEntry],
+    ] = {}
+    for entry in entries:
+        evidence = _stable_concept_evidence(entry)
+        # Exact semantic duplicates that differ only by the model's arbitrary ID
+        # carry no evidence of distinct senses and collapse to one entry.
+        variant_key = (entry.target_term, entry.confidence, entry.notes)
+        grouped.setdefault(evidence, {}).setdefault(variant_key, entry)
+
+    evidence_by_base: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {}
+    stable: list[TerminologyEntry] = []
+    for evidence, variants_by_key in sorted(grouped.items()):
+        base = _stable_concept_base(evidence)
+        prior = evidence_by_base.setdefault(base, evidence)
+        if prior != evidence:  # Defensive even though a full SHA-256 collision is remote.
+            raise ValueError("stable terminology concept ID collision")
+
+        variants = sorted(
+            variants_by_key.values(),
+            key=lambda entry: (
+                normalize_term(entry.target_term),
+                entry.target_term,
+                entry.confidence,
+                entry.notes,
+            ),
+        )
+        for index, entry in enumerate(variants, start=1):
+            concept_id = base if len(variants) == 1 else f"{base}-{index}"
+            source_terms, provenance = evidence
+            stable.append(TerminologyEntry(
+                concept_id=concept_id,
+                source_terms=list(source_terms),
+                target_term=entry.target_term,
+                provenance=list(provenance),
+                confidence=entry.confidence,
+                notes=entry.notes,
+            ))
+    return stable
+
+
 def _canonical_entries(entries: Iterable[TerminologyEntry]) -> list[TerminologyEntry]:
     canonical: list[TerminologyEntry] = []
     for entry in entries:
@@ -364,7 +439,10 @@ def consolidate_terminology(
         results = _canonical_entries(results)
         if len(batches) == 1:
             return freeze_terminology(
-                results, source_lang=source_lang, target_lang=target_lang, version=version
+                _stabilize_concept_ids(results),
+                source_lang=source_lang,
+                target_lang=target_lang,
+                version=version,
             )
 
         next_groups = _groups_from_entries(results)
