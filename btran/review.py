@@ -53,14 +53,14 @@ def _atomic_json(path: Path, value: dict[str, Any]) -> None:
         raise
 
 
-def _read_item(path: Path) -> ReviewItem:
+def _read_item(path: Path, *, expected_item_id: str | None = None) -> ReviewItem:
     value = json.loads(path.read_text())
     expected = {"item_id", "kind", "blocking", "evidence", "image_path", "page_number", "status", "resolution"}
     if not isinstance(value, dict) or set(value) != expected:
         raise ValueError("invalid review artifact shape")
     item = ReviewItem.from_dict(value)
     if (
-        item.item_id != path.stem or not isinstance(item.kind, str) or not item.kind
+        item.item_id != (expected_item_id or path.stem) or not isinstance(item.kind, str) or not item.kind
         or not isinstance(item.blocking, bool) or not isinstance(item.evidence, dict)
         or not isinstance(item.image_path, str)
         or (item.page_number is not None and (isinstance(item.page_number, bool) or not isinstance(item.page_number, int)))
@@ -110,6 +110,36 @@ def _archive_stale(directory: Path, active_ids: set[str]) -> None:
         shutil.move(str(path), str(destination))
 
 
+def _archived_resolution(directory: Path, current: ReviewItem) -> dict[str, str] | None:
+    """Recover the latest decision when a stable subject disappears for a run.
+
+    Glossary generation is nondeterministic: a concept can be absent in one run
+    and return in a later run. Its current artifact is archived while absent, so
+    looking only in the live directory loses an otherwise stable decision.
+    """
+    archive = directory / "archive"
+    prefix = f"{current.item_id}."
+    candidates: list[tuple[int, str, ReviewItem]] = []
+    for path in sorted(archive.glob("*.json")):
+        name = path.name
+        if name != f"{current.item_id}.json":
+            if not (name.startswith(prefix) and name.endswith(".json") and name[len(prefix):-5].isdigit()):
+                continue
+        try:
+            existing = _read_item(path, expected_item_id=current.item_id)
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            # Historical corruption for this stable ID must fail closed.
+            return None
+        if _same_review_subject(existing, current):
+            candidates.append((path.stat().st_mtime_ns, name, existing))
+    if not candidates:
+        return None
+    latest = max(candidates)[2]
+    if latest.status == "resolved" and latest.resolution:
+        return latest.resolution
+    return None
+
+
 def write_items(directory: Path, items: list[ReviewItem], *, archive_stale: bool = False) -> list[Path]:
     """Persist the explicit current review set, preserving stable resolutions."""
     directory = Path(directory)
@@ -133,6 +163,11 @@ def write_items(directory: Path, items: list[ReviewItem], *, archive_stale: bool
             if existing.status == "resolved" and existing.resolution and _same_review_subject(existing, item):
                 value["status"] = existing.status
                 value["resolution"] = existing.resolution
+        else:
+            resolution = _archived_resolution(directory, item)
+            if resolution:
+                value["status"] = "resolved"
+                value["resolution"] = resolution
         _atomic_json(path, value)
         paths.append(path)
     return paths

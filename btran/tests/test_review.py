@@ -43,6 +43,30 @@ def test_current_review_set_archives_stale_artifacts_without_applying_them(tmp_p
     assert json.loads((directory / "current-concept.json").read_text())["status"] == "resolved"
 
 
+def test_resolved_item_reappearing_after_an_absent_run_recovers_archived_decision(tmp_path: Path):
+    """Nondeterministic glossary omission must not erase a stable review decision."""
+    directory = tmp_path / "needs_review"
+    recurring = ReviewItem(
+        "recurring", "low_confidence", True,
+        {"concept_id": "stable-concept", "target_term": "first wording"},
+    )
+    write_items(directory, [recurring], archive_stale=True)
+    resolve_item(directory / "recurring.json", "correct", correction="reviewed wording")
+
+    write_items(directory, [], archive_stale=True)
+    assert not (directory / "recurring.json").exists()
+    assert (directory / "archive" / "recurring.json").is_file()
+
+    regenerated = ReviewItem(
+        "recurring", "low_confidence", True,
+        {"concept_id": "stable-concept", "target_term": "different model wording"},
+    )
+    write_items(directory, [regenerated], archive_stale=True)
+
+    assert unresolved_items(directory) == []
+    assert corrections(directory) == {"stable-concept": "reviewed wording"}
+
+
 def test_malformed_current_review_artifact_blocks_instead_of_being_replaced(tmp_path: Path):
     """A current malformed decision cannot be silently accepted or overwritten."""
     directory = tmp_path / "needs_review"
