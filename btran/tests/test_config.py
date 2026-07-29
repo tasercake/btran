@@ -1,297 +1,96 @@
-"""Tests for btran.config."""
+"""Task 4 configuration and finite-process policy tests."""
 
 from pathlib import Path
 
 import pytest
 
-from btran.config import Config, load_config
-
-
-class TestDefaults:
-    """Config loads sensible defaults when nothing is provided."""
-
-    def test_default_model(self):
-        cfg = load_config(["dummy_in", "dummy_out.epub", "--target-lang", "fr"])
-        assert cfg.model == "gemini-2.5-flash"
-
-    def test_source_language_is_not_a_runtime_setting(self):
-        cfg = load_config(["dummy_in", "dummy_out.epub", "--target-lang", "fr"])
-        assert not hasattr(cfg, "source_lang")
-
-    def test_default_concurrency(self):
-        cfg = load_config(["dummy_in", "dummy_out.epub", "--target-lang", "fr"])
-        assert cfg.concurrency == 4
-
-    def test_default_max_retries(self):
-        cfg = load_config(["dummy_in", "dummy_out.epub", "--target-lang", "fr"])
-        assert cfg.max_retries == 3
-
-    def test_default_timeout(self):
-        cfg = load_config(["dummy_in", "dummy_out.epub", "--target-lang", "fr"])
-        assert cfg.timeout == 120
-
-    def test_default_intermediate_dir_is_path(self):
-        cfg = load_config(["dummy_in", "dummy_out.epub", "--target-lang", "fr"])
-        assert cfg.intermediate_dir == Path("./intermediate")
-
-    def test_default_pi_bin(self):
-        cfg = load_config(["dummy_in", "dummy_out.epub", "--target-lang", "fr"])
-        assert cfg.pi_bin == "pi"
-
-    def test_default_title(self):
-        cfg = load_config(["dummy_in", "dummy_out.epub", "--target-lang", "fr"])
-        assert cfg.title == "Translated Book"
-
-    def test_default_author(self):
-        cfg = load_config(["dummy_in", "dummy_out.epub", "--target-lang", "fr"])
-        assert cfg.author == "Unknown"
-
-    def test_default_embed_images(self):
-        cfg = load_config(["dummy_in", "dummy_out.epub", "--target-lang", "fr"])
-        assert cfg.embed_images is False
-
-    def test_default_no_resume(self):
-        cfg = load_config(["dummy_in", "dummy_out.epub", "--target-lang", "fr"])
-        assert cfg.no_resume is False
-
-    def test_positional_input_dir(self):
-        cfg = load_config(["/tmp/books", "out.epub", "--target-lang", "es"])
-        assert cfg.input_dir == Path("/tmp/books")
-
-    def test_positional_output_epub(self):
-        cfg = load_config(["in", "/tmp/output.epub", "--target-lang", "es"])
-        assert cfg.output_epub == Path("/tmp/output.epub")
-
-
-class TestEnvVars:
-    """Environment variables populate config fields."""
-
-    def test_env_model(self, monkeypatch):
-        monkeypatch.setenv("BTRAN_MODEL", "gpt-4o")
-        cfg = load_config(["in", "out.epub", "--target-lang", "fr"])
-        assert cfg.model == "gpt-4o"
-
-    def test_env_target_lang(self, monkeypatch):
-        monkeypatch.setenv("BTRAN_TARGET_LANG", "zh")
-        cfg = load_config(["in", "out.epub"])
-        assert cfg.target_lang == "zh"
-
-    def test_env_concurrency_int(self, monkeypatch):
-        monkeypatch.setenv("BTRAN_CONCURRENCY", "8")
-        cfg = load_config(["in", "out.epub", "--target-lang", "fr"])
-        assert cfg.concurrency == 8
-        assert isinstance(cfg.concurrency, int)
-
-    def test_env_max_retries_int(self, monkeypatch):
-        monkeypatch.setenv("BTRAN_MAX_RETRIES", "5")
-        cfg = load_config(["in", "out.epub", "--target-lang", "fr"])
-        assert cfg.max_retries == 5
-        assert isinstance(cfg.max_retries, int)
-
-    def test_env_timeout_int(self, monkeypatch):
-        monkeypatch.setenv("BTRAN_TIMEOUT", "300")
-        cfg = load_config(["in", "out.epub", "--target-lang", "fr"])
-        assert cfg.timeout == 300
-        assert isinstance(cfg.timeout, int)
-
-    def test_env_intermediate_dir(self, monkeypatch):
-        monkeypatch.setenv("BTRAN_INTERMEDIATE_DIR", "/tmp/work")
-        cfg = load_config(["in", "out.epub", "--target-lang", "fr"])
-        assert cfg.intermediate_dir == Path("/tmp/work")
-
-    def test_env_pi_bin(self, monkeypatch):
-        monkeypatch.setenv("BTRAN_PI_BIN", "/usr/local/bin/pi")
-        cfg = load_config(["in", "out.epub", "--target-lang", "fr"])
-        assert cfg.pi_bin == "/usr/local/bin/pi"
-
-    def test_env_title(self, monkeypatch):
-        monkeypatch.setenv("BTRAN_TITLE", "My Book")
-        cfg = load_config(["in", "out.epub", "--target-lang", "fr"])
-        assert cfg.title == "My Book"
-
-    def test_env_author(self, monkeypatch):
-        monkeypatch.setenv("BTRAN_AUTHOR", "Krishna")
-        cfg = load_config(["in", "out.epub", "--target-lang", "fr"])
-        assert cfg.author == "Krishna"
-
-    def test_env_input_dir(self, monkeypatch):
-        monkeypatch.setenv("BTRAN_INPUT_DIR", "/data/scans")
-        # CLI positional overrides env — spec says CLI wins.
-        cfg = load_config(["in", "out.epub", "--target-lang", "fr"])
-        assert cfg.input_dir == Path("in")
-
-    def test_env_output_epub(self, monkeypatch):
-        monkeypatch.setenv("BTRAN_OUTPUT_EPUB", "/out/book.epub")
-        # CLI positional overrides env — spec says CLI wins.
-        cfg = load_config(["in", "out.epub", "--target-lang", "fr"])
-        assert cfg.output_epub == Path("out.epub")
-
-
-class TestCLIOverridesEnv:
-    """CLI args take precedence over environment variables."""
-
-    def test_cli_model_overrides_env(self, monkeypatch):
-        monkeypatch.setenv("BTRAN_MODEL", "gpt-4o")
-        cfg = load_config(["in", "out.epub", "--target-lang", "fr", "--model", "claude-sonnet"])
-        assert cfg.model == "claude-sonnet"
-
-    def test_cli_target_lang_overrides_env(self, monkeypatch):
-        monkeypatch.setenv("BTRAN_TARGET_LANG", "zh")
-        cfg = load_config(["in", "out.epub", "--target-lang", "es"])
-        assert cfg.target_lang == "es"
-
-    def test_cli_concurrency_overrides_env(self, monkeypatch):
-        monkeypatch.setenv("BTRAN_CONCURRENCY", "8")
-        cfg = load_config(["in", "out.epub", "--target-lang", "fr", "--concurrency", "16"])
-        assert cfg.concurrency == 16
-
-    def test_cli_max_retries_overrides_env(self, monkeypatch):
-        monkeypatch.setenv("BTRAN_MAX_RETRIES", "2")
-        cfg = load_config(["in", "out.epub", "--target-lang", "fr", "--max-retries", "10"])
-        assert cfg.max_retries == 10
-
-    def test_cli_timeout_overrides_env(self, monkeypatch):
-        monkeypatch.setenv("BTRAN_TIMEOUT", "60")
-        cfg = load_config(["in", "out.epub", "--target-lang", "fr", "--timeout", "240"])
-        assert cfg.timeout == 240
-
-    def test_cli_embed_images_flag(self, monkeypatch):
-        cfg = load_config(["in", "out.epub", "--target-lang", "fr", "--embed-images"])
-        assert cfg.embed_images is True
-
-    def test_cli_no_resume_flag(self, monkeypatch):
-        cfg = load_config(["in", "out.epub", "--target-lang", "fr", "--no-resume"])
-        assert cfg.no_resume is True
-
-    def test_cli_intermediate_dir_overrides_env(self, monkeypatch):
-        monkeypatch.setenv("BTRAN_INTERMEDIATE_DIR", "/tmp/work")
-        cfg = load_config(["in", "out.epub", "--target-lang", "fr", "--intermediate-dir", "/custom/int"])
-        assert cfg.intermediate_dir == Path("/custom/int")
-
-    def test_cli_title_overrides_env(self, monkeypatch):
-        monkeypatch.setenv("BTRAN_TITLE", "Env Title")
-        cfg = load_config(["in", "out.epub", "--target-lang", "fr", "--title", "CLI Title"])
-        assert cfg.title == "CLI Title"
-
-    def test_cli_author_overrides_env(self, monkeypatch):
-        monkeypatch.setenv("BTRAN_AUTHOR", "Env Author")
-        cfg = load_config(["in", "out.epub", "--target-lang", "fr", "--author", "CLI Author"])
-        assert cfg.author == "CLI Author"
-
-    def test_cli_pi_bin_overrides_env(self, monkeypatch):
-        monkeypatch.setenv("BTRAN_PI_BIN", "/usr/bin/pi")
-        cfg = load_config(["in", "out.epub", "--target-lang", "fr", "--pi-bin", "/opt/pi"])
-        assert cfg.pi_bin == "/opt/pi"
-
-
-class TestMissingTargetLang:
-    """target_lang is required — must raise ValueError if not set anywhere."""
-
-    def test_missing_raises_valueerror(self):
-        with pytest.raises(ValueError, match="target_lang"):
-            load_config(["in", "out.epub"])
-
-    def test_missing_even_with_other_env(self, monkeypatch):
-        """Even with other env vars set, missing target_lang still raises."""
-        monkeypatch.setenv("BTRAN_MODEL", "gpt-5")
-        with pytest.raises(ValueError, match="target_lang"):
-            load_config(["in", "out.epub"])
-
-
-class TestIntParsing:
-    """Integer fields are parsed correctly from CLI."""
-
-    def test_concurrency_parsed_as_int(self):
-        cfg = load_config(["in", "out.epub", "--target-lang", "fr", "--concurrency", "32"])
-        assert cfg.concurrency == 32
-        assert isinstance(cfg.concurrency, int)
-
-    def test_max_retries_parsed_as_int(self):
-        cfg = load_config(["in", "out.epub", "--target-lang", "fr", "--max-retries", "7"])
-        assert cfg.max_retries == 7
-        assert isinstance(cfg.max_retries, int)
-
-    def test_timeout_parsed_as_int(self):
-        cfg = load_config(["in", "out.epub", "--target-lang", "fr", "--timeout", "999"])
-        assert cfg.timeout == 999
-        assert isinstance(cfg.timeout, int)
-
-
-class TestPathObjects:
-    """Path fields are Path objects."""
-
-    def test_input_dir_is_path(self):
-        cfg = load_config(["in", "out.epub", "--target-lang", "fr"])
-        assert isinstance(cfg.input_dir, Path)
-
-    def test_output_epub_is_path(self):
-        cfg = load_config(["in", "out.epub", "--target-lang", "fr"])
-        assert isinstance(cfg.output_epub, Path)
-
-    def test_intermediate_dir_is_path(self):
-        cfg = load_config(["in", "out.epub", "--target-lang", "fr"])
-        assert isinstance(cfg.intermediate_dir, Path)
-
-
-class TestDotenvLoading:
-    """Integration: .env file values are loaded."""
-
-    def test_dotenv_target_lang(self, monkeypatch, tmp_path):
-        """Simulate a .env file with target_lang set."""
-        envfile = tmp_path / ".env"
-        envfile.write_text("BTRAN_TARGET_LANG=it\n")
-        monkeypatch.chdir(tmp_path)
-        # load_dotenv uses find_dotenv(usecwd=True) so chdir works.
-        from dotenv import load_dotenv as _load
-        _load(dotenv_path=str(envfile))
-        cfg = load_config(["in", "out.epub"])
-        assert cfg.target_lang == "it"
-
-    def test_dotenv_overridden_by_cli(self, monkeypatch, tmp_path):
-        """CLI overrides .env values."""
-        envfile = tmp_path / ".env"
-        envfile.write_text("BTRAN_TARGET_LANG=it\nBTRAN_MODEL=env-model\n")
-        monkeypatch.chdir(tmp_path)
-        from dotenv import load_dotenv as _load
-        _load(dotenv_path=str(envfile))
-        cfg = load_config(["in", "out.epub", "--target-lang", "de", "--model", "cli-model"])
-        assert cfg.target_lang == "de"
-        assert cfg.model == "cli-model"
-
-
-class TestNewConfigFields:
-    """Production controls load from defaults, environment, and CLI."""
-
-    def test_defaults(self):
-        cfg = load_config(["in", "out.epub", "--target-lang", "fr"])
-        assert cfg.epub_check is False
-        assert cfg.epub_check_path == "epubcheck"
-        assert cfg.manifest_path == Path("manifest.json")
-        assert cfg.glossary_path == Path("glossary.json")
-        assert cfg.glossary_budget == 100_000
-
-    def test_environment_loading_and_types(self, monkeypatch):
-        monkeypatch.setenv("BTRAN_EPUB_CHECK", "true")
-        monkeypatch.setenv("BTRAN_EPUB_CHECK_PATH", "/opt/epubcheck")
-        monkeypatch.setenv("BTRAN_MANIFEST_PATH", "/tmp/manifest.json")
-        monkeypatch.setenv("BTRAN_GLOSSARY_BUDGET", "120000")
-        cfg = load_config(["in", "out.epub", "--target-lang", "fr"])
-        assert cfg.epub_check is True
-        assert cfg.epub_check_path == "/opt/epubcheck"
-        assert cfg.manifest_path == Path("/tmp/manifest.json")
-        assert cfg.glossary_budget == 120_000
-
-    def test_cli_overrides_environment(self, monkeypatch):
-        monkeypatch.setenv("BTRAN_MANIFEST_PATH", "/env/manifest.json")
-        monkeypatch.setenv("BTRAN_GLOSSARY_BUDGET", "100")
-        cfg = load_config([
-            "in", "out.epub", "--target-lang", "fr",
-            "--manifest-path", "/cli/manifest.json", "--glossary-budget", "200",
-        ])
-        assert cfg.manifest_path == Path("/cli/manifest.json")
-        assert cfg.glossary_budget == 200
-
-    def test_preflight_only_environment_control_is_rejected(self, monkeypatch):
-        monkeypatch.setenv("BTRAN_PREFLIGHT_ONLY", "true")
-        with pytest.raises(ValueError, match="not supported"):
-            load_config(["in", "out.epub", "--target-lang", "fr"])
+from btran.config import Config, load_config, resolve_workspace
+
+
+@pytest.fixture
+def clean_cwd(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    for name in list(__import__("os").environ):
+        if name.startswith("BTRAN_"):
+            monkeypatch.delenv(name, raising=False)
+
+
+def test_absent_target_selects_native(clean_cwd):
+    config = load_config(["photos", "book.epub"])
+    assert config.target_lang is None
+    assert config.mode == "native"
+
+
+@pytest.mark.parametrize(("environment", "arguments", "expected"), [
+    ("ja", ["photos", "book.epub"], "ja"),
+    (" ja ", ["photos", "book.epub"], "ja"),
+    ("ja", ["photos", "book.epub", "--target-lang", "fr"], "fr"),
+])
+def test_target_cli_overrides_only_nonblank_environment(clean_cwd, monkeypatch, environment, arguments, expected):
+    monkeypatch.setenv("BTRAN_TARGET_LANG", environment)
+    config = load_config(arguments)
+    assert config.target_lang == expected
+    assert config.mode == "translated"
+
+
+@pytest.mark.parametrize("environment, args", [
+    ("", ["photos", "book.epub"]),
+    ("   ", ["photos", "book.epub", "--target-lang", "fr"]),
+])
+def test_blank_environment_target_is_rejected(clean_cwd, monkeypatch, environment, args):
+    monkeypatch.setenv("BTRAN_TARGET_LANG", environment)
+    with pytest.raises(SystemExit) as exc:
+        load_config(args)
+    assert exc.value.code == 2
+
+
+def test_blank_cli_target_is_rejected(clean_cwd):
+    with pytest.raises(SystemExit) as exc:
+        load_config(["photos", "book.epub", "--target-lang", " \t "])
+    assert exc.value.code == 2
+
+
+@pytest.mark.parametrize(("flag", "value"), [
+    ("--concurrency", "0"), ("--concurrency", "33"),
+    ("--max-retries", "-1"), ("--max-retries", "6"),
+    ("--timeout", "0"), ("--timeout", "3601"),
+])
+def test_finite_process_bounds_are_rejected_at_parse_time(clean_cwd, flag, value):
+    with pytest.raises(SystemExit) as exc:
+        load_config(["photos", "book.epub", flag, value])
+    assert exc.value.code == 2
+
+
+def test_finite_process_policy_is_centralized(clean_cwd):
+    config = load_config(["photos", "book.epub", "--timeout", "10", "--max-retries", "3"])
+    assert config.retry_backoffs == (1, 2, 4)
+    assert config.max_leaf_seconds == 4 * 14 + 7
+
+
+def test_new_run_selectors_load_from_cli_and_environment(clean_cwd, monkeypatch):
+    monkeypatch.setenv("BTRAN_CORRECTION_SET", "environment-set")
+    config = load_config([
+        "photos", "book.epub", "--workspace", "state", "--base-revision", "base",
+        "--correction-set", "explicit-set", "--refresh",
+    ])
+    assert config.workspace == Path("state")
+    assert config.base_revision == "base"
+    assert config.correction_set == "explicit-set"
+    assert config.refresh is True
+
+
+def test_workspace_defaults_beside_output_and_bad_optional_workspace_falls_back(tmp_path):
+    output = tmp_path / "output" / "book.epub"
+    default = resolve_workspace(Config(output_epub=output))
+    assert default.workspace == output.parent / ".btran"
+    bad = tmp_path / "not-a-directory"
+    bad.write_text("x")
+    fallback = resolve_workspace(Config(output_epub=output, workspace=bad))
+    assert fallback.workspace == output.parent / ".btran"
+    assert fallback.fallback_from == bad
+
+
+def test_legacy_intermediate_directory_is_only_workspace_fallback_alias(tmp_path):
+    legacy = tmp_path / "legacy"
+    resolution = resolve_workspace(Config(output_epub=tmp_path / "book.epub", intermediate_dir=legacy))
+    assert resolution.workspace == legacy

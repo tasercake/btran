@@ -5,12 +5,13 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+from dataclasses import asdict
 from pathlib import Path
 
 import imagehash
 from PIL import Image
 
-from btran.schema import PageResult
+from btran.schema import PageResult, canonical_json
 
 
 def compute_sha256(image_path: Path) -> str:
@@ -170,7 +171,7 @@ class ImageCache:
         prompt_version: str,
     ) -> None:
         """Store a new translation result with full semantic context."""
-        result_json = json.dumps(result.to_dict())
+        result_json = canonical_json(asdict(result))
         self._conn.execute(
             "INSERT OR REPLACE INTO translations"
             " (sha256, phash, image_path, page_number, result_json,"

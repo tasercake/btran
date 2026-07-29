@@ -4,6 +4,8 @@ import asyncio
 import json
 import os
 import signal
+import sys
+import time
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -31,6 +33,23 @@ _VALID_OUTPUT = json.dumps(
         "illustrations": ["A map of the island."],
     }
 )
+
+
+def _assert_exact_segment_review_provenance(store, finding_ids, *, page_id, segment_artifacts):
+    """Review requests must target and base exactly one correction-ready segment."""
+    requests = [store.get_finding(finding_id) for finding_id in finding_ids]
+    requests = [finding for finding in requests if finding.kind == "review_request"]
+    assert requests
+    for request in requests:
+        subject_ids = request.evidence["applicable_subject_ids"]
+        assert request.evidence["scope"] == "segment"
+        assert subject_ids == list(request.subject_refs)
+        assert len(subject_ids) == 1
+        subject_id = subject_ids[0]
+        assert subject_id != page_id
+        assert subject_id in segment_artifacts
+        assert request.evidence["base_artifact_ids"] == [segment_artifacts[subject_id]]
+        assert request.dependency_ids == (segment_artifacts[subject_id],)
 
 
 class TestExtractPage:
@@ -176,28 +195,31 @@ class TestExtractPage:
 
         class HangingProcess:
             def __init__(self):
+                self._never = asyncio.Event()
+                self.terminate = Mock(side_effect=self._never.set)
                 self.kill = Mock()
                 self.pid = 123
                 self.returncode = None
-                self._never = asyncio.Event()
 
             async def communicate(self):
-                if not killpg.called:
-                    await self._never.wait()
+                await self._never.wait()
                 return b"", b""
 
         proc = HangingProcess()
+        from btran.process_cleanup import _ProcessRef
         with patch(
             "btran.source_extractor.asyncio.create_subprocess_exec",
             AsyncMock(return_value=proc),
-        ), patch("btran.source_extractor.os.killpg") as killpg:
+        ), patch("btran.process_cleanup._proc_ref", return_value=_ProcessRef(123, 1)), \
+             patch("btran.process_cleanup._signal_group", return_value=False), \
+             patch("btran.process_cleanup.os.kill"):
             with pytest.raises(ExtractionError, match="timed out"):
                 await extract_page(
-                    Path("page.png"), "model", "a" * 64, "b" * 16, 1, timeout=0.01
+                    Path("page.png"), "model", "a" * 64, "b" * 16, 1, timeout=1
                 )
 
-        killpg.assert_called_once_with(123, signal.SIGKILL)
-        proc.kill.assert_not_called()
+        proc.terminate.assert_called_once_with()
+        proc.kill.assert_called_once_with()
 
     @pytest.mark.asyncio
     async def test_cancellation_kills_and_reaps_pi_process(self):
@@ -211,18 +233,21 @@ class TestExtractPage:
                 self.returncode = None
                 self.started = asyncio.Event()
                 self._never = asyncio.Event()
+                self.terminate = Mock(side_effect=self._never.set)
 
             async def communicate(self):
                 self.started.set()
-                if not killpg.called:
-                    await self._never.wait()
+                await self._never.wait()
                 return b"", b""
 
         proc = HangingProcess()
+        from btran.process_cleanup import _ProcessRef
         with patch(
             "btran.source_extractor.asyncio.create_subprocess_exec",
             AsyncMock(return_value=proc),
-        ), patch("btran.source_extractor.os.killpg") as killpg:
+        ), patch("btran.process_cleanup._proc_ref", return_value=_ProcessRef(123, 1)), \
+             patch("btran.process_cleanup._signal_group", return_value=False), \
+             patch("btran.process_cleanup.os.kill"):
             task = asyncio.create_task(extract_page(
                 Path("page.png"), "model", "a" * 64, "b" * 16, 1,
             ))
@@ -231,8 +256,54 @@ class TestExtractPage:
             with pytest.raises(asyncio.CancelledError):
                 await task
 
-        killpg.assert_called_once_with(123, signal.SIGKILL)
-        proc.kill.assert_not_called()
+        proc.terminate.assert_called_once_with()
+        proc.kill.assert_called_once_with()
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(os.name != "posix", reason="requires /proc POSIX process cleanup")
+    async def test_timeout_kills_detached_setsid_pipe_holder(self, tmp_path):
+        """Extraction cleanup finds wrapper child after it escapes session."""
+        from btran.source_extractor import ExtractionError, extract_page
+
+        pid_path = tmp_path / "escaped.pid"
+        child_source = (
+            "import os, signal, time\n"
+            "os.setsid()\n"
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            "while True: time.sleep(.1)\n"
+        )
+        worker = tmp_path / "fake-pi"
+        worker.write_text(
+            f"#!{sys.executable}\n"
+            "import signal, subprocess, sys, time\n"
+            f"child=subprocess.Popen([sys.executable, '-c', {child_source!r}])\n"
+            f"open({str(pid_path)!r}, 'w').write(str(child.pid))\n"
+            "signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))\n"
+            "while True: time.sleep(.1)\n",
+            encoding="utf-8",
+        )
+        worker.chmod(0o755)
+        child_pid: int | None = None
+        try:
+            with pytest.raises(ExtractionError, match="timed out"):
+                await extract_page(Path("page.png"), "model", "a" * 64, "b" * 16, 1,
+                                   pi_bin=str(worker), timeout=1)
+            child_pid = int(pid_path.read_text(encoding="utf-8"))
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                try:
+                    os.kill(child_pid, 0)
+                except ProcessLookupError:
+                    break
+                await asyncio.sleep(.01)
+            else:
+                pytest.fail("detached extraction pipe holder survived cleanup")
+        finally:
+            if child_pid is not None:
+                try:
+                    os.kill(child_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
 
     @pytest.mark.asyncio
     async def test_negative_timeout_rejected_before_spawning_pi(self):
@@ -240,7 +311,7 @@ class TestExtractPage:
 
         exec_mock = AsyncMock()
         with patch("btran.source_extractor.asyncio.create_subprocess_exec", exec_mock):
-            with pytest.raises(ExtractionError, match="timeout must be non-negative"):
+            with pytest.raises(ExtractionError, match="between 1 and 3600"):
                 await extract_page(
                     Path("page.png"), "model", "a" * 64, "b" * 16, 1, timeout=-1
                 )
@@ -248,18 +319,43 @@ class TestExtractPage:
         exec_mock.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_zero_timeout_disables_the_extraction_deadline(self):
-        from btran.source_extractor import extract_page
+    async def test_zero_timeout_is_rejected_before_spawning_pi(self):
+        from btran.source_extractor import ExtractionError, extract_page
 
-        with patch(
-            "btran.source_extractor.asyncio.create_subprocess_exec",
-            AsyncMock(return_value=_make_mock_proc(stdout=_VALID_OUTPUT)),
-        ):
-            extraction = await extract_page(
-                Path("page.png"), "model", "a" * 64, "b" * 16, 1, timeout=0
-            )
+        exec_mock = AsyncMock()
+        with patch("btran.source_extractor.asyncio.create_subprocess_exec", exec_mock):
+            with pytest.raises(ExtractionError, match="between 1 and 3600"):
+                await extract_page(Path("page.png"), "model", "a" * 64, "b" * 16, 1, timeout=0)
 
-        assert extraction.page_number == 1
+        exec_mock.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_group_signal_lookup_failure_still_directly_kills_and_reaps_child(self, monkeypatch):
+        import btran.source_extractor as extractor
+
+        class HangingProcess:
+            def __init__(self):
+                self.pid = 123
+                self.returncode = None
+                self.done = asyncio.Event()
+                self.terminate = Mock()
+                self.kill = Mock(side_effect=self.done.set)
+
+            async def communicate(self):
+                await self.done.wait()
+                return b"", b""
+
+        proc = HangingProcess()
+        monkeypatch.setattr(extractor, "PROCESS_TERMINATE_GRACE_SECONDS", .01)
+        monkeypatch.setattr(extractor, "PROCESS_KILL_GRACE_SECONDS", .01)
+        from btran.process_cleanup import _ProcessRef
+        with patch("btran.process_cleanup._proc_ref", return_value=_ProcessRef(123, 1)), \
+             patch("btran.process_cleanup._signal_group", return_value=False), \
+             patch("btran.process_cleanup.os.kill"):
+            await extractor._kill_and_reap(proc)
+
+        proc.terminate.assert_called_once_with()
+        proc.kill.assert_called_once_with()
 
 
 class TestStrictStructuredValidation:
@@ -344,3 +440,286 @@ class TestExtractionArtifacts:
 
         monkeypatch.setattr(extractor, "EXTRACTION_SCHEMA_VERSION", "changed")
         assert first != extractor.extraction_cache_identity("a" * 64, "vision-a")
+
+
+class TestPersistedRawLeaves:
+    @pytest.mark.asyncio
+    async def test_decode_failure_is_raw_diagnostic_fallback_not_effective_content(self, tmp_path):
+        from btran.artifacts import ArtifactStore
+        from btran.identity import page_id_for_raw_sha256
+        from btran.source_extractor import RawPageInput, extract_raw_pages
+
+        image = tmp_path / "accepted.png"
+        image.write_bytes(b"not a decodable image")
+        digest = __import__("hashlib").sha256(image.read_bytes()).hexdigest()
+        page_id = page_id_for_raw_sha256(digest)
+        store = ArtifactStore(tmp_path / "state")
+
+        result = await extract_raw_pages(
+            [RawPageInput(page_id, image, digest)], store=store,
+            workspace=tmp_path / "state", model="vision", base_revision_id="base-rev",
+        )
+
+        leaf = result.leaves[0]
+        artifact = store.get(leaf.page_artifact_id)
+        assert result.status == "degraded"
+        assert artifact.kind == "DiagnosticSourceFallback"
+        assert artifact.payload["source_lang"] is None
+        assert "effective_content_id" not in artifact.payload
+        assert "[btran diagnostic: page_unreadable:" in artifact.payload["segment"]["source_text"]
+        from btran.artifacts import source_extraction_semantic_key
+        from btran.source_extractor import EXTRACTION_PROMPT, EXTRACTION_SCHEMA_VERSION
+        assert artifact.semantic_key == source_extraction_semantic_key(
+            extraction_schema=EXTRACTION_SCHEMA_VERSION,
+            prompt_bytes=EXTRACTION_PROMPT.encode("utf-8"),
+            model_executable_identity="pi-bin:pi", model_id="vision",
+            raw_bytes=image.read_bytes(), normalization_bytes=b"",
+        )
+        requests = [store.get_finding(item) for item in leaf.finding_ids]
+        _assert_exact_segment_review_provenance(
+            store, leaf.finding_ids, page_id=page_id,
+            segment_artifacts={artifact.payload["segment"]["segment_id"]: artifact.artifact_id},
+        )
+        request = next(item for item in requests if item.kind == "review_request")
+        assert request.requires_action is False
+        assert request.evidence == {
+            "trigger": "degraded_unknown_confidence",
+            "suggested_correction_kind": "source_text",
+            "applicable_subject_ids": [artifact.payload["segment"]["segment_id"]],
+            "base_revision_id": "base-rev",
+            "base_artifact_ids": [artifact.artifact_id],
+            "scope": "segment",
+        }
+
+    @pytest.mark.asyncio
+    async def test_hash_mismatch_fallback_key_uses_actual_raw_bytes(self, tmp_path):
+        from hashlib import sha256
+
+        from btran.artifacts import ArtifactStore, source_extraction_semantic_key
+        from btran.identity import page_id_for_raw_sha256
+        from btran.source_extractor import (
+            EXTRACTION_PROMPT,
+            EXTRACTION_SCHEMA_VERSION,
+            RawPageInput,
+            extract_raw_pages,
+        )
+
+        actual_raw = b"raw bytes retained despite claimed digest mismatch"
+        claimed_digest = sha256(b"different accepted bytes").hexdigest()
+        store = ArtifactStore(tmp_path / "state")
+        result = await extract_raw_pages([
+            RawPageInput(page_id_for_raw_sha256(claimed_digest), tmp_path / "missing.png",
+                         claimed_digest, raw_bytes=actual_raw)
+        ], store=store, workspace=tmp_path / "state", model="vision")
+
+        artifact = store.get(result.leaves[0].page_artifact_id)
+        assert result.status == "degraded"
+        assert artifact.semantic_key == source_extraction_semantic_key(
+            extraction_schema=EXTRACTION_SCHEMA_VERSION,
+            prompt_bytes=EXTRACTION_PROMPT.encode("utf-8"),
+            model_executable_identity="pi-bin:pi",
+            model_id="vision",
+            raw_bytes=actual_raw,
+            normalization_bytes=b"",
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("timeout", "max_retries", "error"), [
+        (0, 3, "timeout must be finite and between 1 and 3600"),
+        (1, 6, "max_retries must be an integer between 0 and 5"),
+    ])
+    async def test_invalid_run_bounds_reject_before_decode_failure_fallback(
+        self, tmp_path, timeout, max_retries, error,
+    ):
+        from hashlib import sha256
+
+        from btran.artifacts import ArtifactStore
+        from btran.identity import page_id_for_raw_sha256
+        from btran.source_extractor import ExtractionError, RawPageInput, extract_raw_pages
+
+        raw = b"undecodable accepted input"
+        digest = sha256(raw).hexdigest()
+        store = ArtifactStore(tmp_path / "state")
+        with pytest.raises(ExtractionError, match=error):
+            await extract_raw_pages([
+                RawPageInput(page_id_for_raw_sha256(digest), tmp_path / "missing.png", digest,
+                             raw_bytes=raw)
+            ], store=store, workspace=tmp_path / "state", model="vision", timeout=timeout,
+               max_retries=max_retries)
+
+        assert not list(store.artifacts_dir.iterdir())
+        assert not list(store.findings_dir.iterdir())
+
+    @pytest.mark.asyncio
+    async def test_low_confidence_page_aggregation_keeps_segment_review_provenance(self, tmp_path):
+        from btran.artifacts import ArtifactStore, DependencyGraph
+        from btran.identity import page_id_for_raw_sha256
+        from btran.source_extractor import RawPageInput, extract_raw_pages, materialize_effective_source
+        from PIL import Image
+
+        image = tmp_path / "page.png"
+        Image.new("RGB", (600, 600), "white").save(image)
+        digest = __import__("hashlib").sha256(image.read_bytes()).hexdigest()
+        page_id = page_id_for_raw_sha256(digest)
+        store = ArtifactStore(tmp_path / "state")
+        proc = _make_mock_proc(stdout=_VALID_OUTPUT)
+        with patch("btran.source_extractor.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
+            result = await extract_raw_pages(
+                [RawPageInput(page_id, image, digest, confidence=.5)], store=store,
+                workspace=tmp_path / "state", model="vision", base_revision_id="base-rev",
+            )
+
+        findings = [store.get_finding(item) for item in result.leaves[0].finding_ids]
+        requests = [item for item in findings if item.kind == "review_request"]
+        assert requests
+        assert all(item.requires_action is False for item in requests)
+        assert all(item.evidence["trigger"] == "low_confidence" for item in requests)
+        assert all(item.evidence["base_revision_id"] == "base-rev" for item in requests)
+        assert all(item.evidence["base_artifact_ids"] for item in requests)
+        raw_segments = {
+            store.get(artifact_id).payload["segment_id"]: artifact_id
+            for artifact_id in result.leaves[0].segment_artifact_ids
+        }
+        _assert_exact_segment_review_provenance(
+            store, result.leaves[0].finding_ids, page_id=page_id, segment_artifacts=raw_segments,
+        )
+
+        effective = materialize_effective_source(
+            result, store=store, graph=DependencyGraph(tmp_path / "state"), base_revision_id="base-rev",
+        )
+        effective_segments = {
+            store.get(artifact_id).payload["segment_id"]: artifact_id
+            for artifact_id in effective.leaves[0].segment_artifact_ids
+        }
+        _assert_exact_segment_review_provenance(
+            store, effective.leaves[0].finding_ids, page_id=page_id,
+            segment_artifacts=effective_segments,
+        )
+
+
+class TestEffectiveSourceMaterialization:
+    @pytest.mark.asyncio
+    async def test_native_effective_source_preserves_language_and_applies_selected_overlay(self, tmp_path):
+        from btran.artifacts import ArtifactStore, DependencyGraph
+        from btran.corrections import OverlayInput
+        from btran.identity import page_id_for_raw_sha256
+        from btran.source_extractor import RawPageInput, extract_raw_pages, materialize_effective_source
+        from PIL import Image
+
+        image = tmp_path / "page.png"
+        Image.new("RGB", (600, 600), "white").save(image)
+        digest = __import__("hashlib").sha256(image.read_bytes()).hexdigest()
+        page_id = page_id_for_raw_sha256(digest)
+        store = ArtifactStore(tmp_path / "state")
+        graph = DependencyGraph(tmp_path / "state")
+        with patch("btran.source_extractor.asyncio.create_subprocess_exec", AsyncMock(return_value=_make_mock_proc(stdout=_VALID_OUTPUT))):
+            raw = await extract_raw_pages(
+                [RawPageInput(page_id, image, digest)], store=store, workspace=tmp_path / "state",
+                model="vision", base_revision_id="base-revision",
+            )
+
+        raw_segment_id = raw.leaves[0].segment_artifact_ids[0]
+        segment = store.get(raw_segment_id).payload
+        overlay = OverlayInput(
+            correction_id="source-correction", kind="source_text", subject_id=segment["segment_id"],
+            replacement="Corrected source text", base_artifact_ids=(raw_segment_id,),
+            scope={"segment_id": segment["segment_id"]},
+        )
+        result = materialize_effective_source(
+            raw, store=store, graph=graph, source_overlays=(overlay,), base_revision_id="base-revision",
+        )
+
+        assert result.status == "completed"
+        assert len(result.leaves) == 1
+        leaf = result.leaves[0]
+        page = store.get(leaf.page_artifact_id)
+        assert page.kind == "EffectiveSourcePage"
+        assert page.payload["source_langs"] == ["en"]
+        effective = [store.get(artifact_id) for artifact_id in leaf.segment_artifact_ids]
+        corrected = next(item for item in effective if item.payload["segment_id"] == segment["segment_id"])
+        assert corrected.payload["source_text"] == "Corrected source text"
+        assert corrected.payload["effective_text"] == "Corrected source text"
+        assert corrected.payload["source_lang"] == corrected.payload["render_lang"] == "en"
+        assert corrected.payload["translation_artifact_id"] is None
+        assert corrected.payload["target_overlay_artifact_id"] is None
+        assert corrected.payload["correction_ids"] == ["source-correction"]
+        overlay_id = corrected.payload["source_overlay_artifact_id"]
+        assert store.get(overlay_id).kind == "SourceTextOverlay"
+        edges = [graph.get(edge_id) for edge_id in result.graph_edge_ids]
+        assert {(edge.parent_artifact_id, edge.child_artifact_id, edge.edge_kind) for edge in edges} >= {
+            (raw_segment_id, corrected.artifact_id, "raw_extraction_to_effective_source"),
+            (overlay_id, corrected.artifact_id, "source_overlay_to_effective_source"),
+        }
+
+    @pytest.mark.asyncio
+    async def test_raw_diagnostic_fallback_becomes_only_und_effective_diagnostic_with_review(self, tmp_path):
+        from btran.artifacts import ArtifactStore, DependencyGraph
+        from btran.identity import page_id_for_raw_sha256
+        from btran.source_extractor import RawPageInput, extract_raw_pages, materialize_effective_source
+
+        image = tmp_path / "bad.png"
+        image.write_bytes(b"not an image")
+        digest = __import__("hashlib").sha256(image.read_bytes()).hexdigest()
+        store = ArtifactStore(tmp_path / "state")
+        raw = await extract_raw_pages(
+            [RawPageInput(page_id_for_raw_sha256(digest), image, digest)], store=store,
+            workspace=tmp_path / "state", model="vision", base_revision_id="base-revision",
+        )
+        graph = DependencyGraph(tmp_path / "state")
+        result = materialize_effective_source(raw, store=store, graph=graph, base_revision_id="base-revision")
+
+        assert result.status == "degraded"
+        leaf = result.leaves[0]
+        effective = store.get(leaf.segment_artifact_ids[0])
+        assert effective.kind == "DiagnosticEffectiveSourceSegment"
+        assert effective.payload["source_lang"] is None
+        assert effective.payload["render_lang"] == "und"
+        assert effective.payload["effective_text"] == effective.payload["source_text"]
+        raw_fallback = store.get(raw.leaves[0].page_artifact_id)
+        _assert_exact_segment_review_provenance(
+            store, raw.leaves[0].finding_ids, page_id=raw.leaves[0].page_id,
+            segment_artifacts={raw_fallback.payload["segment"]["segment_id"]: raw_fallback.artifact_id},
+        )
+        _assert_exact_segment_review_provenance(
+            store, leaf.finding_ids, page_id=leaf.page_id,
+            segment_artifacts={effective.payload["segment_id"]: effective.artifact_id},
+        )
+        requests = [store.get_finding(item) for item in leaf.finding_ids]
+        assert {request.evidence["trigger"] for request in requests if request.kind == "review_request"} == {
+            "degraded_unknown_confidence"
+        }
+        edges = [graph.get(edge_id) for edge_id in result.graph_edge_ids]
+        assert any(
+            edge.edge_kind == "raw_fallback_to_effective_source"
+            and edge.parent_artifact_id == raw.leaves[0].page_artifact_id
+            and edge.child_artifact_id == effective.artifact_id
+            for edge in edges
+        )
+
+    @pytest.mark.asyncio
+    async def test_task10_native_target_keeps_task7_text_and_makes_no_translation_call(self, tmp_path):
+        from btran.artifacts import ArtifactStore, DependencyGraph
+        from btran.identity import page_id_for_raw_sha256
+        from btran.source_extractor import RawPageInput, extract_raw_pages, materialize_effective_source
+        from btran.translator import materialize_effective_target
+        from PIL import Image
+
+        image = tmp_path / "page.png"
+        Image.new("RGB", (600, 600), "white").save(image)
+        digest = __import__("hashlib").sha256(image.read_bytes()).hexdigest()
+        store = ArtifactStore(tmp_path / "state")
+        graph = DependencyGraph(tmp_path / "state")
+        with patch("btran.source_extractor.asyncio.create_subprocess_exec", AsyncMock(return_value=_make_mock_proc(stdout=_VALID_OUTPUT))):
+            raw = await extract_raw_pages([RawPageInput(page_id_for_raw_sha256(digest), image, digest)],
+                                          store=store, workspace=tmp_path / "state", model="vision")
+        source = materialize_effective_source(raw, store=store, graph=graph)
+
+        async def forbidden_model(_):
+            raise AssertionError("native target materialization must not call translation")
+
+        target = await materialize_effective_target(source, store=store, graph=graph, mode="native",
+                                                    translation_call=forbidden_model)
+        source_texts = [store.get(item).payload["effective_text"] for item in source.leaves[0].segment_artifact_ids]
+        target_segments = [store.get(item).payload for item in target.leaves[0].segment_artifact_ids]
+        assert [item["effective_text"] for item in target_segments] == source_texts
+        assert all(item["render_lang"] == item["source_lang"] for item in target_segments)

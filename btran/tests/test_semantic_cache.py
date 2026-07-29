@@ -7,12 +7,13 @@ model, and prompt/output-schema identity (prompt_version).
 All tests are written to FAIL before the implementation is updated.
 """
 
+from dataclasses import asdict
 from pathlib import Path
 
 import pytest
 from PIL import Image
 
-from btran.schema import PageResult
+from btran.schema import Finding, PageResult, RevisionSnapshot
 
 
 # ---------------------------------------------------------------------------
@@ -323,7 +324,7 @@ class TestLegacyDbFailClosed:
                 "b" * 16,
                 "/tmp/old.png",
                 1,
-                json.dumps(_make_result(page_text="legacy cached").to_dict()),
+                json.dumps(asdict(_make_result(page_text="legacy cached"))),
             ),
         )
         conn.commit()
@@ -373,7 +374,7 @@ class TestLegacyDbFailClosed:
                 "b" * 16,
                 "/tmp/old.png",
                 1,
-                json.dumps(_make_result().to_dict()),
+                json.dumps(asdict(_make_result())),
             ),
         )
         conn.commit()
@@ -610,3 +611,24 @@ class TestPromptFingerprint:
         f1 = compute_prompt_fingerprint("translate from en to fr")
         f2 = compute_prompt_fingerprint("translate from ja to de")
         assert f1 != f2
+
+
+def test_immutable_cache_reuse_requires_explicit_selected_snapshot_artifact(tmp_path: Path):
+    """Same-key history is discovery only; selector determines reuse."""
+    from btran.artifacts import ArtifactStore, CacheValidator
+
+    store = ArtifactStore(tmp_path / "state")
+    summary = Finding(kind="stage_summary", severity="info", stage="test", message="done")
+    store.put_finding(summary)
+    old = store.put("leaf", {"version": "old"}, finding_ids=(summary.finding_id,), semantic_key="same-key")
+    new = store.put("leaf", {"version": "new"}, finding_ids=(summary.finding_id,), semantic_key="same-key")
+    validator = CacheValidator(store)
+    selected = RevisionSnapshot(
+        revision_id="new-snapshot", selected_artifact_ids=(new.artifact_id,),
+        selected_cache_attestation_ids=(store.attestation_id_for(new.artifact_id, "leaf", "same-key"),),
+    )
+
+    key = lambda *, value: value
+    assert validator.select(selected, requested_artifact_id=new.artifact_id, kind="leaf", key_constructor=key, value="same-key") == new
+    assert validator.select(selected, requested_artifact_id=old.artifact_id, kind="leaf", key_constructor=key, value="same-key") is None
+    assert validator.select(selected, requested_artifact_id=None, kind="leaf", key_constructor=key, value="same-key") is None

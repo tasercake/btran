@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import io
 import json
+import zipfile
 
 import pytest
 
@@ -309,9 +311,9 @@ def test_consolidation_fails_when_multiple_batches_do_not_reduce_without_target_
         )
 
 
-@pytest.mark.parametrize("timeout", [-1, float("nan"), True])
+@pytest.mark.parametrize("timeout", [-1, 0, 3601, 1.5, float("nan"), True])
 def test_pi_consolidation_rejects_invalid_timeout_before_constructing_leaf(timeout):
-    with pytest.raises(ValueError, match="timeout must be non-negative and finite"):
+    with pytest.raises(ValueError, match="between 1 and 3600"):
         make_pi_consolidation_call(pi_bin="pi", model="test-model", timeout=timeout)
 
 
@@ -326,10 +328,10 @@ def test_tool_less_ephemeral_pi_call_returns_stdout_and_cleans_up_timeout(tmp_pa
         "    print(json.dumps(sys.argv[1:]))\n"
     )
     fake_pi.chmod(0o755)
-    no_timeout_call = make_pi_consolidation_call(
-        pi_bin=str(fake_pi), model="test-model", timeout=0
+    bounded_success_call = make_pi_consolidation_call(
+        pi_bin=str(fake_pi), model="test-model", timeout=1
     )
-    arguments = json.loads(no_timeout_call("prompt"))
+    arguments = json.loads(bounded_success_call("prompt"))
     assert "--no-session" in arguments
     assert "--no-tools" in arguments
     assert "--no-extensions" in arguments
@@ -475,3 +477,402 @@ def test_freeze_hash_and_cache_identity_are_stable_for_same_input():
     assert cache_identity_with_glossary("image-sha", first) != cache_identity_with_glossary(
         "image-sha", "other-glossary"
     )
+
+
+def _effective_source_artifact(tmp_path, *, text="Magic sword", language="en"):
+    """Small Task-7-shaped effective-source leaf for Task-8 boundaries."""
+    import hashlib
+    from btran.artifacts import ArtifactStore, DependencyGraph
+    from btran.schema import EffectiveSegment
+
+    digest = lambda value: hashlib.sha256(value.encode()).hexdigest()
+    store = ArtifactStore(tmp_path)
+    graph = DependencyGraph(tmp_path)
+    record = EffectiveSegment(
+        effective_segment_id=digest("effective:" + text), segment_id=digest("segment:" + text),
+        source_lang=language, source_text=text, effective_text=text, render_lang=language, mode="native",
+    )
+    artifact = store.put("EffectiveSourceSegment", record.to_dict(), semantic_key=digest("source:" + text))
+    return store, graph, record, artifact
+
+
+def test_task8_native_evidence_is_local_indexed_and_never_calls_terminology_model(tmp_path):
+    from btran.terminology import build_terminology_evidence
+
+    store, graph, record, artifact = _effective_source_artifact(tmp_path, text="Magic sword magic")
+
+    def forbidden(_: str) -> str:
+        raise AssertionError("native terminology must not call Pi")
+
+    run = build_terminology_evidence(
+        [artifact.artifact_id], store=store, graph=graph, mode="native", pi_call=forbidden,
+        base_revision_id="base-revision",
+    )
+
+    assert run.status == "degraded"
+    assert len(run.evidence_leaves) == 1
+    assert len(run.index_artifact_ids) == 3
+    assert run.projection_artifact_ids
+    edges = [graph.get(edge_id) for edge_id in run.graph_edge_ids]
+    assert {edge.edge_kind for edge in edges} >= {
+        "effective_source_to_occurrence_evidence", "occurrence_evidence_to_concept_membership",
+        "membership_to_projection", "selector_to_projection",
+    }
+    review_requests = [store.get_finding(finding_id) for finding_id in run.finding_ids]
+    review_requests = [finding for finding in review_requests if finding.kind == "review_request"]
+    assert review_requests
+    assert all(finding.requires_action is False for finding in review_requests)
+    assert all(finding.evidence["suggested_correction_kind"] == "terminology" for finding in review_requests)
+    assert all(finding.evidence["base_revision_id"] == "base-revision" for finding in review_requests)
+
+
+def test_task8_consolidation_failure_uses_source_form_projection_and_complete_review_request(tmp_path):
+    from btran.terminology import TERMINOLOGY_FAILURE_KIND, build_terminology_evidence
+
+    store, graph, record, artifact = _effective_source_artifact(tmp_path)
+    run = build_terminology_evidence(
+        [artifact.artifact_id], store=store, graph=graph, mode="translated", target_lang="fr",
+        pi_call=lambda _: (_ for _ in ()).throw(RuntimeError("offline")), base_revision_id="base-revision",
+    )
+
+    assert run.status == "degraded"
+    assert len(run.failure_artifact_ids) == 1
+    assert store.get(run.failure_artifact_ids[0]).kind == TERMINOLOGY_FAILURE_KIND
+    projections = [store.get(artifact_id).payload for artifact_id in run.projection_artifact_ids]
+    assert {item["target_form"] for item in projections} == {"Magic", "sword"}
+    requests = [store.get_finding(finding_id) for finding_id in run.finding_ids]
+    requests = [finding for finding in requests if finding.kind == "review_request"]
+    assert requests
+    for request in requests:
+        assert request.evidence["trigger"] == "degraded_unknown_confidence"
+        assert request.evidence["scope"] == "all_concept_occurrences"
+        assert request.evidence["base_artifact_ids"] == list(request.dependency_ids)
+
+
+def test_task8_low_confidence_and_source_sense_ambiguity_emit_complete_review_requests(tmp_path):
+    from btran.terminology import build_terminology_evidence
+
+    store, graph, record, artifact = _effective_source_artifact(tmp_path, text="bank")
+
+    def ambiguous_response(prompt):
+        request = json.loads(prompt.split("\n", 1)[1])
+        item = request["items"][0]
+        return json.dumps({"entries": [
+            {"concept_id": "river", "source_terms": item["source_terms"], "target_term": "rive",
+             "provenance": item["provenance"], "confidence": 0.2},
+            {"concept_id": "finance", "source_terms": item["source_terms"], "target_term": "banque",
+             "provenance": item["provenance"], "confidence": 0.2},
+        ]})
+
+    run = build_terminology_evidence(
+        [artifact.artifact_id], store=store, graph=graph, mode="translated", target_lang="fr",
+        pi_call=ambiguous_response, base_revision_id="base-revision",
+    )
+    requests = [store.get_finding(finding_id) for finding_id in run.finding_ids]
+    requests = [finding for finding in requests if finding.kind == "review_request"]
+    assert {finding.evidence["trigger"] for finding in requests} >= {"low_confidence", "source_sense_ambiguity"}
+    for request in requests:
+        assert request.requires_action is False
+        assert request.evidence["applicable_subject_ids"] == list(request.subject_refs)
+        assert request.evidence["base_revision_id"] == "base-revision"
+        assert request.evidence["base_artifact_ids"] == list(request.dependency_ids)
+        assert request.evidence["scope"] == "all_concept_occurrences"
+
+
+def test_task8_subset_terminology_overlay_creates_exact_selector_and_correction_edge(tmp_path):
+    from btran.corrections import OverlayInput
+    from btran.terminology import build_terminology_evidence
+
+    store, graph, record, artifact = _effective_source_artifact(tmp_path, text="magic magic")
+    baseline = build_terminology_evidence(
+        [artifact.artifact_id], store=store, graph=graph, mode="native", base_revision_id="base-revision",
+    )
+    membership = store.get(baseline.membership_artifact_ids[0])
+    old_projection = baseline.projection_artifact_ids[0]
+    occurrence_ids = membership.payload["occurrence_ids"]
+    overlay = OverlayInput(
+        correction_id="correction-id", kind="terminology", subject_id=membership.payload["concept_id"],
+        replacement="arcane", base_artifact_ids=(membership.artifact_id, old_projection),
+        scope={"concept_id": membership.payload["concept_id"],
+               "selector": {"kind": "occurrence_ids", "ids": [occurrence_ids[0]]}},
+    )
+    run = build_terminology_evidence(
+        [artifact.artifact_id], store=store, graph=graph, mode="native", terminology_overlays=(overlay,),
+        base_revision_id="base-revision", selected_membership_artifact_ids=baseline.membership_artifact_ids,
+    )
+
+    projections = [store.get(artifact_id).payload for artifact_id in run.projection_artifact_ids]
+    corrected = [item for item in projections if item["correction_id"] == "correction-id"]
+    assert len(corrected) == 1
+    assert corrected[0]["selector_occurrence_ids"] == [occurrence_ids[0]]
+    assert corrected[0]["target_form"] == "arcane"
+    assert any(graph.get(edge_id).edge_kind == "terminology_correction_to_projection" for edge_id in run.graph_edge_ids)
+
+
+def test_task8_changed_verified_candidate_payload_never_reuses_selected_shard(tmp_path):
+    from btran.terminology import build_terminology_evidence
+
+    store, graph, record, artifact = _effective_source_artifact(tmp_path, text="magic")
+    first = build_terminology_evidence(
+        [artifact.artifact_id], store=store, graph=graph, mode="native",
+        evidence_candidates={record.segment_id: [{"start": 0, "end": 5, "surface": "magic", "evidence": "first"}]},
+        base_revision_id="base-revision",
+    )
+    first_shard = first.evidence_leaves[0].evidence_shard_artifact_id
+
+    # Both candidates verify to same occurrence. Extra verified candidate payload
+    # still binds semantic key and artifact identity, so selected old shard dies.
+    second = build_terminology_evidence(
+        [artifact.artifact_id], store=store, graph=graph, mode="native",
+        evidence_candidates={record.segment_id: [{"start": 0, "end": 5, "surface": "magic", "evidence": "second"}]},
+        selected_evidence_shard_ids=(first_shard,), base_revision_id="base-revision",
+    )
+    second_shard = second.evidence_leaves[0].evidence_shard_artifact_id
+
+    assert second_shard != first_shard
+    assert store.get(second_shard).semantic_key != store.get(first_shard).semantic_key
+    assert store.get(second_shard).payload["candidate_binding"] != store.get(first_shard).payload["candidate_binding"]
+
+
+def test_task8_successor_transition_keeps_old_evidence_in_sealed_graph_closure(tmp_path):
+    """Changed evidence retains only its prior shard and seals as a closed graph."""
+    import hashlib
+    from btran.artifacts import RevisionStore
+    from btran.schema import EffectiveSegment, RevisionSnapshot, canonical_json_bytes
+    from btran.terminology import build_terminology_evidence
+
+    store, graph, first_record, first_source = _effective_source_artifact(tmp_path, text="magic")
+    digest = lambda value: hashlib.sha256(value.encode()).hexdigest()
+    second_record = EffectiveSegment(
+        effective_segment_id=digest("effective:sword"), segment_id=digest("segment:sword"),
+        source_lang="en", source_text="sword", effective_text="sword", render_lang="en", mode="native",
+    )
+    second_source = store.put("EffectiveSourceSegment", second_record.to_dict(),
+                              semantic_key=digest("source:sword"))
+    baseline = build_terminology_evidence(
+        [first_source.artifact_id, second_source.artifact_id], store=store, graph=graph, mode="native",
+        evidence_candidates={
+            first_record.segment_id: [{"start": 0, "end": 5, "surface": "magic", "evidence": "old"}],
+            second_record.segment_id: [{"start": 0, "end": 5, "surface": "sword", "evidence": "same"}],
+        }, base_revision_id="base-revision",
+    )
+    old_by_concept = {store.get(item).payload["canonical_source_form"]: item
+                      for item in baseline.membership_artifact_ids}
+    old_magic_shard = store.get(old_by_concept["magic"]).payload["evidence_shard_ids"][0]
+    old_projection_by_concept = {store.get(item).payload["concept_id"]: item
+                                 for item in baseline.projection_artifact_ids}
+    selected_ids = tuple(sorted((
+        *(leaf.evidence_shard_artifact_id for leaf in baseline.evidence_leaves),
+        *baseline.membership_artifact_ids,
+        *baseline.projection_artifact_ids,
+    )))
+    selected_snapshot = RevisionSnapshot(
+        revision_id="baseline", selected_artifact_ids=selected_ids,
+        selected_cache_attestation_ids=store.attestation_ids_for(selected_ids),
+    )
+
+    successor = build_terminology_evidence(
+        [first_source.artifact_id, second_source.artifact_id], store=store, graph=graph, mode="native",
+        evidence_candidates={
+            first_record.segment_id: [{"start": 0, "end": 5, "surface": "magic", "evidence": "new"}],
+            second_record.segment_id: [{"start": 0, "end": 5, "surface": "sword", "evidence": "same"}],
+        }, base_revision_id="base-revision",
+        selected_evidence_shard_ids=tuple(leaf.evidence_shard_artifact_id for leaf in baseline.evidence_leaves),
+        # Selected predecessor state alone supplies transition evidence.
+        selected_membership_artifact_ids=baseline.membership_artifact_ids,
+        selected_snapshot=selected_snapshot,
+    )
+    new_by_concept = {store.get(item).payload["canonical_source_form"]: item
+                      for item in successor.membership_artifact_ids}
+    new_magic = store.get(new_by_concept["magic"])
+    new_projection_by_concept = {store.get(item).payload["concept_id"]: item
+                                 for item in successor.projection_artifact_ids}
+
+    # Only changed membership/projection retains old evidence and changes;
+    # unrelated sword stays selected. This is exact transition state, not a
+    # page-wide old-shard fan-out.
+    magic_concept_id = store.get(old_by_concept["magic"]).payload["concept_id"]
+    sword_concept_id = store.get(old_by_concept["sword"]).payload["concept_id"]
+    assert new_magic.artifact_id != old_by_concept["magic"]
+    assert new_by_concept["sword"] == old_by_concept["sword"]
+    assert new_projection_by_concept[magic_concept_id] != old_projection_by_concept[magic_concept_id]
+    assert new_projection_by_concept[sword_concept_id] == old_projection_by_concept[sword_concept_id]
+    assert new_magic.payload["transition_from_evidence_shard_ids"] == [old_magic_shard]
+    assert old_magic_shard in new_magic.dependency_ids
+    transition = [graph.get(item) for item in successor.graph_edge_ids
+                  if graph.get(item).edge_kind == "occurrence_evidence_to_concept_membership"
+                  and graph.get(item).child_artifact_id == new_magic.artifact_id]
+    assert {(edge.parent_artifact_id, edge.child_artifact_id) for edge in transition} == {
+        (old_magic_shard, new_magic.artifact_id),
+        (store.get(new_magic.artifact_id).payload["evidence_shard_ids"][0], new_magic.artifact_id),
+    }
+
+    # Same semantic successor run validates and retains its selected audit
+    # closure rather than dropping old evidence and regenerating membership.
+    successor_selected_ids = tuple(sorted((
+        *(leaf.evidence_shard_artifact_id for leaf in successor.evidence_leaves),
+        *successor.membership_artifact_ids,
+        *successor.projection_artifact_ids,
+    )))
+    successor_snapshot = RevisionSnapshot(
+        revision_id="successor", selected_artifact_ids=successor_selected_ids,
+        selected_cache_attestation_ids=store.attestation_ids_for(successor_selected_ids),
+    )
+    rerun = build_terminology_evidence(
+        [first_source.artifact_id, second_source.artifact_id], store=store, graph=graph, mode="native",
+        evidence_candidates={
+            first_record.segment_id: [{"start": 0, "end": 5, "surface": "magic", "evidence": "new"}],
+            second_record.segment_id: [{"start": 0, "end": 5, "surface": "sword", "evidence": "same"}],
+        }, base_revision_id="base-revision",
+        selected_evidence_shard_ids=tuple(leaf.evidence_shard_artifact_id for leaf in successor.evidence_leaves),
+        selected_membership_artifact_ids=successor.membership_artifact_ids,
+        selected_snapshot=successor_snapshot,
+    )
+    assert rerun.membership_artifact_ids == successor.membership_artifact_ids
+    assert rerun.projection_artifact_ids == successor.projection_artifact_ids
+    assert rerun.graph_edge_ids == successor.graph_edge_ids
+    rerun_magic = next(store.get(item) for item in rerun.membership_artifact_ids
+                       if store.get(item).payload["canonical_source_form"] == "magic")
+    assert rerun_magic.payload["transition_from_evidence_shard_ids"] == [old_magic_shard]
+
+    # Projection roots close over retained old evidence, so every successor
+    # graph endpoint can be copied and verified by RevisionStore.
+    snapshot = RevisionSnapshot(revision_id="successor", selected_artifact_ids=successor.projection_artifact_ids)
+    provenance = {"revision_id": "successor", "render_input": successor.projection_artifact_ids[0]}
+    epub = io.BytesIO()
+    with zipfile.ZipFile(epub, "w") as archive:
+        archive.writestr("META-INF/btran-provenance.json", canonical_json_bytes(provenance))
+    revisions = RevisionStore(tmp_path, store, graph)
+    bundle = revisions.seal_bundle(
+        snapshot, provenance, epub.getvalue(), render_input_artifact_id=successor.projection_artifact_ids[0],
+        edge_ids=successor.graph_edge_ids, expected_embedded_provenance=provenance,
+    )
+    revisions.verify_bundle("successor")
+    assert (bundle / "artifacts" / f"{old_magic_shard}.json").exists()
+    sealed_edges = revisions.selected_graph("successor").edges("successor")
+    manifest = json.loads((bundle / "bundle-manifest.json").read_text())
+    assert all(edge.parent_artifact_id in manifest["artifact_ids"]
+               and edge.child_artifact_id in manifest["artifact_ids"] for edge in sealed_edges)
+
+
+def test_task8_selected_leaf_roots_seal_zero_occurrence_and_diagnostic_edges(tmp_path):
+    """Punctuation and diagnostic leaves remain selected even without memberships."""
+    import hashlib
+    from btran.artifacts import RevisionStore
+    from btran.schema import EffectiveSegment, Finding, RevisionSnapshot, canonical_json_bytes
+    from btran.terminology import build_terminology_evidence
+
+    store, graph, _, normal_source = _effective_source_artifact(tmp_path, text="magic")
+    digest = lambda value: hashlib.sha256(value.encode()).hexdigest()
+    punctuation = EffectiveSegment(
+        effective_segment_id=digest("effective:punctuation"), segment_id=digest("segment:punctuation"),
+        source_lang="en", source_text="!!!", effective_text="!!!", render_lang="en", mode="native",
+    )
+    diagnostic_finding = Finding(
+        kind="source_diagnostic", severity="warning", stage="source", subject_refs=(punctuation.segment_id,),
+        evidence={"reason": "unreadable"}, message="Diagnostic effective source.",
+    )
+    store.put_finding(diagnostic_finding)
+    diagnostic = EffectiveSegment(
+        effective_segment_id=digest("effective:diagnostic"), segment_id=digest("segment:diagnostic"),
+        source_lang=None, source_text="[diagnostic]", effective_text="[diagnostic]", render_lang="und", mode="native",
+        finding_ids=(diagnostic_finding.finding_id,),
+    )
+    punctuation_source = store.put("EffectiveSourceSegment", punctuation.to_dict(), semantic_key=digest("source:punctuation"))
+    diagnostic_source = store.put("DiagnosticEffectiveSourceSegment", diagnostic.to_dict(),
+                                  finding_ids=(diagnostic_finding.finding_id,), semantic_key=digest("source:diagnostic"))
+    run = build_terminology_evidence(
+        [normal_source.artifact_id, punctuation_source.artifact_id, diagnostic_source.artifact_id],
+        store=store, graph=graph, mode="native", base_revision_id="base-revision",
+    )
+    assert len(run.projection_artifact_ids) == 1
+    zero_leaves = [leaf for leaf in run.evidence_leaves if not leaf.occurrence_ids]
+    assert {leaf.segment_id for leaf in zero_leaves} == {punctuation.segment_id, diagnostic.segment_id}
+    assert {leaf.evidence_shard_artifact_id for leaf in zero_leaves}.issubset(run.selected_artifact_ids)
+    assert run.stage_root_artifact_ids
+
+    # Existing projection roots now transitively include zero-occurrence stage root.
+    snapshot = RevisionSnapshot(revision_id="zero-leaves", selected_artifact_ids=run.projection_artifact_ids)
+    provenance = {"revision_id": "zero-leaves", "render_input": run.projection_artifact_ids[0]}
+    epub = io.BytesIO()
+    with zipfile.ZipFile(epub, "w") as archive:
+        archive.writestr("META-INF/btran-provenance.json", canonical_json_bytes(provenance))
+    revisions = RevisionStore(tmp_path, store, graph)
+    bundle = revisions.seal_bundle(
+        snapshot, provenance, epub.getvalue(), render_input_artifact_id=run.projection_artifact_ids[0],
+        edge_ids=run.graph_edge_ids, expected_embedded_provenance=provenance,
+    )
+    revisions.verify_bundle("zero-leaves")
+    manifest = json.loads((bundle / "bundle-manifest.json").read_text())
+    for leaf in zero_leaves:
+        source_id = next(item.effective_source_artifact_id for item in run.evidence_leaves
+                         if item.evidence_shard_artifact_id == leaf.evidence_shard_artifact_id)
+        assert leaf.evidence_shard_artifact_id in manifest["artifact_ids"]
+        assert source_id in manifest["artifact_ids"]
+    assert all(edge.parent_artifact_id in manifest["artifact_ids"]
+               and edge.child_artifact_id in manifest["artifact_ids"]
+               for edge in revisions.selected_graph("zero-leaves").edges("zero-leaves"))
+
+
+def test_task8_invalid_evidence_degrades_typed_shard_with_correction_ready_review(tmp_path):
+    from btran.terminology import (
+        TERMINOLOGY_ASSESSMENT_KIND,
+        build_terminology_evidence,
+    )
+
+    store, graph, record, artifact = _effective_source_artifact(tmp_path, text="magic")
+    run = build_terminology_evidence(
+        [artifact.artifact_id], store=store, graph=graph, mode="native",
+        evidence_candidates={record.segment_id: [{"start": 0, "end": 5, "surface": "wrong"}]},
+        base_revision_id="base-revision",
+    )
+
+    shard = store.get(run.evidence_leaves[0].evidence_shard_artifact_id)
+    assert run.status == "degraded"
+    assert shard.kind == "OccurrenceEvidenceFailure"
+    assert shard.payload["degraded"] is True
+    assert shard.payload["occurrences"] == []
+    invalid = next(store.get_finding(item) for item in run.finding_ids
+                   if store.get_finding(item).kind == "terminology_evidence_invalid")
+    assert invalid.dependency_ids == (artifact.artifact_id,)
+    assert invalid.evidence["base_artifact_ids"] == [artifact.artifact_id]
+    assert invalid.evidence["suggested_correction_kind"] == "source_text"
+    assessment = next(store.get(item) for item in run.assessment_artifact_ids
+                      if store.get(item).kind == TERMINOLOGY_ASSESSMENT_KIND)
+    assert assessment.payload["score"] is None
+    assert assessment.payload["signals"] == ["fallback", "invalid_evidence"]
+    request = next(store.get_finding(item) for item in run.finding_ids
+                   if store.get_finding(item).kind == "review_request")
+    assert request.requires_action is False
+    assert request.evidence == {
+        "trigger": "degraded_unknown_confidence",
+        "suggested_correction_kind": "source_text",
+        "applicable_subject_ids": [record.segment_id],
+        "base_revision_id": "base-revision",
+        "base_artifact_ids": [artifact.artifact_id],
+        "scope": "segment",
+    }
+    summary = store.get_finding(run.stage_summary_finding_id)
+    assert summary.evidence["status"] == "degraded"
+    assert summary.evidence["counts"]["invalid_evidence_shards"] == 1
+
+
+def test_task8_terminology_review_requests_name_exact_projection_and_membership_bases(tmp_path):
+    from btran.terminology import build_terminology_evidence
+
+    store, graph, record, artifact = _effective_source_artifact(tmp_path, text="magic sword")
+    run = build_terminology_evidence(
+        [artifact.artifact_id], store=store, graph=graph, mode="native", base_revision_id="base-revision",
+    )
+    memberships = {store.get(item).payload["concept_id"]: item for item in run.membership_artifact_ids}
+    projections = [store.get(item) for item in run.projection_artifact_ids]
+    requests = [store.get_finding(item) for item in run.finding_ids
+                if store.get_finding(item).kind == "review_request"]
+
+    assert requests
+    for projection in projections:
+        request = next(item for item in requests if projection.payload["concept_id"] in item.subject_refs)
+        expected = sorted((projection.artifact_id, memberships[projection.payload["concept_id"]]))
+        assert request.evidence["suggested_correction_kind"] == "terminology"
+        assert request.evidence["base_artifact_ids"] == expected
+        assert request.dependency_ids == tuple(expected)

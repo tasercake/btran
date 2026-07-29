@@ -1,4 +1,4 @@
-"""Issue #5 failure semantics retained by the typed two-pass workflow."""
+"""Legacy bridge does not let review/reconciliation/validation findings gate EPUB."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -7,43 +7,70 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from PIL import Image
 
+from btran.artifacts import ArtifactStore, RevisionStore
 from btran.config import Config
+from btran.epub_builder import build_epub
 from btran.orchestrator import run
-from btran.schema import PageExtraction, SourceBlock, TranslatedBlock
+from btran.reconciliation import reconcile_effective
+from btran.schema import PageExtraction, SourceBlock
+from btran.validators import validate_effective
 
 
 def _config(tmp_path: Path) -> Config:
-    return Config(input_dir=tmp_path / "in", output_epub=tmp_path / "out.epub", intermediate_dir=tmp_path / "work", target_lang="en", max_retries=1)
+    return Config(input_dir=tmp_path / "in", output_epub=tmp_path / "out.epub", workspace=tmp_path / "work", target_lang=None, max_retries=1)
 
 
-def _image(path: Path, color: tuple[int, int, int]) -> None:
-    Image.new("RGB", (600, 600), color).save(path)
+def _image(path: Path) -> None:
+    Image.new("RGB", (600, 600), (1, 2, 3)).save(path)
 
 
-def _source(number: int, path: Path) -> PageExtraction:
-    return PageExtraction(number, str(path), "a" * 64, f"{number:016x}", "ja", "vision", blocks=[SourceBlock(f"page_{number}_block_0", "paragraph", "source", 0)])
-
-
-@pytest.mark.asyncio
-async def test_terminal_translation_failure_is_streamed_and_blocks_epub(tmp_path: Path):
-    cfg = _config(tmp_path); cfg.input_dir.mkdir(); _image(cfg.input_dir / "a.png", (1, 2, 3))
-    reported: list[tuple[int, str]] = []
-    source = _source(1, cfg.input_dir / "a.png")
-    with patch("btran.orchestrator.extract_page", AsyncMock(return_value=source)), patch("btran.orchestrator.translate_blocks", AsyncMock(side_effect=RuntimeError("model broke"))), patch("btran.orchestrator.build_epub") as epub:
-        result = await run(cfg, on_page_error=lambda page, message: reported.append((page, message)))
-    assert result.errors and reported == [(1, "RuntimeError: model broke")]
-    epub.assert_not_called()
+def _source(path: Path) -> PageExtraction:
+    return PageExtraction(1, str(path), "a" * 64, "1" * 16, "ja", "vision", blocks=[SourceBlock("page_1_block_0", "paragraph", "猫", 0)])
 
 
 @pytest.mark.asyncio
-async def test_all_pages_must_have_exact_translated_ids_before_epub(tmp_path: Path):
-    cfg = _config(tmp_path); cfg.input_dir.mkdir(); _image(cfg.input_dir / "a.png", (1, 2, 3)); _image(cfg.input_dir / "b.png", (4, 5, 6))
-    sources = [_source(1, cfg.input_dir / "a.png"), _source(2, cfg.input_dir / "b.png")]
-    async def translate(source, glossary, **kwargs):
-        if source.page_number == 1:
-            return [TranslatedBlock("wrong", "translation")]
-        return [TranslatedBlock(source.blocks[0].id, "translation")]
-    with patch("btran.orchestrator.extract_page", AsyncMock(side_effect=sources)), patch("btran.orchestrator.translate_blocks", side_effect=translate), patch("btran.orchestrator.build_epub") as epub:
+async def test_validation_finding_does_not_block_epub(tmp_path: Path):
+    cfg = _config(tmp_path); cfg.input_dir.mkdir(); _image(cfg.input_dir / "a.png")
+    source = _source(cfg.input_dir / "a.png")
+
+    def validate_with_informational_error(**kwargs):
+        return validate_effective(**kwargs, rules={
+            "informational": lambda _pages, _reconciliation, _mode: ("informational error",),
+        })
+
+    with patch("btran.source_extractor.extract_page", AsyncMock(return_value=source)), \
+         patch("btran.orchestrator.reconcile_effective", wraps=reconcile_effective) as reconciliation, \
+         patch("btran.orchestrator.validate_effective", side_effect=validate_with_informational_error) as validation, \
+         patch("btran.orchestrator.build_epub", wraps=build_epub) as epub:
         result = await run(cfg)
-    assert result.errors and "page 1" in result.errors[0]
-    epub.assert_not_called()
+
+    assert result.errors == []
+    assert result.status == "completed"
+    assert cfg.output_epub.is_file()
+    assert result.report is not None and Path(result.report_path).is_file()
+    reconciliation.assert_called_once()
+    validation.assert_called_once()
+    epub.assert_called_once()
+
+    store = ArtifactStore(cfg.workspace)
+    snapshot = RevisionStore(cfg.workspace).snapshot(result.candidate_revision_id)
+    validation_artifact = next(
+        store.get(artifact_id) for artifact_id in snapshot.selected_artifact_ids
+        if store.get(artifact_id).kind == "ValidationArtifact"
+    )
+    assert validation_artifact.payload["rule_results"] == [{
+        "rule": "informational", "errors": ["informational error"], "exception": None,
+    }]
+    finding = next(
+        store.get_finding(finding_id) for finding_id in validation_artifact.finding_ids
+        if store.get_finding(finding_id).kind == "validation_error"
+    )
+    assert finding.finding_id in result.report.content_finding_ids
+
+
+def test_orchestrator_no_longer_imports_or_creates_review_workflow():
+    import btran.orchestrator as orchestrator
+    source = Path(orchestrator.__file__).read_text()
+    assert "btran.review" not in source
+    assert "needs_review" not in source
+    assert "unresolved_items" not in source

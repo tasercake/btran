@@ -22,8 +22,42 @@ from btran import (
 from btran.config import Config
 from btran.orchestrator import RunResult as OrchestratorRunResult
 from btran.orchestrator import orchestrator_run
-from btran.orchestrator_contract import OrchestratorCallable, RunResult
-from btran.schema import ErrorResult, Manifest, PageResult
+from btran.orchestrator_contract import (
+    CacheEvent,
+    OrchestratorCallable,
+    RunResult,
+    SelectedRunInputs,
+    StageContract,
+    StageInputs,
+    StageOutputs,
+    initialized_report,
+)
+from btran.schema import EffectivePage, EffectiveSegment, ErrorResult, Manifest, PageResult
+
+
+@pytest.mark.asyncio
+async def test_immutable_stage_contract_initializes_nonfinal_report():
+    selected = SelectedRunInputs(None, "unsealed", None)
+
+    async def fake_stage(inputs: StageInputs) -> StageOutputs:
+        assert inputs.stage == "discovery"
+        return StageOutputs("completed", cache_events=(CacheEvent("discovery", "book", "produced"),))
+
+    output = await StageContract("discovery", fake_stage).execute(StageInputs("discovery", selected))
+    assert output.cache_events[0].to_dict()["outcome"] == "produced"
+    report = initialized_report(run_id="a" * 32, mode="native", selected=selected)
+    assert report.final_epub_status == "not_finalized"
+    assert report.stage_records == ()
+
+
+def test_selected_run_inputs_are_explicit_snapshot_selectors_not_history_queries():
+    selected = SelectedRunInputs("active-revision", "base-revision", "set-1", ("artifact-a", "artifact-b"))
+    inputs = StageInputs("validation", selected, ("artifact-a",), values={"selector": "artifact-a"})
+
+    assert inputs.selected.base_snapshot_artifact_ids == ("artifact-a", "artifact-b")
+    assert inputs.values["selector"] == "artifact-a"
+    with pytest.raises(TypeError):
+        inputs.values["selector"] = "artifact-b"
 
 
 @pytest.mark.asyncio
@@ -166,6 +200,15 @@ async def test_wave_one_modules_exchange_representative_typed_artifacts(tmp_path
         translations={1: translated_blocks},
     ).affected_pages == []
 
+    segment = EffectiveSegment(
+        effective_segment_id="a" * 64, segment_id="b" * 64, source_lang="en",
+        source_text="An island appears.", effective_text="The island appears.",
+        render_lang="en", mode="translated", translation_artifact_id="c" * 64,
+    )
+    page = EffectivePage(
+        effective_page_id="d" * 64, page_id="e" * 64,
+        effective_segment_ids=(segment.effective_segment_id,), source_langs=("en",),
+    )
     output_path = tmp_path / "book.epub"
-    epub_builder.build_epub([page_result], output_path, target_lang="en")
+    epub_builder.build_epub(epub_builder.seal_effective_content((page,), (segment,)), output_path)
     assert output_path.is_file()

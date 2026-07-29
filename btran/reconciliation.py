@@ -1,19 +1,40 @@
-"""One-round reconciliation of glossary usage across translated pages."""
+"""Informational reconciliation over selected effective content.
 
+This module never changes a glossary, schedules translation, or asks an operator to
+answer before returning.  Its output is an immutable, inspectable stage artifact.
+"""
 from __future__ import annotations
 
 import hashlib
 import json
 import re
 import unicodedata
-from dataclasses import dataclass, replace
-from typing import Callable
+from dataclasses import asdict, dataclass, field
+from typing import Any, Mapping, Sequence
 
-from btran.schema import PageExtraction, TerminologyEntry, TerminologyMap, TranslatedBlock
+from btran.artifacts import ArtifactStore, artifact_id_for
+from btran.schema import (
+    ConfidenceAssessment,
+    EffectivePage,
+    EffectiveSegment,
+    Finding,
+    PageExtraction,
+    TerminologyEntry,
+    TerminologyMap,
+    TranslatedBlock,
+    canonical_json,
+    review_requests_for,
+    stage_summary_finding,
+    uncertainty_finding,
+)
+
+RECONCILIATION_ARTIFACT_KIND = "ReconciliationArtifact"
+RECONCILIATION_ASSESSMENT_KIND = "ConfidenceAssessment"
 
 
 @dataclass(frozen=True)
 class GlossaryChange:
+    """Legacy migration value; reconciliation no longer creates these."""
     concept_id: str
     old_target_term: str
     new_target_term: str
@@ -21,15 +42,60 @@ class GlossaryChange:
 
 @dataclass(frozen=True)
 class TermIssue:
+    """Legacy-compatible, non-mutating terminology observation."""
     concept_id: str
     kind: str
-    pages: tuple[int, ...]
-    expected_target_term: str
+    pages: tuple[int, ...] = ()
+    expected_target_term: str = ""
     observed_target_terms: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
+class ReconciliationIssue:
+    issue_id: str
+    kind: str
+    subject_ids: tuple[str, ...]
+    base_artifact_ids: tuple[str, ...]
+    expected_target_term: str = ""
+    observed_target_terms: tuple[str, ...] = ()
+    evidence: Mapping[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "issue_id": self.issue_id,
+            "kind": self.kind,
+            "subject_ids": list(self.subject_ids),
+            "base_artifact_ids": list(self.base_artifact_ids),
+            "expected_target_term": self.expected_target_term,
+            "observed_target_terms": list(self.observed_target_terms),
+            "evidence": dict(self.evidence),
+        }
+
+
+@dataclass(frozen=True)
+class ReconciliationArtifact:
+    """Typed selected-input reconciliation result.
+
+    ``projection_artifact_ids`` are deliberately unchanged on every fallback.
+    They are selected input, never a mutable reconciliation output.
+    """
+    artifact_id: str
+    effective_page_artifact_ids: tuple[str, ...]
+    projection_artifact_ids: tuple[str, ...]
+    issues: tuple[ReconciliationIssue, ...]
+    finding_ids: tuple[str, ...]
+    assessment_artifact_ids: tuple[str, ...]
+    stage_summary_finding_id: str
+    status: str
+    error_evidence: Mapping[str, Any] | None = None
+
+
+@dataclass(frozen=True)
 class ReconciliationResult:
+    """Read-only compatibility view for migration callers.
+
+    It intentionally contains no reviewer callback result and no changed glossary.
+    """
     glossary_v2: TerminologyMap
     glossary_diff: list[GlossaryChange]
     issues: list[TermIssue]
@@ -51,24 +117,17 @@ def _term_in_text(term: str, text: str, *, allow_regular_variant: bool = False) 
             forms.extend((normalized_term + "s", normalized_term + "es", normalized_term + "'s", normalized_term + "’s"))
             if len(normalized_term) > 1 and normalized_term.endswith("y") and normalized_term[-2] not in "aeiou":
                 forms.append(normalized_term[:-1] + "ies")
-        alternatives = "|".join(re.escape(form) for form in sorted(forms, key=len, reverse=True))
-        return re.search(rf"(?<!\w)(?:{alternatives})(?!\w)", normalized_text) is not None
+        return re.search(rf"(?<!\w)(?:{'|'.join(re.escape(form) for form in sorted(forms, key=len, reverse=True))})(?!\w)", normalized_text) is not None
     return normalized_term in normalized_text
 
 
 def _entry_mentions_page(entry: TerminologyEntry, extraction: PageExtraction) -> bool:
     mentioned = {_normalize_text(mention.term) for mention in extraction.term_mentions}
     source_text = "\n".join(block.text for block in extraction.blocks)
-    return any(
-        _normalize_text(term) in mentioned or _term_in_text(term, source_text)
-        for term in entry.source_terms
-    )
+    return any(_normalize_text(term) in mentioned or _term_in_text(term, source_text) for term in entry.source_terms)
 
 
-def index_terms_to_pages(
-    extractions: list[PageExtraction], glossary: TerminologyMap
-) -> dict[str, set[int]]:
-    """Map every source alias/sense to pages where it is actually mentioned."""
+def index_terms_to_pages(extractions: list[PageExtraction], glossary: TerminologyMap) -> dict[str, set[int]]:
     index: dict[str, set[int]] = {}
     for extraction in extractions:
         for entry in glossary.entries:
@@ -78,180 +137,185 @@ def index_terms_to_pages(
 
 
 def glossary_diff(v1: TerminologyMap, v2: TerminologyMap) -> list[GlossaryChange]:
-    """Return target-form changes between two frozen glossary versions."""
-    old = {entry.concept_id: entry for entry in v1.entries}
-    new = {entry.concept_id: entry for entry in v2.entries}
-    return [
-        GlossaryChange(concept_id, old[concept_id].target_term, new[concept_id].target_term)
-        for concept_id in sorted(old.keys() & new.keys())
-        if old[concept_id].target_term != new[concept_id].target_term
-    ]
+    old, new = ({entry.concept_id: entry for entry in value.entries} for value in (v1, v2))
+    return [GlossaryChange(key, old[key].target_term, new[key].target_term) for key in sorted(old.keys() & new.keys()) if old[key].target_term != new[key].target_term]
 
 
 def _translated_page_text(blocks: list[TranslatedBlock] | None) -> str:
     return "\n".join(block.translated_text for block in blocks or [])
 
 
-def _next_version(version: str) -> str:
-    if version.isdigit():
-        return str(int(version) + 1)
-    parts = version.split(".")
-    if parts and parts[0].isdigit():
-        return ".".join([str(int(parts[0]) + 1), *(["0"] * (len(parts) - 1))])
-    return f"{version}-v2"
-
-
-def _glossary_hash(version: str, entries: list[TerminologyEntry], glossary: TerminologyMap) -> str:
-    payload = {
-        "version": version,
-        "source_lang": glossary.source_lang,
-        "target_lang": glossary.target_lang,
-        "entries": [entry.to_dict() for entry in entries],
-    }
-    return hashlib.sha256(
-        json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode()
-    ).hexdigest()
-
-
-def _with_reviewed_forms(
-    glossary: TerminologyMap, reviewed_forms: dict[str, str]
-) -> TerminologyMap:
-    entries = [
-        replace(entry, target_term=reviewed_forms.get(entry.concept_id, entry.target_term))
-        for entry in glossary.entries
-    ]
-    version = _next_version(glossary.version)
-    return TerminologyMap(
-        version=version,
-        hash=_glossary_hash(version, entries, glossary),
-        source_lang=glossary.source_lang,
-        target_lang=glossary.target_lang,
-        entries=entries,
-    )
-
-
-def _ambiguous_source_pages(
-    extractions: list[PageExtraction], glossary: TerminologyMap
-) -> list[TermIssue]:
-    """Identify aliases shared by concepts; their sense cannot be inferred by string matching."""
-    aliases: dict[str, set[str]] = {}
-    for entry in glossary.entries:
-        for alias in entry.source_terms:
-            normalized = _normalize_text(alias)
-            if normalized:
-                aliases.setdefault(normalized, set()).add(entry.concept_id)
-
+def _legacy_issues(*, glossary: TerminologyMap, extractions: list[PageExtraction], translations: dict[int, list[TranslatedBlock]]) -> list[TermIssue]:
+    page_index = index_terms_to_pages(extractions, glossary)
+    known_targets = [(entry.target_term, entry.concept_id) for entry in glossary.entries]
     issues: list[TermIssue] = []
-    for extraction in extractions:
-        mentioned = {_normalize_text(mention.term) for mention in extraction.term_mentions}
-        source_text = "\n".join(block.text for block in extraction.blocks)
-        for alias, concept_ids in aliases.items():
-            if len(concept_ids) < 2:
+    for entry in glossary.entries:
+        missing, conflicts, observed = [], [], set()
+        for page_number in sorted(page_index.get(entry.concept_id, ())):
+            text = _translated_page_text(translations.get(page_number))
+            if _term_in_text(entry.target_term, text, allow_regular_variant=True):
                 continue
-            if alias in mentioned or _term_in_text(alias, source_text):
-                issues.append(
-                    TermIssue(
-                        concept_id="|".join(sorted(concept_ids)),
-                        kind="ambiguous_source_sense",
-                        pages=(extraction.page_number,),
-                        expected_target_term="",
-                    )
-                )
+            competing = [target for target, concept_id in known_targets if concept_id != entry.concept_id and _term_in_text(target, text, allow_regular_variant=True)]
+            if competing:
+                conflicts.append(page_number); observed.update(competing)
+            else:
+                missing.append(page_number)
+        if missing:
+            issues.append(TermIssue(entry.concept_id, "missing_term", tuple(missing), entry.target_term))
+        if conflicts:
+            issues.append(TermIssue(entry.concept_id, "context_conflict", tuple(conflicts), entry.target_term, tuple(sorted(observed))))
     return issues
 
 
-def _reviewed_form_changes(
-    glossary: TerminologyMap,
-    ambiguous: list[TermIssue],
-    reviewer: Callable[[list[TermIssue]], dict[str, str]] | None,
-) -> dict[str, str]:
-    if reviewer is None or not ambiguous:
-        return {}
-    reviewed = reviewer(ambiguous)
-    if not isinstance(reviewed, dict):
-        raise ValueError("reviewer must return a mapping of concept IDs to target forms")
-    allowed = {issue.concept_id for issue in ambiguous} & {entry.concept_id for entry in glossary.entries}
-    unknown = set(reviewed) - allowed
-    if unknown or any(not isinstance(form, str) or not form.strip() for form in reviewed.values()):
-        raise ValueError("reviewer returned invalid glossary changes")
-    old_forms = {entry.concept_id: entry.target_term for entry in glossary.entries}
-    return {concept_id: form for concept_id, form in reviewed.items() if form != old_forms[concept_id]}
+def reconcile(*, glossary: TerminologyMap, extractions: list[PageExtraction], translations: dict[int, list[TranslatedBlock]]) -> ReconciliationResult:
+    """Migration inspection only. No callback, mutation, or retranslation contract."""
+    issues = _legacy_issues(glossary=glossary, extractions=extractions, translations=translations)
+    affected = sorted({page for issue in issues for page in issue.pages})
+    return ReconciliationResult(glossary, [], issues, affected)
 
 
-def reconcile(
-    *,
-    glossary: TerminologyMap,
-    extractions: list[PageExtraction],
-    translations: dict[int, list[TranslatedBlock]],
-    reviewer: Callable[[list[TermIssue]], dict[str, str]] | None = None,
-) -> ReconciliationResult:
-    """Inspect one translation pass; return a page set but never schedule retranslation.
+def _issue_id(kind: str, subjects: Sequence[str], bases: Sequence[str], evidence: Mapping[str, Any]) -> str:
+    return hashlib.sha256(canonical_json({"kind": kind, "subject_ids": sorted(set(subjects)), "base_artifact_ids": sorted(set(bases)), "evidence": dict(evidence)}).encode()).hexdigest()
 
-    Only a context conflict or an ambiguous source sense reaches ``reviewer``. A
-    reviewer can update target forms once; no subsequent review/retranslation
-    round is invoked here.
+
+def _selected_pages(value: Any, store: ArtifactStore) -> tuple[tuple[str, EffectivePage, tuple[tuple[str, EffectiveSegment], ...]], ...]:
+    leaves = getattr(value, "leaves", value)
+    if not isinstance(leaves, (tuple, list)):
+        raise ValueError("effective pages must be Task-10 leaves or selected page artifact IDs")
+    page_ids = [leaf.page_artifact_id if hasattr(leaf, "page_artifact_id") else leaf for leaf in leaves]
+    output = []
+    for page_id in page_ids:
+        if not isinstance(page_id, str):
+            raise ValueError("effective page ID is invalid")
+        envelope = store.get(page_id)
+        if envelope.kind != "EffectiveTargetPage":
+            raise ValueError("reconciliation requires selected effective target pages")
+        page = EffectivePage.from_dict(envelope.payload)
+        segments: list[tuple[str, EffectiveSegment]] = []
+        for segment_id in envelope.dependency_ids:
+            child = store.get(segment_id)
+            if child.kind not in {"EffectiveTargetSegment", "DiagnosticEffectiveTargetSegment"}:
+                continue
+            segments.append((child.artifact_id, EffectiveSegment.from_dict(child.payload)))
+        if tuple(item[1].effective_segment_id for item in segments) != page.effective_segment_ids:
+            raise ValueError("effective page segment closure/order is invalid")
+        output.append((envelope.artifact_id, page, tuple(segments)))
+    if len({page.page_id for _, page, _ in output}) != len(output):
+        raise ValueError("effective pages duplicate page identity")
+    return tuple(output)
+
+
+def _selected_projections(value: Any, store: ArtifactStore) -> tuple[tuple[str, Mapping[str, Any]], ...]:
+    ids = getattr(value, "projection_artifact_ids", value)
+    if ids is None:
+        return ()
+    if not isinstance(ids, (tuple, list)):
+        raise ValueError("projections must be Task-8 run or selected artifact IDs")
+    output = []
+    for artifact_id in ids:
+        envelope = store.get(artifact_id)
+        if envelope.kind != "ConceptProjection":
+            raise ValueError("reconciliation requires selected ConceptProjection artifacts")
+        body = envelope.payload
+        if not isinstance(body.get("concept_id"), str) or not isinstance(body.get("target_form"), str):
+            raise ValueError("projection payload is invalid")
+        output.append((envelope.artifact_id, body))
+    return tuple(sorted(output))
+
+
+def _reconciliation_payload(page_ids: Sequence[str], projection_ids: Sequence[str], issues: Sequence[ReconciliationIssue], status: str, error: Mapping[str, Any] | None) -> dict[str, Any]:
+    return {"effective_page_artifact_ids": list(sorted(set(page_ids))), "projection_artifact_ids": list(sorted(set(projection_ids))), "issues": [item.to_dict() for item in issues], "status": status, "error_evidence": dict(error) if error else None, "algorithm_version": "reconciliation-v1"}
+
+
+def _put_assessment(store: ArtifactStore, *, reconciliation_id: str, issue: ReconciliationIssue, base_revision_id: str) -> tuple[str, tuple[str, ...]]:
+    signal = "reconciliation_conflict" if issue.kind == "context_conflict" else "missing_term"
+    assessment = ConfidenceAssessment(subject_id=issue.issue_id, producing_stage="reconciliation", producing_artifact_id=reconciliation_id, score=0, signals=tuple(sorted(("reconciliation_issue", signal))))
+    uncertainty = uncertainty_finding(assessment)
+    store.put_finding(uncertainty)
+    request = review_requests_for(assessment=assessment, reconciliation_issue="reconciliation_conflict" if issue.kind == "context_conflict" else "missing_term", stage="reconciliation", subject_ids=issue.subject_ids, suggested_correction_kind="terminology", base_revision_id=base_revision_id, base_artifact_ids=issue.base_artifact_ids, scope="all_concept_occurrences")
+    finding_ids = [uncertainty.finding_id]
+    for finding in request:
+        store.put_finding(finding); finding_ids.append(finding.finding_id)
+    artifact = store.put(RECONCILIATION_ASSESSMENT_KIND, assessment.to_dict(), dependency_ids=(reconciliation_id,), finding_ids=tuple(sorted(finding_ids)), semantic_key=f"confidence:{reconciliation_id}:{issue.issue_id}")
+    return artifact.artifact_id, tuple(sorted(finding_ids))
+
+
+def reconcile_effective(*, effective_pages: Any, projections: Any, store: ArtifactStore, base_revision_id: str) -> ReconciliationArtifact:
+    """Inspect selected effective pages/projections and always return typed artifact.
+
+    A full-stage exception becomes unchanged-projection degraded output.  It is
+    intentionally not propagated to validators/rendering.
     """
-    page_index = index_terms_to_pages(extractions, glossary)
-    source_ambiguities = _ambiguous_source_pages(extractions, glossary)
-    ambiguous_pages = {
-        page_number
-        for issue in source_ambiguities
-        for page_number in issue.pages
-    }
-    known_targets = [(entry.target_term, entry.concept_id) for entry in glossary.entries]
-    issues: list[TermIssue] = list(source_ambiguities)
-    ambiguous: list[TermIssue] = list(source_ambiguities)
-    affected: set[int] = set(ambiguous_pages)
-
-    for entry in glossary.entries:
-        pages = sorted(page_index.get(entry.concept_id, set()))
-        missing_pages: list[int] = []
-        conflict_pages: list[int] = []
-        observed: set[str] = set()
-        for page_number in pages:
-            if page_number in ambiguous_pages:
+    page_ids: tuple[str, ...] = ()
+    projection_ids: tuple[str, ...] = ()
+    issues: tuple[ReconciliationIssue, ...] = ()
+    findings: list[str] = []
+    error: Mapping[str, Any] | None = None
+    status = "completed"
+    try:
+        pages = _selected_pages(effective_pages, store)
+        selected = _selected_projections(projections, store)
+        page_ids = tuple(sorted(page_id for page_id, _, _ in pages))
+        projection_ids = tuple(item[0] for item in selected)
+        texts = [(segment.segment_id, segment.effective_text) for _, _, segments in pages for _, segment in segments]
+        observations: list[ReconciliationIssue] = []
+        for projection_id, projection in selected:
+            concept = projection["concept_id"]
+            target = projection["target_form"]
+            # A projection with no target form is a source-form/native fallback,
+            # not a target-term defect.
+            if not target:
                 continue
-            translated = _translated_page_text(translations.get(page_number))
-            if _term_in_text(entry.target_term, translated, allow_regular_variant=True):
-                continue
-            competing = [
-                target for target, concept_id in known_targets
-                if concept_id != entry.concept_id
-                and _term_in_text(target, translated, allow_regular_variant=True)
-            ]
-            if competing:
-                conflict_pages.append(page_number)
-                observed.update(competing)
-            else:
-                missing_pages.append(page_number)
+            matching = [segment_id for segment_id, text in texts if _term_in_text(target, text, allow_regular_variant=True)]
+            if not matching:
+                subjects = tuple(sorted({concept, *(segment_id for segment_id, _ in texts)}))
+                bases = tuple(sorted((projection_id, projection["membership_id"])))
+                evidence = {"concept_id": concept, "projection_id": projection_id, "target_form": target, "segment_ids": list(subjects[1:])}
+                observations.append(ReconciliationIssue(_issue_id("missing_term", subjects, bases, evidence), "missing_term", subjects, bases, target, (), evidence))
+        # Two selected projections assigning different forms to one exact occurrence are a conflict.
+        occurrence_forms: dict[str, list[tuple[str, str, str]]] = {}
+        for projection_id, projection in selected:
+            for occurrence_id in projection.get("selector_occurrence_ids", []):
+                occurrence_forms.setdefault(occurrence_id, []).append((projection_id, projection["concept_id"], projection["target_form"]))
+        for occurrence_id, values in sorted(occurrence_forms.items()):
+            forms = sorted({value[2] for value in values})
+            if len(forms) > 1:
+                conflict_projection_ids = tuple(sorted(value[0] for value in values))
+                bases = tuple(sorted({*conflict_projection_ids, *(store.get(value[0]).payload["membership_id"] for value in values)}))
+                subjects = tuple(sorted({occurrence_id, *(value[1] for value in values)}))
+                evidence = {"occurrence_id": occurrence_id, "projection_ids": list(conflict_projection_ids), "target_forms": forms}
+                observations.append(ReconciliationIssue(_issue_id("context_conflict", subjects, bases, evidence), "context_conflict", subjects, bases, "", tuple(forms), evidence))
+        issues = tuple(sorted(observations, key=lambda item: item.issue_id))
+    except Exception as exc:
+        status = "degraded"
+        error = {"exception_type": type(exc).__name__, "message": str(exc)}
+        # Preserve known selected projection IDs even when later input parsing fails.
+        raw = getattr(projections, "projection_artifact_ids", projections)
+        if isinstance(raw, (tuple, list)) and all(isinstance(item, str) for item in raw):
+            projection_ids = tuple(sorted(set(raw)))
+        finding = Finding(kind="reconciliation_exception", severity="error", stage="reconciliation", subject_refs=projection_ids, evidence=dict(error), message="Reconciliation failed; unchanged projections remain selected.", dependency_ids=projection_ids)
+        store.put_finding(finding); findings.append(finding.finding_id)
 
-        if missing_pages:
-            issue = TermIssue(
-                entry.concept_id, "missing_term", tuple(missing_pages), entry.target_term
-            )
-            issues.append(issue)
-            affected.update(missing_pages)
-        if conflict_pages:
-            issue = TermIssue(
-                entry.concept_id,
-                "context_conflict",
-                tuple(conflict_pages),
-                entry.target_term,
-                tuple(sorted(observed)),
-            )
-            issues.append(issue)
-            ambiguous.append(issue)
-            affected.update(conflict_pages)
-
-    reviewed_forms = _reviewed_form_changes(glossary, ambiguous, reviewer)
-    glossary_v2 = _with_reviewed_forms(glossary, reviewed_forms) if reviewed_forms else glossary
-    changes = glossary_diff(glossary, glossary_v2)
-    for change in changes:
-        affected.update(page_index.get(change.concept_id, set()))
-
-    return ReconciliationResult(
-        glossary_v2=glossary_v2,
-        glossary_diff=changes,
-        issues=issues,
-        affected_pages=sorted(affected),
-    )
+    payload = _reconciliation_payload(page_ids, projection_ids, issues, status, error)
+    reconciliation_id = artifact_id_for(RECONCILIATION_ARTIFACT_KIND, payload, tuple(sorted(set((*page_ids, *projection_ids)))))
+    assessment_ids: list[str] = []
+    for issue in issues:
+        quality = Finding(kind=issue.kind, severity="warning", stage="reconciliation", subject_refs=issue.subject_ids, evidence=issue.to_dict(), message="Terminology reconciliation observation.", dependency_ids=issue.base_artifact_ids)
+        store.put_finding(quality); findings.append(quality.finding_id)
+        assessment_id, ids = _put_assessment(store, reconciliation_id=reconciliation_id, issue=issue, base_revision_id=base_revision_id)
+        assessment_ids.append(assessment_id); findings.extend(ids)
+    if status == "degraded":
+        assessment = ConfidenceAssessment(subject_id="reconciliation", producing_stage="reconciliation", producing_artifact_id=reconciliation_id, score=None, signals=("degraded", "fallback"))
+        uncertainty = uncertainty_finding(assessment); store.put_finding(uncertainty); findings.append(uncertainty.finding_id)
+        bases = projection_ids or page_ids
+        if bases:
+            for request in review_requests_for(assessment=assessment, degraded_or_fallback=True, stage="reconciliation", subject_ids=("reconciliation",), suggested_correction_kind="target_segment", base_revision_id=base_revision_id, base_artifact_ids=bases, scope="segment"):
+                store.put_finding(request); findings.append(request.finding_id)
+        assessment_artifact = store.put(RECONCILIATION_ASSESSMENT_KIND, assessment.to_dict(), dependency_ids=(reconciliation_id,), finding_ids=tuple(sorted(set(findings))), semantic_key=f"confidence:{reconciliation_id}:fallback")
+        assessment_ids.append(assessment_artifact.artifact_id)
+    summary = stage_summary_finding("reconciliation", status, {"pages": len(page_ids), "projections": len(projection_ids), "issues": len(issues), "exceptions": int(status == "degraded")}, subject_refs=tuple(sorted({*page_ids, *projection_ids})))
+    store.put_finding(summary); findings.append(summary.finding_id)
+    envelope = store.put(RECONCILIATION_ARTIFACT_KIND, payload, dependency_ids=tuple(sorted(set((*page_ids, *projection_ids)))), finding_ids=tuple(sorted(set(findings))), semantic_key=hashlib.sha256(canonical_json(payload).encode()).hexdigest())
+    if envelope.artifact_id != reconciliation_id:
+        raise AssertionError("reconciliation artifact identity changed while publishing")
+    return ReconciliationArtifact(envelope.artifact_id, page_ids, projection_ids, issues, tuple(sorted(set(findings))), tuple(sorted(assessment_ids)), summary.finding_id, status, error)

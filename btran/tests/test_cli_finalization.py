@@ -1,10 +1,9 @@
-"""CLI boundary tests; real orchestrator integration lives in a companion suite."""
+"""CLI finalization contract after immutable executor migration."""
 
 from __future__ import annotations
 
-import sys
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -13,90 +12,46 @@ from btran.config import Config
 from btran.orchestrator_contract import RunResult
 
 
-def _config(**overrides: object) -> Config:
+def _config(tmp_path: Path, **overrides: object) -> Config:
     values: dict[str, object] = {
-        "input_dir": Path("/tmp"),
-        "output_epub": Path("/tmp/out.epub"),
+        "input_dir": tmp_path / "input",
+        "output_epub": tmp_path / "book.epub",
+        "workspace": tmp_path / "work",
         "target_lang": "fr",
-        "pi_bin": "pi",
+        "pi_bin": "definitely-not-present",
     }
     values.update(overrides)
     return Config(**values)
 
 
-def test_fake_contract_success_returns_normally():
-    async def fake_runner(config: Config, on_page_error=None) -> RunResult:
-        assert config.target_lang == "fr"
+def test_cli_does_not_preflight_pi_or_epubcheck_before_runner(tmp_path):
+    """Model/check executables belong to bounded stage invocation, not CLI."""
+    config = _config(tmp_path, epub_check=True, epub_check_path="missing-epubcheck")
+    runner = AsyncMock(return_value=RunResult(errors=[], status="completed"))
+    with patch("btran.cli.load_config", return_value=config), patch("btran.cli.orchestrator_run", new=runner):
+        main()
+    runner.assert_awaited_once()
+
+
+def test_cli_streams_recoverable_page_error_but_returns_zero(tmp_path, capsys):
+    async def runner(config: Config, on_page_error=None) -> RunResult:
         assert on_page_error is not None
-        return RunResult(errors=[])
+        on_page_error(3, "translation degraded; diagnostic content retained")
+        return RunResult(errors=["legacy only"], status="completed_degraded")
 
-    with patch("btran.cli.load_config", return_value=_config()):
-        with patch("btran.cli.shutil.which", return_value="/usr/bin/pi"):
-            with patch("btran.cli.orchestrator_run", new=fake_runner):
-                main()
-
-
-def test_fake_contract_failure_exits_nonzero_with_concise_summary(capsys):
-    async def fake_runner(config: Config, on_page_error=None) -> RunResult:
-        return RunResult(errors=["page 2 exhausted retries", "page 5 invalid response"])
-
-    with patch("btran.cli.load_config", return_value=_config()):
-        with patch("btran.cli.shutil.which", return_value="/usr/bin/pi"):
-            with patch("btran.cli.orchestrator_run", new=fake_runner):
-                with pytest.raises(SystemExit) as exc:
-                    main()
-
-    assert exc.value.code == 1
-    stderr = capsys.readouterr().err
-    assert "2 page(s) failed" in stderr
-    assert "page 2 exhausted retries" not in stderr
-    assert "page 5 invalid response" not in stderr
+    with patch("btran.cli.load_config", return_value=_config(tmp_path)), patch("btran.cli.orchestrator_run", new=runner):
+        main()
+    captured = capsys.readouterr()
+    assert "page 3 failed" in captured.err
+    assert "status=completed_degraded" in captured.out
 
 
-def test_fake_contract_streams_page_error_before_completion(capsys):
-    async def fake_runner(config: Config, on_page_error=None) -> RunResult:
-        assert on_page_error is not None
-        on_page_error(3, "network timeout")
-        assert "page 3 failed: network timeout" in capsys.readouterr().err
-        return RunResult(errors=["page 3 network timeout"])
+def test_cli_keyboard_interrupt_has_terminal_nonzero_exit(tmp_path, capsys):
+    async def runner(config: Config, on_page_error=None) -> RunResult:
+        raise KeyboardInterrupt
 
-    with patch("btran.cli.load_config", return_value=_config()):
-        with patch("btran.cli.shutil.which", return_value="/usr/bin/pi"):
-            with patch("btran.cli.orchestrator_run", new=fake_runner):
-                with pytest.raises(SystemExit) as exc:
-                    main()
-
-    assert exc.value.code == 1
-    assert "1 page(s) failed" in capsys.readouterr().err
-
-
-def test_input_path_must_be_a_directory(tmp_path, capsys):
-    input_file = tmp_path / "not-a-directory"
-    input_file.write_text("not images")
-
-    with patch("btran.cli.load_config", return_value=_config(input_dir=input_file)):
-        with pytest.raises(SystemExit) as exc:
+    with patch("btran.cli.load_config", return_value=_config(tmp_path)), patch("btran.cli.orchestrator_run", new=runner):
+        with pytest.raises(SystemExit) as exited:
             main()
-
-    assert exc.value.code == 1
-    assert "input_dir is not a directory" in capsys.readouterr().err
-
-
-def test_epubcheck_executable_is_left_to_the_epub_stage_that_uses_it():
-    config = _config(epub_check=True, epub_check_path="missing-epubcheck")
-    called = False
-
-    async def fake_runner(config: Config, on_page_error=None) -> RunResult:
-        nonlocal called
-        called = True
-        return RunResult(errors=[])
-
-    with patch("btran.cli.load_config", return_value=config):
-        with patch(
-            "btran.cli.shutil.which",
-            side_effect=lambda executable: "/usr/bin/pi" if executable == "pi" else None,
-        ):
-            with patch("btran.cli.orchestrator_run", new=fake_runner):
-                main()
-
-    assert called is True
+    assert exited.value.code == 1
+    assert "Interrupted" in capsys.readouterr().err

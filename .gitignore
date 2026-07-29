@@ -7,3 +7,4 @@ intermediate/
 cache.sqlite
 *.epub
 .env
+.spec/

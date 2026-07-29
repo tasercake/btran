@@ -1,152 +1,126 @@
-"""Tests for the input-page manifest contract."""
+"""Task 4 raw-hash BookRecord discovery tests."""
 
 import json
+import os
 from pathlib import Path
 
 import pytest
 
-from btran.manifest import (
-    ManifestValidationError,
-    generate_manifest,
-    load_or_generate_manifest,
-    read_manifest,
-    validate_manifest,
-    write_manifest,
-)
+from btran.manifest import DISCOVERY_FILENAME, discover_book, generate_manifest, write_manifest
 
 
-FIXTURES = Path(__file__).parent / "fixtures"
+def test_discovery_accepts_supported_undecodable_file(tmp_path):
+    (tmp_path / "page.png").write_bytes(b"definitely not a png")
+    result = discover_book(tmp_path)
+    assert result.succeeded
+    assert result.book is not None
+    assert len(result.pages) == 1
+    assert result.pages[0].page.raw_file_sha256
 
 
-def _copy_image(name: str, destination: Path) -> None:
-    destination.write_bytes((FIXTURES / name).read_bytes())
+def test_discovery_uses_raw_hash_not_filename_or_order(tmp_path):
+    workspace = tmp_path / "state"
+    (tmp_path / "z.png").write_bytes(b"same bytes")
+    first = discover_book(tmp_path, workspace)
+    first_page_id = first.pages[0].page.page_id
+    (tmp_path / "z.png").rename(tmp_path / "a.png")
+    second = discover_book(tmp_path, workspace)
+    assert second.pages[0].page.page_id == first_page_id
+    assert second.pages[0].reconciliation == "reused"
 
 
-class TestManifestPersistence:
-    def test_write_then_read_round_trips_schema_manifest(self, tmp_path):
-        images = tmp_path / "images"
-        images.mkdir()
-        _copy_image("hi_res_page.png", images / "page_002.png")
-        _copy_image("hi_res_page.png", images / "page_001.png")
+def test_discovery_keeps_duplicate_raw_files_as_distinct_ordered_placements(tmp_path):
+    (tmp_path / "a.png").write_bytes(b"same bytes")
+    (tmp_path / "b.png").write_bytes(b"same bytes")
 
-        manifest = generate_manifest(images)
-        manifest_path = tmp_path / "manifest.json"
-        write_manifest(manifest, manifest_path)
+    result = discover_book(tmp_path)
 
-        assert read_manifest(manifest_path) == manifest
-        assert json.loads(manifest_path.read_text())["total_pages"] == 2
-
-    def test_read_rejects_invalid_manifest_json(self, tmp_path):
-        path = tmp_path / "manifest.json"
-        path.write_text("not json")
-
-        with pytest.raises(ManifestValidationError, match="valid JSON"):
-            read_manifest(path)
-
-    def test_load_or_generate_writes_manifest_when_missing(self, tmp_path):
-        images = tmp_path / "images"
-        images.mkdir()
-        _copy_image("hi_res_page.png", images / "cover.png")
-
-        manifest_path = tmp_path / "manifest.json"
-        manifest = load_or_generate_manifest(images, manifest_path)
-
-        assert manifest_path.exists()
-        assert manifest.pages == [
-            {"filename": "cover.png", "page_number": 1, "status": "pending"}
-        ]
+    assert result.book is not None
+    assert len(result.pages) == 2
+    assert len({item.page.page_id for item in result.pages}) == 1
+    assert [item.placement.relative_path for item in result.pages] == ["a.png", "b.png"]
+    assert len({item.placement.placement_id for item in result.pages}) == 2
+    assert len(result.book.page_ids) == 1
 
 
-class TestManifestValidation:
-    def test_generate_manifest_orders_supported_images_and_ignores_non_images(self, tmp_path):
-        _copy_image("hi_res_page.png", tmp_path / "page_010.png")
-        _copy_image("hi_res_page.png", tmp_path / "page_002.png")
-        (tmp_path / "notes.txt").write_text("not an image")
+def test_discovery_reuses_raw_id_across_rename_reorder_and_timestamp_change(tmp_path):
+    workspace = tmp_path / "state"
+    first_path, second_path = tmp_path / "a.png", tmp_path / "b.png"
+    first_path.write_bytes(b"first page")
+    second_path.write_bytes(b"second page")
+    first = discover_book(tmp_path, workspace)
+    first_ids = {item.page.page_id for item in first.pages}
 
-        manifest = generate_manifest(tmp_path)
+    first_path.rename(tmp_path / "z.png")
+    second_path.rename(tmp_path / "a.png")  # Reverse deterministic placement order.
+    os.utime(tmp_path / "z.png", (1_700_000_000, 1_700_000_000))
+    os.utime(tmp_path / "a.png", (1_800_000_000, 1_800_000_000))
+    second = discover_book(tmp_path, workspace)
 
-        assert [page["filename"] for page in manifest.pages] == [
-            "page_002.png",
-            "page_010.png",
-        ]
-        assert [page["page_number"] for page in manifest.pages] == [1, 2]
-        assert manifest.total_pages == 2
+    assert {item.page.page_id for item in second.pages} == first_ids
+    assert [item.reconciliation for item in second.pages] == ["reused", "reused"]
 
-    def test_validate_rejects_nonsequential_page_numbers_in_manifest_order(self, tmp_path):
-        _copy_image("hi_res_page.png", tmp_path / "page_001.png")
-        _copy_image("hi_res_page.png", tmp_path / "page_002.png")
-        from btran.schema import Manifest
 
-        manifest = Manifest(
-            input_dir=str(tmp_path),
-            pages=[
-                {"filename": "page_001.png", "page_number": 2, "status": "pending"},
-                {"filename": "page_002.png", "page_number": 1, "status": "pending"},
-            ],
-            total_pages=2,
-        )
+def test_missing_page_is_persisted_finding_and_history_remains(tmp_path):
+    workspace = tmp_path / "state"
+    page = tmp_path / "page.jpg"
+    page.write_bytes(b"bytes")
+    first = discover_book(tmp_path, workspace)
+    page.unlink()
+    second = discover_book(tmp_path, workspace)
+    assert [finding.kind for finding in second.findings] == ["page_missing"]
+    snapshot = json.loads((workspace / DISCOVERY_FILENAME).read_text())
+    assert snapshot["known_pages"][0]["page_id"] == first.pages[0].page.page_id
+    assert (workspace / "findings" / f"{second.findings[0].finding_id}.json").exists()
 
-        with pytest.raises(ManifestValidationError, match="ordered sequentially"):
-            validate_manifest(manifest)
 
-    def test_validate_rejects_missing_referenced_page(self, tmp_path):
-        from btran.schema import Manifest
+def test_missing_input_becomes_nonleaking_invocation_failure(tmp_path):
+    missing = tmp_path / "missing"
+    result = discover_book(missing)
+    assert result.book is None
+    assert result.invocation_failure is not None
+    assert result.invocation_failure.code == "input_access"
+    assert result.invocation_failure.exception_type in {"FileNotFoundError", "NotADirectoryError"}
 
-        manifest = Manifest(
-            input_dir=str(tmp_path),
-            pages=[{"filename": "missing.png", "page_number": 1, "status": "pending"}],
-            total_pages=1,
-        )
 
-        with pytest.raises(ManifestValidationError, match="missing.png"):
-            validate_manifest(manifest)
+def test_discovery_stat_error_is_typed_input_access_failure(tmp_path, monkeypatch):
+    page = tmp_path / "page.png"
+    page.write_bytes(b"raw page bytes")
+    original_stat = Path.stat
 
-    def test_validate_rejects_invalid_page_shape_and_total(self, tmp_path):
-        from btran.schema import Manifest
+    def inaccessible_stat(path, *args, **kwargs):
+        if path == page:
+            raise PermissionError("page stat denied")
+        return original_stat(path, *args, **kwargs)
 
-        manifest = Manifest(
-            input_dir=str(tmp_path),
-            pages=[{"filename": "page.png", "page_number": 1}],
-            total_pages=2,
-        )
+    monkeypatch.setattr(Path, "stat", inaccessible_stat)
+    result = discover_book(tmp_path)
 
-        with pytest.raises(ManifestValidationError, match="total_pages"):
-            validate_manifest(manifest)
+    assert result.invocation_failure is not None
+    assert result.invocation_failure.code == "input_access"
+    assert result.invocation_failure.path == str(page)
+    assert result.invocation_failure.exception_type == "PermissionError"
 
-    def test_validate_rejects_page_path_outside_input_directory(self, tmp_path):
-        from btran.schema import Manifest
 
-        outside = tmp_path.parent / "outside.png"
-        _copy_image("hi_res_page.png", outside)
-        manifest = Manifest(
-            input_dir=str(tmp_path),
-            pages=[{"filename": "../outside.png", "page_number": 1, "status": "pending"}],
-            total_pages=1,
-        )
+def test_legacy_manifest_stat_error_is_not_silently_skipped(tmp_path, monkeypatch):
+    page = tmp_path / "page.png"
+    page.write_bytes(b"raw page bytes")
+    original_stat = Path.stat
 
-        with pytest.raises(ManifestValidationError, match="bare filename"):
-            validate_manifest(manifest)
+    def inaccessible_stat(path, *args, **kwargs):
+        if path == page:
+            raise PermissionError("page stat denied")
+        return original_stat(path, *args, **kwargs)
 
-    def test_read_rejects_non_string_input_directory(self, tmp_path):
-        path = tmp_path / "manifest.json"
-        path.write_text(json.dumps({"input_dir": 42, "pages": [], "total_pages": 0}))
+    monkeypatch.setattr(Path, "stat", inaccessible_stat)
 
-        with pytest.raises(ManifestValidationError, match="input_dir must be a string"):
-            read_manifest(path)
+    with pytest.raises(PermissionError, match="page stat denied"):
+        generate_manifest(tmp_path)
 
-    @pytest.mark.parametrize("filename", ["subdir/../page.png", r"..\\page.png", "{absolute_path}"])
-    def test_validate_rejects_non_filename_references(self, tmp_path, filename):
-        from btran.schema import Manifest
 
-        page = tmp_path / "page.png"
-        _copy_image("hi_res_page.png", page)
-        if filename == "{absolute_path}":
-            filename = str(page)
-        manifest = Manifest(
-            input_dir=str(tmp_path),
-            pages=[{"filename": filename, "page_number": 1, "status": "pending"}],
-            total_pages=1,
-        )
-
-        with pytest.raises(ManifestValidationError, match="bare filename"):
-            validate_manifest(manifest)
+def test_legacy_manifest_serialization_remains_narrow_migration_format(tmp_path):
+    (tmp_path / "page.png").write_bytes(b"bytes")
+    manifest = generate_manifest(tmp_path)
+    path = tmp_path / "manifest.json"
+    write_manifest(manifest, path)
+    assert set(json.loads(path.read_text())) == {"input_dir", "pages", "total_pages"}

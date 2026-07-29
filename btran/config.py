@@ -1,9 +1,10 @@
-"""Configuration for btran's small production CLI surface."""
+"""Configuration and finite process policy for btran runs."""
 
 from __future__ import annotations
 
 import argparse
 import os
+import tempfile
 from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Callable
@@ -13,6 +14,12 @@ from dotenv import find_dotenv, load_dotenv
 
 GLOSSARY_BUDGET_DEFAULT = 100_000
 GLOSSARY_BUDGET_MAXIMUM = 120_000
+TIMEOUT_SECONDS_MINIMUM = 1
+TIMEOUT_SECONDS_MAXIMUM = 3600
+MAX_RETRIES_MINIMUM = 0
+MAX_RETRIES_MAXIMUM = 5
+PROCESS_TERMINATE_GRACE_SECONDS = 2
+PROCESS_KILL_GRACE_SECONDS = 2
 _ENV_PREFIX = "BTRAN_"
 _UNSUPPORTED_ENV_CONTROLS = {
     "CACHE_DB": "the merged orchestrator uses its work-owned translation cache",
@@ -21,24 +28,26 @@ _UNSUPPORTED_ENV_CONTROLS = {
     "GLOSSARY_PATH": "glossary output paths are managed by the pipeline",
     "RECONCILIATION_ROUNDS": "reconciliation always uses one round",
     "PREFLIGHT_ONLY": "the merged orchestrator always runs preflight as part of a full run",
-    "REVIEW": "the merged orchestrator automatically blocks on unresolved review items",
+    "REVIEW": "review findings are informational and never block a run",
 }
 
 
 @dataclass
 class Config:
-    """Runtime settings passed unchanged to the orchestrator boundary.
-
-    A relative ``manifest_path`` is resolved by pipeline integration beneath
-    ``input_dir``, so the default is always ``INPUT_DIR/manifest.json``.
-    """
+    """Run settings.  ``target_lang=None`` selects native mode."""
 
     model: str = "gemini-2.5-flash"
-    target_lang: str = ""
+    target_lang: str | None = None
     concurrency: int = 4
     max_retries: int = 3
     timeout: int = 120
-    intermediate_dir: Path = Path("./intermediate")
+    # ``workspace`` is new authority.  ``intermediate_dir`` remains a narrow
+    # migration alias for callers of the old CLI surface.
+    workspace: Path | None = None
+    intermediate_dir: Path | None = None
+    base_revision: str | None = None
+    correction_set: str | None = None
+    refresh: bool = False
     pi_bin: str = "pi"
     title: str = "Translated Book"
     author: str = "Unknown"
@@ -53,9 +62,57 @@ class Config:
     glossary_path: Path = Path("glossary.json")
     glossary_budget: int = GLOSSARY_BUDGET_DEFAULT
 
+    @property
+    def mode(self) -> str:
+        return "translated" if self.target_lang is not None else "native"
+
+    @property
+    def retry_backoffs(self) -> tuple[int, ...]:
+        return tuple(min(2 ** attempt, 16) for attempt in range(self.max_retries))
+
+    @property
+    def max_leaf_seconds(self) -> int:
+        """Hard upper bound for one external leaf, including cleanup/backoff."""
+        return ((self.max_retries + 1) * (
+            self.timeout + PROCESS_TERMINATE_GRACE_SECONDS + PROCESS_KILL_GRACE_SECONDS
+        )) + sum(self.retry_backoffs)
+
+
+@dataclass(frozen=True)
+class WorkspaceResolution:
+    workspace: Path
+    fallback_from: Path | None = None
+
+    @property
+    def used_fallback(self) -> bool:
+        return self.fallback_from is not None
+
+
+class WorkspaceResolutionError(ValueError):
+    """Neither requested nor output-adjacent workspace can be made writable."""
+
+
+def validate_timeout_seconds(value: object) -> int:
+    """Enforce Config's integer-only external-process timeout contract."""
+    if (isinstance(value, bool) or not isinstance(value, int)
+            or not TIMEOUT_SECONDS_MINIMUM <= value <= TIMEOUT_SECONDS_MAXIMUM):
+        raise ValueError(
+            f"timeout must be an integer between {TIMEOUT_SECONDS_MINIMUM} and {TIMEOUT_SECONDS_MAXIMUM}"
+        )
+    return value
+
+
+def validate_max_retries(value: object) -> int:
+    """Enforce Config's bounded integer retry contract."""
+    if (isinstance(value, bool) or not isinstance(value, int)
+            or not MAX_RETRIES_MINIMUM <= value <= MAX_RETRIES_MAXIMUM):
+        raise ValueError(
+            f"max_retries must be an integer between {MAX_RETRIES_MINIMUM} and {MAX_RETRIES_MAXIMUM}"
+        )
+    return value
+
 
 def _flag_env(value: str) -> bool:
-    """Parse an explicitly boolean environment value."""
     normalized = value.strip().lower()
     if normalized in {"1", "true", "yes", "on"}:
         return True
@@ -66,11 +123,14 @@ def _flag_env(value: str) -> bool:
 
 _ENV_FIELDS: dict[str, tuple[str, Callable[[str], object]]] = {
     "model": ("MODEL", str),
-    "target_lang": ("TARGET_LANG", str),
     "concurrency": ("CONCURRENCY", int),
     "max_retries": ("MAX_RETRIES", int),
     "timeout": ("TIMEOUT", int),
+    "workspace": ("WORKSPACE", Path),
     "intermediate_dir": ("INTERMEDIATE_DIR", Path),
+    "base_revision": ("BASE_REVISION", str),
+    "correction_set": ("CORRECTION_SET", str),
+    "refresh": ("REFRESH", _flag_env),
     "pi_bin": ("PI_BIN", str),
     "title": ("TITLE", str),
     "author": ("AUTHOR", str),
@@ -83,16 +143,44 @@ _ENV_FIELDS: dict[str, tuple[str, Callable[[str], object]]] = {
     "manifest_path": ("MANIFEST_PATH", Path),
     "glossary_budget": ("GLOSSARY_BUDGET", int),
 }
-_PATH_FIELDS = {
-    "input_dir",
-    "output_epub",
-    "intermediate_dir",
-    "manifest_path",
-}
+_PATH_FIELDS = {"input_dir", "output_epub", "workspace", "intermediate_dir", "manifest_path"}
+
+
+def default_workspace(output_epub: Path | str) -> Path:
+    """Return output-adjacent state root; this is always fallback authority."""
+    return Path(output_epub).parent / ".btran"
+
+
+def _ensure_writable_directory(path: Path) -> Path:
+    """Create and prove a directory is writable without retaining test files."""
+    path.mkdir(parents=True, exist_ok=True)
+    if not path.is_dir():
+        raise OSError(f"workspace is not a directory: {path}")
+    with tempfile.NamedTemporaryFile(dir=path, prefix=".btran-write-check-", delete=True):
+        pass
+    return path
+
+
+def resolve_workspace(config: Config) -> WorkspaceResolution:
+    """Prefer explicit workspace/intermediate path; safely fall back beside EPUB."""
+    explicit = config.workspace if config.workspace is not None else config.intermediate_dir
+    fallback = default_workspace(config.output_epub)
+    if explicit is None:
+        try:
+            return WorkspaceResolution(_ensure_writable_directory(fallback))
+        except OSError as exc:
+            raise WorkspaceResolutionError("output-adjacent workspace is not writable") from exc
+    try:
+        return WorkspaceResolution(_ensure_writable_directory(Path(explicit)))
+    except OSError:
+        try:
+            return WorkspaceResolution(_ensure_writable_directory(fallback), Path(explicit))
+        except OSError as exc:
+            raise WorkspaceResolutionError("requested and output-adjacent workspaces are not writable") from exc
 
 
 def load_config(argv: list[str] | None = None) -> Config:
-    """Load ``.env`` values then override them with explicit CLI arguments."""
+    """Load dotenv/environment then apply explicit CLI values."""
     load_dotenv(dotenv_path=find_dotenv(usecwd=True))
     parser = _build_parser()
     cli_ns = parser.parse_args(argv)
@@ -105,26 +193,44 @@ def load_config(argv: list[str] | None = None) -> Config:
         if raw is None:
             values[name] = getattr(defaults, name)
             continue
+        if name in {"workspace", "intermediate_dir", "base_revision", "correction_set", "manifest_path"} and not raw.strip():
+            parser.error(f"BTRAN_{env_suffix} must not be blank")
         try:
             values[name] = converter(raw)
         except ValueError:
             parser.error(f"BTRAN_{env_suffix} has an invalid value: {raw!r}")
 
+    # Target selection has deliberately narrower semantics than normal config:
+    # only CLI or environment may select it, and either present blank selector
+    # is an error rather than a native-mode spelling.
+    env_target = os.getenv("BTRAN_TARGET_LANG")
+    cli_target = cli_ns.target_lang
+    if env_target is not None and not env_target.strip():
+        parser.error("BTRAN_TARGET_LANG must not be blank")
+    if cli_target is not None and not cli_target.strip():
+        parser.error("target_lang must not be blank")
+    values["target_lang"] = cli_target.strip() if cli_target is not None else (
+        env_target.strip() if env_target is not None else None
+    )
+
     cli_values = vars(cli_ns).copy()
+    for name in ("workspace", "intermediate_dir", "base_revision", "correction_set", "manifest_path"):
+        raw = cli_values.get(name)
+        if raw is not None and not raw.strip():
+            parser.error(f"{name} must not be empty")
     input_dir = cli_values.pop("INPUT_DIR")
     output_epub = cli_values.pop("OUTPUT_EPUB")
+    cli_values.pop("target_lang")
     for name, value in cli_values.items():
         if value is not None:
             values[name] = Path(value) if name in _PATH_FIELDS else value
 
     values["input_dir"] = Path(input_dir)
     values["output_epub"] = Path(output_epub)
-    config = Config(
-        **{
-            field.name: values.get(field.name, getattr(defaults, field.name))
-            for field in fields(Config)
-        }
-    )
+    config = Config(**{
+        field.name: values.get(field.name, getattr(defaults, field.name))
+        for field in fields(Config)
+    })
     _validate_config(config, parser, cli_ns)
     return config
 
@@ -135,35 +241,28 @@ def _reject_unsupported_environment_controls() -> None:
             raise ValueError(f"BTRAN_{suffix} is not supported: {reason}.")
 
 
-def _validate_config(
-    config: Config, parser: argparse.ArgumentParser, cli_ns: argparse.Namespace
-) -> None:
-    if not config.target_lang:
-        raise ValueError(
-            "target_lang is required. Set BTRAN_TARGET_LANG in .env or "
-            "pass --target-lang on the command line."
-        )
-    minimums = {
-        "concurrency": 1,
-        "max_retries": 0,
-        "timeout": 0,
-        "glossary_budget": 1,
-    }
-    for field_name, minimum in minimums.items():
-        if getattr(config, field_name) < minimum:
-            parser.error(f"{field_name} must be at least {minimum}")
-    if config.glossary_budget > GLOSSARY_BUDGET_MAXIMUM:
-        parser.error(
-            f"glossary_budget must not exceed {GLOSSARY_BUDGET_MAXIMUM}"
-        )
+def _blank(value: object) -> bool:
+    return isinstance(value, str) and not value.strip()
+
+
+def _validate_config(config: Config, parser: argparse.ArgumentParser, cli_ns: argparse.Namespace) -> None:
+    if not 1 <= config.concurrency <= 32:
+        parser.error("concurrency must be between 1 and 32")
+    try:
+        validate_max_retries(config.max_retries)
+        validate_timeout_seconds(config.timeout)
+    except ValueError as exc:
+        parser.error(str(exc))
+    if not 1 <= config.glossary_budget <= GLOSSARY_BUDGET_MAXIMUM:
+        parser.error(f"glossary_budget must be between 1 and {GLOSSARY_BUDGET_MAXIMUM}")
     if config.epub_check and not config.epub_check_path.strip():
         parser.error("epub_check_path must not be empty when --epub-check is enabled")
 
-    manifest_path_value = (
-        cli_ns.manifest_path
-        if cli_ns.manifest_path is not None
-        else os.getenv("BTRAN_MANIFEST_PATH")
-    )
+    for name in ("workspace", "intermediate_dir", "base_revision", "correction_set"):
+        value = getattr(config, name)
+        if _blank(value):
+            parser.error(f"{name} must not be empty")
+    manifest_path_value = cli_ns.manifest_path if cli_ns.manifest_path is not None else os.getenv("BTRAN_MANIFEST_PATH")
     if manifest_path_value is not None and not manifest_path_value.strip():
         parser.error("manifest_path must not be empty")
     if not cli_ns.INPUT_DIR.strip():
@@ -173,10 +272,14 @@ def _validate_config(
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="btran — translate book photos to EPUB")
+    parser = argparse.ArgumentParser(description="btran — book photos to EPUB")
     parser.add_argument("INPUT_DIR", help="Directory containing book page images")
     parser.add_argument("OUTPUT_EPUB", help="Output EPUB file path")
-    parser.add_argument("--target-lang", default=None)
+    parser.add_argument("--target-lang", default=None, metavar="LANG")
+    parser.add_argument("--workspace", default=None, metavar="DIR")
+    parser.add_argument("--base-revision", default=None, metavar="REVISION_ID")
+    parser.add_argument("--correction-set", default=None, metavar="SET_ID")
+    parser.add_argument("--refresh", action="store_true", default=None)
     parser.add_argument("--model", default=None)
     parser.add_argument("--concurrency", type=int, default=None)
     parser.add_argument("--max-retries", type=int, default=None)

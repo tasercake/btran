@@ -1,152 +1,40 @@
-"""Acceptance tests for the final production CLI configuration surface."""
+"""Small acceptance coverage for Task 4 base-run configuration grammar."""
 
-from pathlib import Path
+import os
 
 import pytest
 
 from btran.config import Config, load_config
 
 
-_ARGS = ["photos", "book.epub", "--target-lang", "fr"]
+@pytest.fixture(autouse=True)
+def _isolated_dotenv(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    for name in list(os.environ):
+        if name.startswith("BTRAN_"):
+            monkeypatch.delenv(name, raising=False)
 
 
-def test_manifest_default_is_resolved_by_integration_under_input_directory():
-    config = load_config(_ARGS)
-
-    assert config.manifest_path == Path("manifest.json")
-
-
-def test_config_preserves_internal_glossary_path_for_wp7_swap_compatibility():
-    assert Config(target_lang="fr").glossary_path == Path("glossary.json")
+def test_base_run_syntax_accepts_native_and_explicit_translated_modes():
+    native = load_config(["photos", "book.epub"])
+    translated = load_config(["photos", "book.epub", "--target-lang", "de"])
+    assert native.mode == "native" and native.target_lang is None
+    assert translated.mode == "translated" and translated.target_lang == "de"
 
 
-def test_explicit_manifest_cli_value_overrides_environment(monkeypatch):
-    monkeypatch.setenv("BTRAN_MANIFEST_PATH", "/env/manifest.json")
-
-    config = load_config([*_ARGS, "--manifest-path", "/cli/manifest.json"])
-
-    assert config.manifest_path == Path("/cli/manifest.json")
-
-
-@pytest.mark.parametrize("banned_flag", ["--preflight-only", "--review"])
-def test_unimplemented_orchestrator_mode_flags_are_not_accepted(banned_flag):
+@pytest.mark.parametrize("arguments", [
+    ["photos", "book.epub", "--workspace", ""],
+    ["photos", "book.epub", "--base-revision", ""],
+    ["photos", "book.epub", "--correction-set", ""],
+    ["", "book.epub"], ["photos", ""],
+])
+def test_blank_run_paths_and_selectors_reject(arguments):
     with pytest.raises(SystemExit) as exc:
-        load_config([*_ARGS, banned_flag])
-
+        load_config(arguments)
     assert exc.value.code == 2
 
 
-@pytest.mark.parametrize("environment", ["BTRAN_CACHE_DB", "BTRAN_PREFLIGHT_ONLY", "BTRAN_REVIEW"])
-def test_unimplemented_orchestrator_mode_environment_controls_are_rejected(monkeypatch, environment):
-    monkeypatch.setenv(environment, "1")
-
-    with pytest.raises(ValueError, match="not supported"):
-        load_config(_ARGS)
-
-
-@pytest.mark.parametrize(
-    ("flag", "value", "message"),
-    [
-        ("--concurrency", "0", "concurrency must be at least 1"),
-        ("--max-retries", "-1", "max_retries must be at least 0"),
-        ("--timeout", "-1", "timeout must be at least 0"),
-        ("--glossary-budget", "0", "glossary_budget must be at least 1"),
-        ("--glossary-budget", "120001", "glossary_budget must not exceed 120000"),
-    ],
-)
-def test_numeric_limits_fail_during_argument_parsing(flag, value, message, capsys):
-    with pytest.raises(SystemExit) as exc:
-        load_config([*_ARGS, flag, value])
-
-    assert exc.value.code == 2
-    assert message in capsys.readouterr().err
-
-
-def test_glossary_budget_defaults_to_100k_and_accepts_120k_cap():
-    assert load_config(_ARGS).glossary_budget == 100_000
-    assert load_config([*_ARGS, "--glossary-budget", "120000"]).glossary_budget == 120_000
-
-
-def test_resource_controls_accept_their_lower_bounds():
-    config = load_config(
-        [*_ARGS, "--concurrency", "1", "--max-retries", "0", "--timeout", "0"]
-    )
-
-    assert config.concurrency == 1
-    assert config.max_retries == 0
-    assert config.timeout == 0
-
-
-def test_resource_controls_have_no_configured_upper_bounds():
-    config = load_config(
-        [
-            *_ARGS,
-            "--concurrency", "10000",
-            "--max-retries", "10000",
-            "--timeout", "10000000",
-        ]
-    )
-
-    assert config.concurrency == 10_000
-    assert config.max_retries == 10_000
-    assert config.timeout == 10_000_000
-
-
-def test_epubcheck_path_can_be_configured_before_strict_check_is_enabled(monkeypatch):
-    monkeypatch.setenv("BTRAN_EPUB_CHECK_PATH", "/opt/epubcheck")
-
-    config = load_config(_ARGS)
-
-    assert config.epub_check is False
-    assert config.epub_check_path == "/opt/epubcheck"
-
-
-def test_strict_epubcheck_accepts_an_explicit_path_when_enabled():
-    config = load_config(
-        [*_ARGS, "--epub-check", "--epub-check-path", "/opt/epubcheck"]
-    )
-
-    assert config.epub_check is True
-    assert config.epub_check_path == "/opt/epubcheck"
-
-
-@pytest.mark.parametrize(
-    "args",
-    [
-        ["photos", "book.epub", "--target-lang", "fr", "--manifest-path", ""],
-        ["", "book.epub", "--target-lang", "fr"],
-        ["photos", "", "--target-lang", "fr"],
-    ],
-)
-def test_empty_explicit_paths_are_rejected(args):
-    with pytest.raises(SystemExit) as exc:
-        load_config(args)
-
-    assert exc.value.code == 2
-
-
-@pytest.mark.parametrize(
-    ("banned_flag", "value"),
-    [("--cache-db", "/tmp/cache.sqlite"), ("--no-preflight", None), ("--eval-dir", "eval"), ("--reconciliation-rounds", "2")],
-)
-def test_banned_production_flags_are_not_accepted(banned_flag, value):
-    with pytest.raises(SystemExit) as exc:
-        load_config([*_ARGS, banned_flag, *([] if value is None else [value])])
-
-    assert exc.value.code == 2
-
-
-def test_unsafe_legacy_preflight_environment_is_rejected(monkeypatch):
-    monkeypatch.setenv("BTRAN_NO_PREFLIGHT", "1")
-
-    with pytest.raises(ValueError, match="preflight is always enabled"):
-        load_config(_ARGS)
-
-
-def test_config_has_no_production_eval_or_bypass_fields():
-    config_fields = set(Config.__dataclass_fields__)
-
-    assert {"cache_db", "eval_dir", "no_preflight", "preflight_only", "review"}.isdisjoint(config_fields)
-    # Kept only as an internal artifact location required by the WP-7 runner;
-    # it has no CLI or environment control.
-    assert "glossary_path" in config_fields
+def test_config_has_no_correction_command_or_review_gate_surface():
+    fields = set(Config.__dataclass_fields__)
+    assert {"workspace", "base_revision", "correction_set", "refresh"}.issubset(fields)
+    assert "review" not in fields

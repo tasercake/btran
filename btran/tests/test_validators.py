@@ -1,206 +1,107 @@
-"""Tests for deterministic translation-result validators."""
+"""Task-11 validation remains diagnostic content, never a gate."""
+from __future__ import annotations
 
-from btran.schema import (
-    PageExtraction,
-    PageResult,
-    SourceBlock,
-    TermMention,
-    TerminologyEntry,
-    TerminologyMap,
-    TranslatedBlock,
-)
+from btran.artifacts import ArtifactStore
+from btran.reconciliation import reconcile_effective
+from btran.schema import EffectivePage, EffectiveSegment
 from btran.validators import (
-    check_block_id_correspondence,
     check_block_schema,
-    check_glossary_consistency,
-    check_illustration_count,
-    check_non_empty_text_fields,
-    check_translation_language,
     detect_language,
-    validate_page,
+    validate_effective,
 )
 
 
-def source(*, blocks=None, illustrations=None, mentions=None):
-    return PageExtraction(
-        page_number=1,
-        image_path="fixture.png",
-        sha256="a" * 64,
-        phash="b" * 16,
-        source_lang="en",
-        model="test",
-        blocks=blocks or [SourceBlock("b1", "paragraph", "The engine starts.", 0)],
-        illustrations=illustrations or [],
-        term_mentions=mentions or [],
+def _inputs(tmp_path, *, text="The cat sleeps."):
+    store = ArtifactStore(tmp_path / "store")
+    segment = EffectiveSegment(
+        effective_segment_id="effective-segment-1", segment_id="segment-1", source_lang="en",
+        source_text="The cat sleeps.", effective_text=text, render_lang="en", mode="translated",
+        translation_artifact_id="translation-1",
     )
+    target = store.put("EffectiveTargetSegment", segment.to_dict(), semantic_key="target-segment-1")
+    page = EffectivePage(effective_page_id="effective-page-1", page_id="page-1", effective_segment_ids=(segment.effective_segment_id,), source_langs=("en",))
+    target_page = store.put("EffectiveTargetPage", page.to_dict(), dependency_ids=(target.artifact_id,), semantic_key="target-page-1")
+    projection = store.put("ConceptProjection", {
+        "projection_id": "projection-1", "concept_id": "cat", "membership_id": "membership-1",
+        "selector_occurrence_ids": ["occurrence-1"], "target_form": "cat", "correction_id": None,
+    }, semantic_key="projection-1")
+    reconciliation = reconcile_effective(effective_pages=(target_page.artifact_id,), projections=(projection.artifact_id,), store=store, base_revision_id="revision-1")
+    return store, target_page.artifact_id, reconciliation
 
 
-def translation(*, blocks=None, text="Le moteur démarre.", descriptions=None, target_lang="fr"):
-    return PageResult(
-        page_number=1,
-        sha256="a" * 64,
-        phash="b" * 16,
-        source_lang="en",
-        target_lang=target_lang,
-        page_text="The engine starts.",
-        translated_text=text,
-        blocks=[SourceBlock("b1", "paragraph", "The engine starts.", 0)],
-        translated_blocks=blocks or [TranslatedBlock("b1", text)],
-        image_descriptions=descriptions or [],
-    )
-
-
-def glossary():
-    return TerminologyMap(
-        version="1", hash="hash", source_lang="en", target_lang="fr",
-        entries=[TerminologyEntry("engine", ["engine"], "moteur", ["manual"], 1.0)],
-    )
-
-
-def test_valid_page_passes_every_validator():
-    extraction = source(illustrations=["engine diagram"], mentions=[TermMention("engine", "b1")])
-    result = translation(descriptions=["A diagram of an engine"], text="Le moteur démarre.")
-
-    assert validate_page(extraction, result, glossary()) == {
-        "block_schema": [],
-        "non_empty_text": [],
-        "translation_language": [],
-        "illustration_count": [],
-        "block_id_correspondence": [],
-        "glossary_consistency": [],
-    }
-
-
-def test_block_schema_rejects_unknown_type_duplicate_id_and_negative_order():
-    errors = check_block_schema([
-        SourceBlock("b1", "unknown", "text", -1),
-        SourceBlock("b1", "paragraph", "other", 1),
-    ])
-
-    assert any("unsupported type" in error for error in errors)
-    assert any("duplicate id" in error for error in errors)
-    assert any("reading_order" in error for error in errors)
-
-
-def test_block_schema_accepts_source_extractor_block_types():
-    assert check_block_schema([
-        SourceBlock("quote", "pull_quote", "quoted text", 0),
-        SourceBlock("image", "illustration", "diagram", 1),
-    ]) == []
-
-
-def test_block_schema_rejects_reused_reading_order():
-    errors = check_block_schema([
-        SourceBlock("b1", "paragraph", "one", 0),
-        SourceBlock("b2", "paragraph", "two", 0),
-    ])
-
-    assert errors == ["duplicate reading_order: 0"]
-
-
-def test_validate_page_rejects_blank_source_block_text():
-    extraction = source(blocks=[SourceBlock("b1", "paragraph", "", 0)])
-
-    assert "source block b1 text is empty" in validate_page(extraction, translation(), glossary())["non_empty_text"]
-
-
-def test_non_empty_text_rejects_blank_page_and_block_text():
-    result = translation(text=" ", blocks=[TranslatedBlock("b1", "")])
-    result.page_text = "\t"
-
-    errors = check_non_empty_text_fields(result)
-
-    assert any("page_text" in error for error in errors)
-    assert any("translated_text" in error for error in errors)
-    assert any("translated block b1" in error for error in errors)
-
-
-def test_language_detection_uses_character_sets_and_common_words():
-    assert detect_language("こんにちは、世界です") == "ja"
+def test_legacy_helpers_remain_deterministic_migration_utilities():
+    from btran.schema import SourceBlock
+    assert check_block_schema([SourceBlock("b1", "paragraph", "text", 0)]) == []
     assert detect_language("Bonjour le monde et merci") == "fr"
-    assert detect_language("The quick brown fox is here") == "en"
 
 
-def test_translation_language_rejects_detectable_wrong_language():
-    errors = check_translation_language(translation(text="The quick brown fox is here", target_lang="ja"))
+def test_validator_rule_exception_is_persisted_and_other_rules_continue(tmp_path):
+    store, page_id, reconciliation = _inputs(tmp_path)
+    called = []
 
-    assert errors == ["translated_text appears to be en, expected ja"]
+    def broken(*_):
+        raise RuntimeError("boom")
 
+    def still_runs(*_):
+        called.append(True)
+        return ("intentional validation error",)
 
-def test_illustration_count_requires_one_description_per_extracted_illustration():
-    errors = check_illustration_count(
-        source(illustrations=["map", "portrait"]),
-        translation(descriptions=["A map"]),
+    result = validate_effective(
+        effective_pages=(page_id,), reconciliation=reconciliation, store=store,
+        base_revision_id="revision-1", mode="translated",
+        rules={"broken": broken, "still_runs": still_runs},
     )
 
-    assert errors == ["expected 2 illustration descriptions, got 1"]
+    assert result.status == "degraded"
+    assert called == [True]
+    assert [item.rule for item in result.rule_results] == ["broken", "still_runs"]
+    findings = [store.get_finding(item) for item in result.finding_ids]
+    assert {item.kind for item in findings} >= {"validator_exception", "validation_error", "review_request", "stage_summary"}
+    requests = [item for item in findings if item.kind == "review_request"]
+    assert all(item.requires_action is False for item in requests)
+    assert {item.evidence["trigger"] for item in requests} >= {"degraded_unknown_confidence", "validation_error"}
 
 
-def test_illustration_count_rejects_blank_description_references():
-    errors = check_illustration_count(
-        source(illustrations=["map"]),
-        translation(descriptions=[" "]),
+def test_validation_setup_failure_returns_degraded_artifact(tmp_path):
+    store = ArtifactStore(tmp_path / "store")
+    result = validate_effective(
+        effective_pages=("missing-page",), reconciliation=object(), store=store,
+        base_revision_id="revision-1", mode="translated",
     )
-
-    assert errors == ["illustration description 0 is empty"]
-
-
-def test_block_id_correspondence_rejects_missing_and_extra_ids():
-    errors = check_block_id_correspondence(
-        source(blocks=[
-            SourceBlock("b1", "paragraph", "one", 0),
-            SourceBlock("b2", "paragraph", "two", 1),
-        ]),
-        translation(blocks=[TranslatedBlock("b1", "un"), TranslatedBlock("b3", "trois")]),
-    )
-
-    assert "missing translated block IDs: b2" in errors
-    assert "extra translated block IDs: b3" in errors
+    assert result.status == "degraded"
+    findings = [store.get_finding(item) for item in result.finding_ids]
+    assert {item.kind for item in findings} >= {"validation_exception", "stage_summary"}
 
 
-def test_validate_page_reports_malformed_translated_blocks_without_crashing():
-    result = translation(blocks=[SourceBlock("b1", "paragraph", "not translated", 0)])
+def test_validation_semantic_key_and_dependency_change_with_selected_reconciliation(tmp_path):
+    store, page_id, first = _inputs(tmp_path, text="cat")
+    membership = store.put("ConceptMembership", {"membership": "membership-2"}, semantic_key="membership-2")
+    alternate_projection = store.put("ConceptProjection", {
+        "projection_id": "projection-2", "concept_id": "cat", "membership_id": membership.artifact_id,
+        "selector_occurrence_ids": ["occurrence-2"], "target_form": "feline", "correction_id": None,
+    }, dependency_ids=(membership.artifact_id,), semantic_key="projection-2")
+    second = reconcile_effective(effective_pages=(page_id,), projections=(alternate_projection.artifact_id,),
+                                 store=store, base_revision_id="revision-1")
 
-    errors = validate_page(source(), result, glossary())
+    first_validation = validate_effective(effective_pages=(page_id,), reconciliation=first, store=store,
+                                          base_revision_id="revision-1", mode="translated")
+    second_validation = validate_effective(effective_pages=(page_id,), reconciliation=second, store=store,
+                                           base_revision_id="revision-1", mode="translated")
 
-    assert errors["block_schema"] == ["translated block 0 is not a TranslatedBlock"]
-    assert errors["block_id_correspondence"] == ["translated block 0 is not a TranslatedBlock"]
-
-
-def test_glossary_consistency_rejects_missing_required_target_term():
-    errors = check_glossary_consistency(
-        source(mentions=[TermMention("engine", "b1")]),
-        translation(text="La machine démarre."),
-        glossary(),
-    )
-
-    assert errors == ["block b1 translates glossary term 'engine' without required target 'moteur'"]
-
-
-def test_glossary_consistency_rejects_target_term_as_part_of_a_larger_word():
-    art_glossary = TerminologyMap(
-        version="1", hash="hash", source_lang="en", target_lang="fr",
-        entries=[TerminologyEntry("art", ["art"], "art", ["manual"], 1.0)],
-    )
-
-    assert check_glossary_consistency(
-        source(mentions=[TermMention("art", "b1")]),
-        translation(text="La partie commence."),
-        art_glossary,
-    ) == ["block b1 translates glossary term 'art' without required target 'art'"]
+    assert first.artifact_id != second.artifact_id
+    assert first_validation.reconciliation_artifact_id == first.artifact_id
+    assert second_validation.reconciliation_artifact_id == second.artifact_id
+    assert first.artifact_id in store.get(first_validation.artifact_id).dependency_ids
+    assert second.artifact_id in store.get(second_validation.artifact_id).dependency_ids
+    assert store.get(first_validation.artifact_id).semantic_key != store.get(second_validation.artifact_id).semantic_key
 
 
-def test_glossary_consistency_accepts_a_legitimate_variant_for_the_same_source_term():
-    variant_glossary = TerminologyMap(
-        version="1", hash="hash", source_lang="en", target_lang="fr",
-        entries=[
-            TerminologyEntry("engine_metaphor", ["engine"], "machine", ["novel"], 1.0),
-            TerminologyEntry("engine_device", ["engine"], "moteur", ["manual"], 1.0),
-        ],
-    )
-
-    assert check_glossary_consistency(
-        source(mentions=[TermMention("engine", "b1")]),
-        translation(text="La machine démarre."),
-        variant_glossary,
-    ) == []
+def test_native_validation_uses_source_equivalent_rules_and_omits_target_rules(tmp_path):
+    store = ArtifactStore(tmp_path / "store")
+    segment = EffectiveSegment(effective_segment_id="effective-segment-1", segment_id="segment-1", source_lang="en", source_text="The cat sleeps.", effective_text="The cat sleeps.", render_lang="en", mode="native")
+    target = store.put("EffectiveTargetSegment", segment.to_dict(), semantic_key="target-segment-1")
+    page = EffectivePage(effective_page_id="effective-page-1", page_id="page-1", effective_segment_ids=(segment.effective_segment_id,), source_langs=("en",))
+    target_page = store.put("EffectiveTargetPage", page.to_dict(), dependency_ids=(target.artifact_id,), semantic_key="target-page-1")
+    reconciliation = reconcile_effective(effective_pages=(target_page.artifact_id,), projections=(), store=store, base_revision_id="revision-1")
+    result = validate_effective(effective_pages=(target_page.artifact_id,), reconciliation=reconciliation, store=store, base_revision_id="revision-1", mode="native")
+    assert {item.rule for item in result.rule_results} == {"effective_structure", "non_empty_text", "source_language"}
