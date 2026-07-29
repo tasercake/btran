@@ -1007,6 +1007,11 @@ def build_terminology_evidence(
         raise TerminologyEvidenceError("base_revision_id must be non-empty")
     if evidence_candidates is not None and not isinstance(evidence_candidates, Mapping):
         raise TerminologyEvidenceError("evidence_candidates must map segment IDs to occurrences")
+    # Native projections are source-form artifacts. Translated projections from
+    # a selected base cannot authorize reuse and scanning their closure is both
+    # semantically wrong and needlessly quadratic for large books.
+    if mode == "native":
+        selected_projection_artifact_ids = ()
 
     source_inputs = _effective_source_inputs(effective_source, store)
     leaves: list[OccurrenceEvidenceLeaf] = []

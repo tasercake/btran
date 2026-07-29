@@ -526,6 +526,28 @@ def test_task8_native_evidence_is_local_indexed_and_never_calls_terminology_mode
     assert all(finding.evidence["base_revision_id"] == "base-revision" for finding in review_requests)
 
 
+def test_task8_native_mode_does_not_scan_selected_translated_projections(tmp_path, monkeypatch):
+    from btran.terminology import build_terminology_evidence
+
+    store, graph, _, artifact = _effective_source_artifact(tmp_path, text="Magic sword")
+    original_get = store.get
+    touched: list[str] = []
+
+    def guarded_get(artifact_id, *args, **kwargs):
+        if artifact_id == "translated-projection-must-not-be-read":
+            touched.append(artifact_id)
+        return original_get(artifact_id, *args, **kwargs)
+
+    monkeypatch.setattr(store, "get", guarded_get)
+    build_terminology_evidence(
+        [artifact.artifact_id], store=store, graph=graph, mode="native",
+        selected_projection_artifact_ids=("translated-projection-must-not-be-read",),
+        base_revision_id="base-revision",
+    )
+
+    assert touched == []
+
+
 def test_task8_consolidation_failure_uses_source_form_projection_and_complete_review_request(tmp_path):
     from btran.terminology import TERMINOLOGY_FAILURE_KIND, build_terminology_evidence
 
