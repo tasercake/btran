@@ -73,6 +73,19 @@ def test_validation_setup_failure_returns_degraded_artifact(tmp_path):
     assert {item.kind for item in findings} >= {"validation_exception", "stage_summary"}
 
 
+def test_validation_setup_failure_with_selected_page_keeps_sorted_fallback_signals(tmp_path):
+    store, page_id, reconciliation = _inputs(tmp_path)
+    result = validate_effective(
+        effective_pages=(page_id,), reconciliation=reconciliation, store=store,
+        base_revision_id="revision-1", mode="translated", rules={},
+    )
+    assert result.status == "degraded"
+    findings = [store.get_finding(item) for item in result.finding_ids]
+    assert {item.kind for item in findings} >= {
+        "validation_exception", "uncertainty", "review_request", "stage_summary",
+    }
+
+
 def test_validation_semantic_key_and_dependency_change_with_selected_reconciliation(tmp_path):
     store, page_id, first = _inputs(tmp_path, text="cat")
     membership = store.put("ConceptMembership", {"membership": "membership-2"}, semantic_key="membership-2")

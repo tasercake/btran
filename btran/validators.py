@@ -208,7 +208,8 @@ def _validation_payload(reconciliation_id: str, page_ids: Sequence[str], results
 
 def _put_validation_assessment(store: ArtifactStore, *, validation_id: str, subject: str, review_subject_ids: Sequence[str], base_ids: Sequence[str], base_revision_id: str, signal: str, validation_error: bool) -> tuple[str, tuple[str, ...]]:
     degraded = not validation_error
-    assessment = ConfidenceAssessment(subject_id=subject, producing_stage="validation", producing_artifact_id=validation_id, score=None if degraded else 0, signals=(("fallback", signal) if degraded else (signal,)))
+    signals = tuple(sorted({"fallback", signal})) if degraded else (signal,)
+    assessment = ConfidenceAssessment(subject_id=subject, producing_stage="validation", producing_artifact_id=validation_id, score=None if degraded else 0, signals=signals)
     uncertainty = uncertainty_finding(assessment); store.put_finding(uncertainty)
     requests = review_requests_for(assessment=assessment, degraded_or_fallback=degraded, validation_error=validation_error, stage="validation", subject_ids=tuple(sorted(set(review_subject_ids))), suggested_correction_kind="target_segment", base_revision_id=base_revision_id, base_artifact_ids=tuple(sorted(set(base_ids))), scope="segment")
     finding_ids = [uncertainty.finding_id]
