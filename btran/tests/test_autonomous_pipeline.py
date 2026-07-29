@@ -121,7 +121,7 @@ async def test_empty_readable_directory_renders_deterministic_diagnostic_without
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("include_readable", [False, True])
-async def test_explicit_target_completes_for_all_unreadable_and_decode_model_failures(tmp_path, include_readable):
+async def test_explicit_target_completes_for_model_rejected_inputs_and_translation_failures(tmp_path, include_readable):
     config = _config(tmp_path)
     config = Config(**{**config.__dict__, "target_lang": "fr"})
     config.input_dir.mkdir()
@@ -130,6 +130,8 @@ async def test_explicit_target_completes_for_all_unreadable_and_decode_model_fai
         _image(config.input_dir / "good.png")
 
     async def extract(path, model, sha256, phash, page_number, **kwargs):
+        if Path(path).read_bytes() == b"unreadable png":
+            raise RuntimeError("vision rejected unreadable input")
         return _source(Path(path), page_number)
 
     translator = AsyncMock(side_effect=RuntimeError("translation unavailable"))

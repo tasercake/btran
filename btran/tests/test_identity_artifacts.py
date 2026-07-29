@@ -18,7 +18,6 @@ from btran.artifacts import (
     correction_semantic_key,
     finding_semantic_key,
     occurrence_shard_semantic_key,
-    preflight_semantic_key,
     projection_semantic_key,
     reconciliation_semantic_key,
     render_input_semantic_key,
@@ -236,35 +235,6 @@ def test_corrupt_dependency_is_quarantined_during_parent_closure_validation(tmp_
     assert not (tmp_path / "artifacts" / f"{parent.artifact_id}.json").exists()
 
 
-def test_cache_validator_recomputes_current_requested_key_before_snapshot_reuse(tmp_path):
-    store = ArtifactStore(tmp_path)
-    current = dict(algorithm_version="a1", image_library_version="image-lib", configuration={"dpi": 300}, raw_bytes=b"raw", normalized_image_bytes=b"normalized")
-    key = preflight_semantic_key(**current)
-    artifact = _store_artifact(store, semantic_key=key)
-    snapshot = RevisionSnapshot(
-        revision_id="revision", selected_artifact_ids=(artifact.artifact_id,),
-        selected_cache_attestation_ids=(store.attestation_id_for(artifact.artifact_id, "test", key),),
-    )
-    validator = CacheValidator(store)
-    assert validator.select(snapshot, requested_artifact_id=artifact.artifact_id, kind="test", key_constructor=preflight_semantic_key, current_inputs=current) == artifact
-
-    # Every changed requested input creates a cache miss even while stored hash
-    # and closure remain valid.
-    variants = (
-        {**current, "algorithm_version": "a2"},
-        {**current, "image_library_version": "image-lib-2"},
-        {**current, "configuration": {"dpi": 301}},
-        {**current, "raw_bytes": b"raw-2"},
-        {**current, "normalized_image_bytes": b"normalized-2"},
-    )
-    for changed in variants:
-        assert validator.select(snapshot, requested_artifact_id=artifact.artifact_id, kind="test", key_constructor=preflight_semantic_key, current_inputs=changed) is None
-
-    # Reuse requires both matching envelope key and matching index membership.
-    store._index_path("test", key).unlink()
-    assert validator.select(snapshot, requested_artifact_id=artifact.artifact_id, kind="test", key_constructor=preflight_semantic_key, current_inputs=current) is None
-
-
 def test_cache_validator_empty_or_invalid_selected_attestation_is_a_miss(tmp_path):
     store = ArtifactStore(tmp_path)
     artifact = _store_artifact(store, semantic_key="key")
@@ -286,8 +256,7 @@ def test_cache_validator_empty_or_invalid_selected_attestation_is_a_miss(tmp_pat
 
 def test_every_semantic_key_constructor_mutates_declared_inputs_and_rejects_metadata():
     cases = (
-        (preflight_semantic_key, dict(algorithm_version="a", image_library_version="lib", configuration={"dpi": 300}, raw_bytes=b"raw", normalized_image_bytes=b"normal"), {"algorithm_version": "b", "image_library_version": "lib-2", "configuration": {"dpi": 301}, "raw_bytes": b"raw-2", "normalized_image_bytes": b"normal-2"}),
-        (source_extraction_semantic_key, dict(extraction_schema="schema", prompt_bytes=b"prompt", model_executable_identity="pi", model_id="model", raw_bytes=b"raw", normalization_bytes=b"normal"), {"extraction_schema": "schema-2", "prompt_bytes": b"prompt-2", "model_executable_identity": "pi-2", "model_id": "model-2", "raw_bytes": b"raw-2", "normalization_bytes": b"normal-2"}),
+        (source_extraction_semantic_key, dict(extraction_schema="schema", prompt_bytes=b"prompt", model_executable_identity="pi", model_id="model", raw_bytes=b"raw"), {"extraction_schema": "schema-2", "prompt_bytes": b"prompt-2", "model_executable_identity": "pi-2", "model_id": "model-2", "raw_bytes": b"raw-2"}),
         (occurrence_shard_semantic_key, dict(effective_source_segment={"id": "segment", "text": "source"}, evidence_rules_version="rules"), {"effective_source_segment": {"id": "segment", "text": "changed"}, "evidence_rules_version": "rules-2"}),
         (concept_membership_semantic_key, dict(concept_id="concept", occurrence_ids=("occurrence",), evidence_shard_ids=("shard",), membership_rules_version="rules"), {"concept_id": "concept-2", "occurrence_ids": ("occurrence-2",), "evidence_shard_ids": ("shard-2",), "membership_rules_version": "rules-2"}),
         (projection_semantic_key, dict(concept_id="concept", occurrence_scope_selector={"kind": "all"}, membership_id="membership", target_form="term", active_terminology_corrections=("correction",), model_executable_identity="pi", model_id="model", prompt_bytes=b"prompt", consolidation_schema="schema", algorithm_version="algorithm"), {"concept_id": "concept-2", "occurrence_scope_selector": {"kind": "subset"}, "membership_id": "membership-2", "target_form": "term-2", "active_terminology_corrections": ("correction-2",), "model_executable_identity": "pi-2", "model_id": "model-2", "prompt_bytes": b"prompt-2", "consolidation_schema": "schema-2", "algorithm_version": "algorithm-2"}),

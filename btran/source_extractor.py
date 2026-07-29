@@ -6,15 +6,12 @@ import asyncio
 import hashlib
 import html
 import json
-from io import BytesIO
 import math
 import os
 import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping
-
-from PIL import Image, ImageOps, UnidentifiedImageError
 
 from btran.artifacts import ArtifactStore, CacheValidator, DependencyGraph, RevisionSnapshot, source_extraction_semantic_key
 from btran.orchestrator_contract import CacheEvent
@@ -370,7 +367,6 @@ class RawPageInput:
     raw_file_sha256: str
     page_number: int = 1
     phash: str = ""
-    preflight_artifact_id: str | None = None
     confidence: float | None = None
     ambiguity: str | None = None
     raw_bytes: bytes | None = None
@@ -443,37 +439,17 @@ def accepted_raw_image_bytes(page: RawPageInput) -> bytes:
     return raw_bytes
 
 
-def state_owned_image_copies(
+def state_owned_image_copy(
     page: RawPageInput, workspace: Path, *, raw_bytes: bytes | None = None,
-) -> tuple[bytes, bytes, Path]:
-    """Copy accepted raw bytes and deterministic normalized PNG into state.
-
-    Checks and model input consume these copies.  They never reread mutable
-    source after raw identity/keying.
-    """
+) -> tuple[bytes, Path]:
+    """Copy accepted raw bytes once for source-model input without inspecting them."""
     if raw_bytes is None:
         raw_bytes = _raw_image_bytes(page)
     _validate_raw_image_identity(page, raw_bytes)
-    raw_name = f"{page.page_id}-{page.raw_file_sha256}.bin"
-    _atomic_image_copy(workspace / "images" / "raw" / raw_name, raw_bytes)
-    try:
-        with Image.open(BytesIO(raw_bytes)) as image:
-            normalized = ImageOps.exif_transpose(image)
-            normalized.load()
-            # PNG makes state-owned normalized bytes independent of original
-            # JPEG metadata while retaining actual decoded pixels.
-            with tempfile.SpooledTemporaryFile() as output:
-                normalized.save(output, format="PNG")
-                output.seek(0)
-                normalized_bytes = output.read()
-    except (OSError, UnidentifiedImageError, Image.DecompressionBombError) as exc:
-        raise ExtractionError(f"image decode failed: {type(exc).__name__}") from exc
-    normalized_digest = hashlib.sha256(normalized_bytes).hexdigest()
-    normalized_path = _atomic_image_copy(
-        workspace / "images" / "normalized" / f"{page.page_id}-{normalized_digest}.png",
-        normalized_bytes,
-    )
-    return raw_bytes, normalized_bytes, normalized_path
+    suffix = page.image_path.suffix or ".image"
+    raw_name = f"{page.page_id}-{page.raw_file_sha256}{suffix}"
+    raw_path = _atomic_image_copy(workspace / "images" / "raw" / raw_name, raw_bytes)
+    return raw_bytes, raw_path
 
 
 def _put_assessment(
@@ -628,8 +604,7 @@ async def extract_raw_pages(
         return tuple(sorted(set(result)))
 
     def reused_leaf(
-        page: RawPageInput, dependencies: tuple[str, ...], raw_bytes_for_key: bytes,
-        normalization_bytes_for_key: bytes,
+        page: RawPageInput, raw_bytes_for_key: bytes,
     ) -> RawLeafResult | None:
         if cache_validator is None:
             return None
@@ -640,7 +615,7 @@ async def extract_raw_pages(
                 key_constructor=source_extraction_semantic_key,
                 extraction_schema=EXTRACTION_SCHEMA_VERSION, prompt_bytes=EXTRACTION_PROMPT.encode("utf-8"),
                 model_executable_identity=executable_identity, model_id=model,
-                raw_bytes=raw_bytes_for_key, normalization_bytes=normalization_bytes_for_key,
+                raw_bytes=raw_bytes_for_key,
             )
             if artifact is None:
                 continue
@@ -651,8 +626,7 @@ async def extract_raw_pages(
                     segment_ids = tuple(artifact.payload["segment_artifact_ids"])
                     if (not segment_ids or segment_ids != tuple(sorted(set(segment_ids)))
                             or artifact.payload.get("raw_file_sha256") != page.raw_file_sha256
-                            or artifact.payload.get("normalized_image_sha256") != hashlib.sha256(normalization_bytes_for_key).hexdigest()
-                            or artifact.dependency_ids != tuple(sorted((*dependencies, *segment_ids)))):
+                            or artifact.dependency_ids != segment_ids):
                         continue
                     for segment_id in segment_ids:
                         segment = store.get(segment_id)
@@ -662,7 +636,7 @@ async def extract_raw_pages(
                     fallback_assessment = assessment_ids[0] if assessment_ids else artifact.artifact_id
                     return RawLeafResult(page.page_id, artifact.artifact_id, segment_ids, fallback_assessment,
                                          artifact.finding_ids, False, assessment_ids)
-                if (artifact.payload.get("source_lang") is not None or artifact.dependency_ids != dependencies
+                if (artifact.payload.get("source_lang") is not None or artifact.dependency_ids != ()
                         or _fallback_segment(store, artifact.artifact_id).page_id != page.page_id):
                     continue
                 assessment_ids = selected_assessment_ids((artifact.artifact_id,))
@@ -678,26 +652,24 @@ async def extract_raw_pages(
             # ``None`` distinguishes unavailable bytes from a real empty file.
             # Never initialize a fallback key from shared ``b\"\"`` bytes.
             raw_bytes: bytes | None = None
-            normalized_bytes = b""
             key: str | None = None
-            dependencies = (() if page.preflight_artifact_id is None else (page.preflight_artifact_id,))
             try:
                 # Retain actual buffer before identity validation.  On a
                 # hash mismatch, fallback evidence and semantic key must still
                 # describe these bytes, not a digest-derived stand-in.
                 raw_bytes = _raw_image_bytes(page)
                 _validate_raw_image_identity(page, raw_bytes)
-                raw_bytes, normalized_bytes, normalized_path = state_owned_image_copies(
+                raw_bytes, model_image_path = state_owned_image_copy(
                     page, Path(workspace), raw_bytes=raw_bytes)
                 key = source_extraction_semantic_key(
                     extraction_schema=EXTRACTION_SCHEMA_VERSION, prompt_bytes=EXTRACTION_PROMPT.encode("utf-8"),
                     model_executable_identity=executable_identity, model_id=model,
-                    raw_bytes=raw_bytes, normalization_bytes=normalized_bytes,
+                    raw_bytes=raw_bytes,
                 )
-                reused = reused_leaf(page, dependencies, raw_bytes, normalized_bytes)
+                reused = reused_leaf(page, raw_bytes)
                 if reused is not None:
                     return reused, CacheEvent("source_extraction", page.page_id, "hit", reused.page_artifact_id, key)
-                extraction = await extract_page(normalized_path, model, page.raw_file_sha256,
+                extraction = await extract_page(model_image_path, model, page.raw_file_sha256,
                                                 page.phash or "0", page.page_number, pi_bin=pi_bin,
                                                 timeout=timeout, max_retries=max_retries)
                 roots = canonical_root_segments(page.page_id, [
@@ -716,7 +688,7 @@ async def extract_raw_pages(
                 segment_assessment_findings: list[str] = []
                 for segment in roots.segments:
                     envelope = store.put(RAW_SEGMENT_ARTIFACT_KIND, segment.to_dict(),
-                                         dependency_ids=dependencies, finding_ids=tuple(root_findings),
+                                         finding_ids=tuple(root_findings),
                                          semantic_key=key)
                     segment_ids.append(envelope.artifact_id)
                     assessment_id, finding_ids = _put_assessment(
@@ -732,8 +704,7 @@ async def extract_raw_pages(
                     "page_id": page.page_id, "source_lang": extraction.source_lang,
                     "segment_artifact_ids": sorted(segment_ids),
                     "raw_file_sha256": page.raw_file_sha256,
-                    "normalized_image_sha256": hashlib.sha256(normalized_bytes).hexdigest(),
-                }, dependency_ids=tuple(sorted((*dependencies, *segment_ids))),
+                }, dependency_ids=tuple(sorted(segment_ids)),
                    finding_ids=tuple(root_findings), semantic_key=key)
                 assessment_id, assessment_findings = _put_assessment(
                     store, subject_id=page.page_id, producing_artifact_id=page_artifact.artifact_id,
@@ -757,11 +728,10 @@ async def extract_raw_pages(
                         extraction_schema=EXTRACTION_SCHEMA_VERSION, prompt_bytes=EXTRACTION_PROMPT.encode("utf-8"),
                         model_executable_identity=executable_identity, model_id=model,
                         raw_bytes=(raw_bytes if raw_bytes is not None else b"unavailable:" + page.raw_file_sha256.encode("ascii")),
-                        normalization_bytes=normalized_bytes,
                     )
-                failure_kind = "page_unreadable" if (raw_bytes is None or "image decode failed" in str(exc)) else "source_extraction_failed"
+                failure_kind = "page_unreadable" if raw_bytes is None else "source_extraction_failed"
                 leaf = _fallback_leaf(store, page, semantic_key=key, error=exc,
-                                      base_revision_id=base_revision_id, dependency_ids=dependencies,
+                                      base_revision_id=base_revision_id,
                                       failure_kind=failure_kind)
                 return leaf, CacheEvent("source_extraction", page.page_id, "miss", semantic_key=key)
 

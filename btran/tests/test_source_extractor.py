@@ -444,7 +444,7 @@ class TestExtractionArtifacts:
 
 class TestPersistedRawLeaves:
     @pytest.mark.asyncio
-    async def test_decode_failure_is_raw_diagnostic_fallback_not_effective_content(self, tmp_path):
+    async def test_model_rejection_of_unreadable_input_is_raw_diagnostic_fallback(self, tmp_path):
         from btran.artifacts import ArtifactStore
         from btran.identity import page_id_for_raw_sha256
         from btran.source_extractor import RawPageInput, extract_raw_pages
@@ -455,25 +455,28 @@ class TestPersistedRawLeaves:
         page_id = page_id_for_raw_sha256(digest)
         store = ArtifactStore(tmp_path / "state")
 
-        result = await extract_raw_pages(
-            [RawPageInput(page_id, image, digest)], store=store,
-            workspace=tmp_path / "state", model="vision", base_revision_id="base-rev",
-        )
+        model = AsyncMock(side_effect=RuntimeError("unreadable image"))
+        with patch("btran.source_extractor.extract_page", model):
+            result = await extract_raw_pages(
+                [RawPageInput(page_id, image, digest)], store=store,
+                workspace=tmp_path / "state", model="vision", base_revision_id="base-rev",
+            )
 
+        model.assert_awaited_once()
         leaf = result.leaves[0]
         artifact = store.get(leaf.page_artifact_id)
         assert result.status == "degraded"
         assert artifact.kind == "DiagnosticSourceFallback"
         assert artifact.payload["source_lang"] is None
         assert "effective_content_id" not in artifact.payload
-        assert "[btran diagnostic: page_unreadable:" in artifact.payload["segment"]["source_text"]
+        assert "[btran diagnostic: source_extraction_failed:" in artifact.payload["segment"]["source_text"]
         from btran.artifacts import source_extraction_semantic_key
         from btran.source_extractor import EXTRACTION_PROMPT, EXTRACTION_SCHEMA_VERSION
         assert artifact.semantic_key == source_extraction_semantic_key(
             extraction_schema=EXTRACTION_SCHEMA_VERSION,
             prompt_bytes=EXTRACTION_PROMPT.encode("utf-8"),
             model_executable_identity="pi-bin:pi", model_id="vision",
-            raw_bytes=image.read_bytes(), normalization_bytes=b"",
+            raw_bytes=image.read_bytes(),
         )
         requests = [store.get_finding(item) for item in leaf.finding_ids]
         _assert_exact_segment_review_provenance(
@@ -520,7 +523,6 @@ class TestPersistedRawLeaves:
             model_executable_identity="pi-bin:pi",
             model_id="vision",
             raw_bytes=actual_raw,
-            normalization_bytes=b"",
         )
 
     @pytest.mark.asyncio

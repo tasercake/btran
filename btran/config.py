@@ -23,11 +23,9 @@ PROCESS_KILL_GRACE_SECONDS = 2
 _ENV_PREFIX = "BTRAN_"
 _UNSUPPORTED_ENV_CONTROLS = {
     "CACHE_DB": "the merged orchestrator uses its work-owned translation cache",
-    "NO_PREFLIGHT": "preflight is always enabled",
     "EVAL_DIR": "the evaluation corpus is a developer harness, not a production control",
     "GLOSSARY_PATH": "glossary output paths are managed by the pipeline",
     "RECONCILIATION_ROUNDS": "reconciliation always uses one round",
-    "PREFLIGHT_ONLY": "the merged orchestrator always runs preflight as part of a full run",
     "REVIEW": "review findings are informational and never block a run",
 }
 

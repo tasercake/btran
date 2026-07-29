@@ -12,7 +12,6 @@ from btran import (
     epub_builder,
     eval_harness,
     manifest,
-    preflight,
     reconciliation,
     source_extractor,
     terminology,
@@ -92,7 +91,6 @@ async def test_wave_one_modules_exchange_representative_typed_artifacts(tmp_path
         callable(public_api)
         for public_api in (
             manifest.generate_manifest,
-            preflight.preflight_manifest,
             source_extractor.extract_page,
             terminology.consolidate_terminology,
             translator.translate_blocks,
