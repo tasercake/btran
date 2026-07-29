@@ -73,7 +73,7 @@ async def test_executor_persists_stage_records_and_finalizes_in_fixed_order(tmp_
     assert result.errors == []
     assert result.report is not None
     assert [record.stage for record in result.report.stage_records] == [
-        "discovery", "preflight", "source_extraction", "corrections",
+        "discovery", "source_extraction", "corrections",
         "effective_source", "terminology", "target_materialization",
         "reconciliation", "validation", "rendering", "candidate_seal",
     ]
@@ -100,6 +100,10 @@ async def test_degraded_source_leaf_keeps_target_representation_and_still_render
     assert result.status == "completed"
     assert result.target_run is not None
     assert result.target_run.leaves[0].degraded
+    assert all(record.stage != "preflight" for record in result.report.stage_records)
+    store = ArtifactStore(cfg.workspace)
+    assert all(store.get(path.stem).kind != "PagePreflight" for path in (cfg.workspace / "artifacts").glob("*.json"))
+    assert all(store.get_finding(path.stem).stage != "preflight" for path in (cfg.workspace / "findings").glob("*.json"))
     assert reported and reported[0][0] == 1
     assert cfg.output_epub.read_bytes() != b"old"
     # Fallback is materialized into same target-page/segment representation and
@@ -121,6 +125,8 @@ async def test_explicit_target_keeps_unreadable_source_as_translated_und_diagnos
     translated: list[str] = []
 
     async def extract(path, model, sha256, phash, page_number, **kwargs):
+        if Path(path).read_bytes() == b"not an image":
+            raise RuntimeError("vision rejected unreadable image")
         return _source(Path(path), page_number)
 
     async def translate(segment, **kwargs):
@@ -135,6 +141,9 @@ async def test_explicit_target_keeps_unreadable_source_as_translated_und_diagnos
     assert result.report is not None and result.report.final_epub_status == "completed_degraded"
     assert len(translated) == 1
     store = ArtifactStore(cfg.workspace)
+    assert all(record.stage != "preflight" for record in result.report.stage_records)
+    assert all(store.get(path.stem).kind != "PagePreflight" for path in (cfg.workspace / "artifacts").glob("*.json"))
+    assert all(store.get_finding(path.stem).stage != "preflight" for path in (cfg.workspace / "findings").glob("*.json"))
     target_segments = [store.get(artifact_id).payload for leaf in result.target_run.leaves
                        for artifact_id in leaf.segment_artifact_ids]
     diagnostic = next(item for item in target_segments if item["source_lang"] is None)
@@ -144,6 +153,6 @@ async def test_explicit_target_keeps_unreadable_source_as_translated_und_diagnos
     with zipfile.ZipFile(cfg.output_epub) as archive:
         chapters = [archive.read(name).decode("utf-8") for name in archive.namelist() if name.endswith(".xhtml")]
         package = next(archive.read(name).decode("utf-8") for name in archive.namelist() if name.endswith(".opf"))
-    assert any('lang="und" xml:lang="und"' in chapter and "page_unreadable" in chapter for chapter in chapters)
+    assert any('lang="und" xml:lang="und"' in chapter and "source_extraction_failed" in chapter for chapter in chapters)
     assert any('lang="fr" xml:lang="fr"' in chapter and "bonjour" in chapter for chapter in chapters)
     assert "<dc:language>fr</dc:language>" in package

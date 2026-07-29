@@ -24,7 +24,7 @@ def _config(tmp_path: Path, **overrides: object) -> Config:
     return Config(**values)
 
 
-def test_cli_does_not_preflight_pi_or_epubcheck_before_runner(tmp_path):
+def test_cli_does_not_probe_model_or_epubcheck_before_runner(tmp_path):
     """Model/check executables belong to bounded stage invocation, not CLI."""
     config = _config(tmp_path, epub_check=True, epub_check_path="missing-epubcheck")
     runner = AsyncMock(return_value=RunResult(errors=[], status="completed"))

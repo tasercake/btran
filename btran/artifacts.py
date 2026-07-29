@@ -95,26 +95,16 @@ def _semantic(tag: str, body: Mapping[str, Any], *raw_parts: bytes) -> str:
     return tagged_sha256(tag, canonical_json_bytes(dict(body)), *raw_parts)
 
 
-def preflight_semantic_key(
-    *, algorithm_version: str, image_library_version: str, configuration: Mapping[str, Any],
-    raw_bytes: bytes, normalized_image_bytes: bytes,
-) -> str:
-    return _semantic("preflight-v1", {
-        "algorithm_version": _text(algorithm_version, "algorithm_version"),
-        "image_library_version": _text(image_library_version, "image_library_version"),
-        "configuration": dict(configuration),
-    }, _bytes(raw_bytes, "raw_bytes"), _bytes(normalized_image_bytes, "normalized_image_bytes"))
-
-
 def source_extraction_semantic_key(
     *, extraction_schema: str, prompt_bytes: bytes, model_executable_identity: str,
-    model_id: str, raw_bytes: bytes, normalization_bytes: bytes,
+    model_id: str, raw_bytes: bytes,
 ) -> str:
-    return _semantic("source-extraction-v1", {
+    """Key exact bytes supplied to bounded source-model invocation."""
+    return _semantic("source-extraction-v2", {
         "extraction_schema": _text(extraction_schema, "extraction_schema"),
         "model_executable_identity": _text(model_executable_identity, "model_executable_identity"),
         "model_id": _text(model_id, "model_id"),
-    }, _bytes(prompt_bytes, "prompt_bytes"), _bytes(raw_bytes, "raw_bytes"), _bytes(normalization_bytes, "normalization_bytes"))
+    }, _bytes(prompt_bytes, "prompt_bytes"), _bytes(raw_bytes, "raw_bytes"))
 
 
 def occurrence_shard_semantic_key(
@@ -264,7 +254,6 @@ def correction_semantic_key(
     })
 
 # Verb-first aliases make table-to-code correspondence unambiguous.
-semantic_key_preflight = preflight_semantic_key
 semantic_key_source_extraction = source_extraction_semantic_key
 semantic_key_occurrence_shard = occurrence_shard_semantic_key
 semantic_key_concept_membership = concept_membership_semantic_key

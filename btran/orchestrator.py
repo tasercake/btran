@@ -43,7 +43,6 @@ from btran.orchestrator_contract import (
     StageOutputs,
     initialized_report,
 )
-from btran.preflight import PreflightPageInput, persist_preflight_pages
 from btran.schema import (
     CorrectionImpact,
     EffectivePage,
@@ -379,27 +378,8 @@ async def _run_core(config: Config, on_page_error: PageErrorCallback | None = No
     # Discovery placement is relative to input root. It is intentionally not
     # a logical/model input: rename/reorder must only alter output display.
     input_root = Path(config.input_dir).resolve()
-    page_inputs = tuple(
-        PreflightPageInput(page.page.page_id, input_root / page.placement.relative_path,
-                           page.page.raw_file_sha256, number + 1)
-        for number, page in enumerate(logical_discovery)
-    )
-
-    async def preflight_stage(_: StageInputs) -> StageOutputs:
-        result = persist_preflight_pages(page_inputs, store=store, base_revision_id=selected.base_revision_id)
-        roots = tuple(sorted(item.artifact_id for item in result.pages))
-        finding_ids = tuple(sorted(set((result.stage_summary_finding_id,
-                                        *(finding_id for item in result.pages for finding_id in item.finding_ids)))))
-        return StageOutputs(result.status, roots, finding_ids, (),
-                            tuple(CacheEvent("preflight", item.page_id, "produced", item.artifact_id) for item in result.pages), result)
-
-    preflight = await executor.stage("preflight", StageInputs("preflight", selected, (book_artifact_id,), discovered.finding_ids), preflight_stage)
-    preflight_run = preflight.value
-    preflight_by_page = {item.page_id: item.artifact_id for item in preflight_run.pages}
-
     raw_inputs = tuple(RawPageInput(page.page.page_id, input_root / page.placement.relative_path,
-                                    page.page.raw_file_sha256, number + 1,
-                                    preflight_artifact_id=preflight_by_page[page.page.page_id])
+                                    page.page.raw_file_sha256, number + 1)
                        for number, page in enumerate(logical_discovery))
 
     async def extraction_stage(_: StageInputs) -> StageOutputs:
@@ -428,7 +408,7 @@ async def _run_core(config: Config, on_page_error: PageErrorCallback | None = No
         return StageOutputs(result.status, roots, finding_ids, (), result.cache_events, result)
 
     raw = await executor.stage("source_extraction", StageInputs("source_extraction", selected,
-                               tuple(sorted((*preflight.output_artifact_ids,))), preflight.finding_ids), extraction_stage)
+                               (book_artifact_id,), discovered.finding_ids), extraction_stage)
     raw_run = raw.value
 
     async def corrections_stage(_: StageInputs) -> StageOutputs:

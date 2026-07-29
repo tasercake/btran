@@ -21,18 +21,14 @@ for the complete supported production configuration surface.
 
 ## Integrated pipeline
 
-Each run loads or creates a manifest, preflights every listed page, extracts
-source blocks, freezes a glossary, translates, performs the fixed single
-reconciliation pass, validates the results, and writes the EPUB. Any terminal
-page or gate failure prevents EPUB output and returns a nonzero exit status.
-Terminal page failures stream to stderr once as they occur; the CLI emits one
-final failure summary.
+Each run discovers listed pages, extracts source blocks, freezes a glossary,
+translates, performs the fixed single reconciliation pass, validates results,
+and writes the EPUB. Page input or model failures retain diagnostic source
+content so the EPUB remains inspectable. Findings are nonblocking; terminal
+invocation failures prevent EPUB output and return a nonzero exit status.
 
-Preflight is mandatory and unresolved glossary or terminology review items
-block the run until their resolution artifacts are supplied in the work
-directory. These are pipeline gates, not optional CLI modes. Reconciliation is
-fixed to one pass and the eval corpus is a developer harness, not a production
-control.
+Reconciliation is fixed to one pass and the eval corpus is a developer harness,
+not a production control.
 
 ## Production controls
 
