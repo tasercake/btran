@@ -30,6 +30,15 @@ invocation failures prevent EPUB output and return a nonzero exit status.
 Reconciliation is fixed to one pass and the eval corpus is a developer harness,
 not a production control.
 
+## Timing reports
+
+Every DAG stage is measured with a monotonic clock. On completion, the CLI prints
+one `btran timing_ms` line containing the aggregate and per-stage durations. The
+same values are persisted as each stage record's `duration_ms` plus
+`total_stage_duration_ms` in `WORKSPACE/reports/RUN_ID.json`. Timings are
+execution metadata: they do not affect cache keys, content artifacts, or revision
+selection.
+
 ## Production controls
 
 - `--manifest-path PATH` selects a manifest explicitly. Without it, the runner

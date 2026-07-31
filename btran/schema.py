@@ -298,6 +298,9 @@ class StageRecord(CanonicalRecord):
     output_artifact_ids: tuple[str, ...] = ()
     finding_ids: tuple[str, ...] = ()
     stage_summary_finding_id: str = ""
+    # Execution metadata only: measured with a monotonic clock and excluded
+    # from semantic pipeline artifact identities.
+    duration_ms: float = 0.0
     _schema_name: ClassVar[str] = "stage_record"
 
     def _validate(self) -> None:
@@ -310,6 +313,17 @@ class StageRecord(CanonicalRecord):
         _identifier(self.stage_summary_finding_id, "stage_summary_finding_id")
         if self.stage_summary_finding_id not in finding_ids:
             raise SchemaError("completed/degraded stage must retain its stage_summary finding")
+        if (isinstance(self.duration_ms, bool) or not isinstance(self.duration_ms, (int, float))
+                or not math.isfinite(self.duration_ms) or self.duration_ms < 0):
+            raise SchemaError("stage duration_ms must be a finite non-negative number")
+        self.duration_ms = float(self.duration_ms)
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]):
+        # Reports written before timing instrumentation remain inspectable.
+        data = dict(data)
+        data.setdefault("duration_ms", 0.0)
+        return super().from_dict(data)
 
 
 @dataclass
@@ -760,6 +774,7 @@ class RunReport(CanonicalRecord):
     active_revision_id: str | None = None
     final_epub_status: str = ""
     stage_records: tuple[StageRecord, ...] = ()
+    total_stage_duration_ms: float = 0.0
     _schema_name: ClassVar[str] = "run_report"
 
     def _validate(self) -> None:
@@ -812,12 +827,27 @@ class RunReport(CanonicalRecord):
         self.stage_records = tuple(records)
         if len(set(stages)) != len(stages):
             raise SchemaError("run report stage records must have unique stages")
+        if (isinstance(self.total_stage_duration_ms, bool)
+                or not isinstance(self.total_stage_duration_ms, (int, float))
+                or not math.isfinite(self.total_stage_duration_ms)
+                or self.total_stage_duration_ms < 0):
+            raise SchemaError("total_stage_duration_ms must be a finite non-negative number")
+        expected_total = round(sum(record.duration_ms for record in records), 3)
+        if round(float(self.total_stage_duration_ms), 3) != expected_total:
+            raise SchemaError("total_stage_duration_ms must equal the sum of stage durations")
+        self.total_stage_duration_ms = expected_total
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]):
         data = dict(data)
-        if isinstance(data.get("stage_records"), list):
-            data["stage_records"] = tuple(StageRecord.from_dict(item) for item in data["stage_records"])
+        raw_records = data.get("stage_records", ())
+        if "total_stage_duration_ms" not in data and isinstance(raw_records, (list, tuple)):
+            data["total_stage_duration_ms"] = round(sum(
+                float(item.get("duration_ms", 0.0)) if isinstance(item, Mapping) else float(item.duration_ms)
+                for item in raw_records
+            ), 3)
+        if isinstance(raw_records, list):
+            data["stage_records"] = tuple(StageRecord.from_dict(item) for item in raw_records)
         return super().from_dict(data)
 
 
