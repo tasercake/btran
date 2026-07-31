@@ -13,6 +13,7 @@ from btran.cli import main, resolve_base_run_pointers
 from btran.config import Config
 from btran.manifest import InvocationFailure
 from btran.orchestrator_contract import RunResult
+from btran.schema import RunReport, StageRecord
 
 
 def _config(tmp_path: Path, **overrides: object) -> Config:
@@ -37,15 +38,20 @@ def test_default_pointers_are_resolved_from_workspace(tmp_path):
     assert resolve_base_run_pointers(tmp_path, "explicit", "other") == ("explicit", "other")
 
 
-def test_cli_reports_modes_and_degraded_completion_without_failure_exit(tmp_path, capsys):
+def test_cli_reports_modes_degraded_completion_and_stage_timings(tmp_path, capsys):
     config = _config(tmp_path)
-    runner = AsyncMock(return_value=_result("completed_degraded"))
+    stage = StageRecord(stage="discovery", finding_ids=("summary",),
+                        stage_summary_finding_id="summary", duration_ms=2.5)
+    report = RunReport(run_id="run-1", final_epub_status="completed_degraded",
+                       stage_records=(stage,), total_stage_duration_ms=2.5)
+    runner = AsyncMock(return_value=RunResult(errors=[], status="completed_degraded", report=report))
     with patch("btran.cli.load_config", return_value=config), patch("btran.cli.orchestrator_run", new=runner):
         main()
     runner.assert_awaited_once()
     output = capsys.readouterr().out
     assert "mode=native" in output
     assert "status=completed_degraded" in output
+    assert "btran timing_ms total=2.500 discovery=2.500" in output
 
 
 def test_cli_invocation_failure_prints_typed_diagnostic_and_exits_one(tmp_path, capsys):

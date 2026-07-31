@@ -10,6 +10,7 @@ import asyncio
 import json
 import re
 import sys
+import time
 import uuid
 import zipfile
 from dataclasses import replace
@@ -118,7 +119,7 @@ class _CoreExecutor:
         self.cache_events: list[CacheEvent] = []
         self.report = initialized_report(run_id=uuid.uuid4().hex, mode=config.mode, selected=selected)
 
-    def _record(self, inputs: StageInputs, outputs: StageOutputs) -> StageRecord:
+    def _record(self, inputs: StageInputs, outputs: StageOutputs, *, duration_ms: float) -> StageRecord:
         """Publish StageRecord only after every named artifact/finding/edge exists."""
         for artifact_id in (*inputs.input_artifact_ids, *outputs.output_artifact_ids):
             self.store.get(artifact_id)
@@ -135,7 +136,8 @@ class _CoreExecutor:
                              input_artifact_ids=inputs.input_artifact_ids,
                              output_artifact_ids=outputs.output_artifact_ids,
                              finding_ids=outputs.finding_ids,
-                             stage_summary_finding_id=summary.finding_id)
+                             stage_summary_finding_id=summary.finding_id,
+                             duration_ms=duration_ms)
         # Stage records are immutable artifacts too.  Their dependency closure
         # makes a later candidate able to select exact prior stage evidence.
         self.store.put("StageRecord", record.to_dict(),
@@ -143,14 +145,20 @@ class _CoreExecutor:
                        finding_ids=record.finding_ids, semantic_key=_stage_key(record))
         self.records.append(record)
         self.cache_events.extend(outputs.cache_events)
-        self.report = replace(self.report, stage_records=tuple(self.records),
-                              cache_events=tuple(event.to_dict() for event in self.cache_events))
+        self.report = replace(
+            self.report,
+            stage_records=tuple(self.records),
+            total_stage_duration_ms=round(sum(item.duration_ms for item in self.records), 3),
+            cache_events=tuple(event.to_dict() for event in self.cache_events),
+        )
         return record
 
     async def stage(self, name: str, inputs: StageInputs,
                     runner: Callable[[StageInputs], StageOutputs | Awaitable[StageOutputs]]) -> StageOutputs:
+        started_ns = time.perf_counter_ns()
         outputs = await StageContract(name, runner).execute(inputs)
-        self._record(inputs, outputs)
+        duration_ms = round((time.perf_counter_ns() - started_ns) / 1_000_000, 3)
+        self._record(inputs, outputs, duration_ms=duration_ms)
         return outputs
 
 
@@ -938,7 +946,8 @@ async def _finalize(config: Config, core: RunResult) -> RunResult:
         correction_execution_projection_plan_ids=execution_impact_ids, refresh_attempt_ids=refresh_attempt_ids,
         selected_base_revision_id=None if selected.base_revision_id == "unsealed" else selected.base_revision_id,
         candidate_revision_id=revision_id, active_revision_id=selected.active_revision_id,
-        final_epub_status="completed_degraded" if completed_degraded else rendering.value.status, stage_records=tuple(executor.records))
+        final_epub_status="completed_degraded" if completed_degraded else rendering.value.status,
+        stage_records=tuple(executor.records), total_stage_duration_ms=executor.report.total_stage_duration_ms)
     report_path = _write_report(workspace, report)
     store.put("RunReport", report.to_dict(), dependency_ids=(sealing.output_artifact_ids[0],), semantic_key=tagged_sha256("run-report-v1", report.to_json().encode("utf-8")))
     return RunResult(core.errors, status="completed_degraded" if completed_degraded else "completed",

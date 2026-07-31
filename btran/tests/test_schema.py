@@ -192,18 +192,51 @@ class TestCanonicalSchemas:
         with pytest.raises(SchemaError):
             Finding(kind="uncertainty", severity="warning", stage="extract", requires_action=True)
 
-    def test_run_report_preserves_nested_stage_records(self):
+    def test_run_report_preserves_nested_stage_records_and_timings(self):
         stage = StageRecord(
             stage="extract", finding_ids=("finding-summary",),
-            stage_summary_finding_id="finding-summary",
+            stage_summary_finding_id="finding-summary", duration_ms=12.345,
         )
         report = RunReport(
             run_id="run-1", final_epub_status="completed", stage_records=(stage,),
+            total_stage_duration_ms=12.345,
         )
         restored = RunReport.from_json(report.to_json())
         assert restored == report
         assert isinstance(restored.stage_records[0], StageRecord)
         assert restored.stage_records == (stage,)
+        assert restored.total_stage_duration_ms == 12.345
+
+        with pytest.raises(SchemaError, match="duration_ms"):
+            StageRecord(
+                stage="extract", finding_ids=("finding-summary",),
+                stage_summary_finding_id="finding-summary", duration_ms=-1,
+            )
+        with pytest.raises(SchemaError, match="sum of stage durations"):
+            RunReport(
+                run_id="run-1", final_epub_status="completed", stage_records=(stage,),
+                total_stage_duration_ms=1,
+            )
+
+    def test_pre_timing_stage_records_and_reports_remain_readable(self):
+        stage = StageRecord(
+            stage="extract", finding_ids=("finding-summary",),
+            stage_summary_finding_id="finding-summary",
+        )
+        old_stage = stage.to_dict()
+        old_stage.pop("duration_ms")
+        restored_stage = StageRecord.from_dict(old_stage)
+        assert restored_stage.duration_ms == 0.0
+
+        report = RunReport(
+            run_id="run-1", final_epub_status="completed", stage_records=(stage,),
+        )
+        old_report = report.to_dict()
+        old_report.pop("total_stage_duration_ms")
+        old_report["stage_records"][0].pop("duration_ms")
+        restored_report = RunReport.from_dict(old_report)
+        assert restored_report.total_stage_duration_ms == 0.0
+        assert restored_report.stage_records[0].duration_ms == 0.0
 
     def test_correction_impact_regenerated_is_empty_until_execution_phase(self):
         entry = {"stage": "translation", "subject_id": "segment-1", "base_artifact_id": "artifact-1"}

@@ -1,6 +1,7 @@
 """Task 13 core-executor contracts (finalization belongs to Task 14)."""
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 import zipfile
@@ -66,7 +67,9 @@ async def test_executor_persists_stage_records_and_finalizes_in_fixed_order(tmp_
     _image(cfg.input_dir / "z.png", (2, 3, 4))
     _image(cfg.input_dir / "a.png", (1, 2, 3))
     sources = [_source(cfg.input_dir / "a.png", 1), _source(cfg.input_dir / "z.png", 2)]
-    with patch("btran.source_extractor.extract_page", AsyncMock(side_effect=sources)):
+    clock_ticks = iter(range(0, 21_000_000, 1_000_000))
+    with patch("btran.source_extractor.extract_page", AsyncMock(side_effect=sources)), \
+         patch("btran.orchestrator.time.perf_counter_ns", side_effect=lambda: next(clock_ticks)):
         result = await orchestrator_run(cfg)
 
     assert result.status == "completed"
@@ -78,7 +81,12 @@ async def test_executor_persists_stage_records_and_finalizes_in_fixed_order(tmp_
         "reconciliation", "validation", "rendering", "candidate_seal",
     ]
     assert all(record.stage_summary_finding_id in record.finding_ids for record in result.report.stage_records)
+    assert [record.duration_ms for record in result.report.stage_records] == [1.0] * 10
+    assert result.report.total_stage_duration_ms == 10.0
     assert result.report.final_epub_status == "completed"
+    persisted_report = json.loads(Path(result.report_path).read_text(encoding="utf-8"))
+    assert persisted_report["total_stage_duration_ms"] == 10.0
+    assert [item["duration_ms"] for item in persisted_report["stage_records"]] == [1.0] * 10
     assert cfg.output_epub.exists()
     assert len(result.provenance) == 2
     assert all(item.source_artifact_id and item.effective_source_artifact_id and item.effective_target_artifact_id

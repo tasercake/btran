@@ -102,6 +102,29 @@ def _print_summary(result: RunResult, status: str) -> None:
     )
 
 
+def _print_timing_summary(result: RunResult) -> None:
+    """Print one compact line; the durable report retains full timing data."""
+    records = _result_field(result, "stage_records", ()) or ()
+    reported_total = _result_field(result, "total_stage_duration_ms", None)
+    if not records:
+        if isinstance(reported_total, (int, float)) and not isinstance(reported_total, bool):
+            print(f"btran timing_ms total={float(reported_total):.3f}")
+        return
+    values: list[tuple[str, float]] = []
+    for record in records:
+        if isinstance(record, dict):
+            stage, duration = record.get("stage"), record.get("duration_ms")
+        else:
+            stage, duration = getattr(record, "stage", None), getattr(record, "duration_ms", None)
+        if isinstance(stage, str) and isinstance(duration, (int, float)) and not isinstance(duration, bool):
+            values.append((stage, float(duration)))
+    if not values:
+        return
+    total = reported_total if reported_total is not None else round(sum(value for _, value in values), 3)
+    details = " ".join(f"{stage}={duration:.3f}" for stage, duration in values)
+    print(f"btran timing_ms total={float(total):.3f} {details}")
+
+
 def _correction_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="btran immutable correction commands")
     top = parser.add_subparsers(dest="area", required=True)
@@ -220,6 +243,7 @@ def main() -> None:
     if status == "invocation_failed":
         _print_invocation_failure(result)
     _print_summary(result, status)
+    _print_timing_summary(result)
     if status == "invocation_failed":
         raise SystemExit(1)
     # Completed/completed_degraded are success paths.  No content-quality or
