@@ -1,4 +1,4 @@
-"""Configuration and finite process policy for btran runs."""
+"""Configuration and bounded utility-process policy for btran runs."""
 
 from __future__ import annotations
 
@@ -38,6 +38,7 @@ class Config:
     target_lang: str | None = None
     concurrency: int = 4
     max_retries: int = 3
+    # Deadline for terminology consolidation and EPUBCheck only. Model calls have none.
     timeout: int = 120
     # ``workspace`` is new authority.  ``intermediate_dir`` remains a narrow
     # migration alias for callers of the old CLI surface.
@@ -68,13 +69,6 @@ class Config:
     def retry_backoffs(self) -> tuple[int, ...]:
         return tuple(min(2 ** attempt, 16) for attempt in range(self.max_retries))
 
-    @property
-    def max_leaf_seconds(self) -> int:
-        """Hard upper bound for one external leaf, including cleanup/backoff."""
-        return ((self.max_retries + 1) * (
-            self.timeout + PROCESS_TERMINATE_GRACE_SECONDS + PROCESS_KILL_GRACE_SECONDS
-        )) + sum(self.retry_backoffs)
-
 
 @dataclass(frozen=True)
 class WorkspaceResolution:
@@ -91,7 +85,7 @@ class WorkspaceResolutionError(ValueError):
 
 
 def validate_timeout_seconds(value: object) -> int:
-    """Enforce Config's integer-only external-process timeout contract."""
+    """Enforce deadline used by bounded non-model utility subprocesses."""
     if (isinstance(value, bool) or not isinstance(value, int)
             or not TIMEOUT_SECONDS_MINIMUM <= value <= TIMEOUT_SECONDS_MAXIMUM):
         raise ValueError(
@@ -281,7 +275,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", default=None)
     parser.add_argument("--concurrency", type=int, default=None)
     parser.add_argument("--max-retries", type=int, default=None)
-    parser.add_argument("--timeout", type=int, default=None)
+    parser.add_argument(
+        "--timeout", type=int, default=None, metavar="SECONDS",
+        help="Deadline for terminology consolidation and EPUBCheck; Pi extraction and translation have no deadline.",
+    )
     parser.add_argument("--intermediate-dir", default=None)
     parser.add_argument("--title", default=None)
     parser.add_argument("--author", default=None)

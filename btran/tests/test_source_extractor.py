@@ -3,9 +3,6 @@
 import asyncio
 import json
 import os
-import signal
-import sys
-import time
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -161,16 +158,20 @@ class TestExtractPage:
                 await extract_page(Path("page.png"), "model", "a" * 64, "b" * 16, 1)
 
     @pytest.mark.asyncio
-    async def test_pi_command_is_one_bounded_vision_call(self):
-        """Extraction makes one --no-session Pi call with its image attachment and timeout."""
+    async def test_pi_command_awaits_communicate_without_execution_deadline(self):
+        """Extraction awaits Pi directly; only cancellation triggers process cleanup."""
         from btran.source_extractor import EXTRACTION_PROMPT, extract_page
 
-        exec_mock = AsyncMock(return_value=_make_mock_proc(stdout=_VALID_OUTPUT))
-        with patch("btran.source_extractor.asyncio.create_subprocess_exec", exec_mock):
+        proc = _make_mock_proc(stdout=_VALID_OUTPUT)
+        exec_mock = AsyncMock(return_value=proc)
+        with patch("btran.source_extractor.asyncio.create_subprocess_exec", exec_mock), \
+             patch("btran.source_extractor.asyncio.wait_for", side_effect=AssertionError("execution deadline used")):
             await extract_page(
                 Path("/photos/p1.png"), "gemini-vision", "a" * 64, "b" * 16, 1,
-                pi_bin="/bin/pi", timeout=3,
+                pi_bin="/bin/pi",
             )
+
+        proc.communicate.assert_awaited_once_with()
 
         args, kwargs = exec_mock.call_args
         assert args[:2] == ("/bin/pi", "-p")
@@ -187,39 +188,6 @@ class TestExtractPage:
         assert kwargs["stdin"] is asyncio.subprocess.DEVNULL
         assert kwargs["stdout"] is asyncio.subprocess.PIPE
         assert kwargs["start_new_session"] is (os.name == "posix")
-
-    @pytest.mark.asyncio
-    async def test_timeout_kills_and_reaps_pi_process(self):
-        """A timed-out Pi subprocess cannot survive as an orphan."""
-        from btran.source_extractor import ExtractionError, extract_page
-
-        class HangingProcess:
-            def __init__(self):
-                self._never = asyncio.Event()
-                self.terminate = Mock(side_effect=self._never.set)
-                self.kill = Mock()
-                self.pid = 123
-                self.returncode = None
-
-            async def communicate(self):
-                await self._never.wait()
-                return b"", b""
-
-        proc = HangingProcess()
-        from btran.process_cleanup import _ProcessRef
-        with patch(
-            "btran.source_extractor.asyncio.create_subprocess_exec",
-            AsyncMock(return_value=proc),
-        ), patch("btran.process_cleanup._proc_ref", return_value=_ProcessRef(123, 1)), \
-             patch("btran.process_cleanup._signal_group", return_value=False), \
-             patch("btran.process_cleanup.os.kill"):
-            with pytest.raises(ExtractionError, match="timed out"):
-                await extract_page(
-                    Path("page.png"), "model", "a" * 64, "b" * 16, 1, timeout=1
-                )
-
-        proc.terminate.assert_called_once_with()
-        proc.kill.assert_called_once_with()
 
     @pytest.mark.asyncio
     async def test_cancellation_kills_and_reaps_pi_process(self):
@@ -258,76 +226,6 @@ class TestExtractPage:
 
         proc.terminate.assert_called_once_with()
         proc.kill.assert_called_once_with()
-
-    @pytest.mark.asyncio
-    @pytest.mark.skipif(os.name != "posix", reason="requires /proc POSIX process cleanup")
-    async def test_timeout_kills_detached_setsid_pipe_holder(self, tmp_path):
-        """Extraction cleanup finds wrapper child after it escapes session."""
-        from btran.source_extractor import ExtractionError, extract_page
-
-        pid_path = tmp_path / "escaped.pid"
-        child_source = (
-            "import os, signal, time\n"
-            "os.setsid()\n"
-            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
-            "while True: time.sleep(.1)\n"
-        )
-        worker = tmp_path / "fake-pi"
-        worker.write_text(
-            f"#!{sys.executable}\n"
-            "import signal, subprocess, sys, time\n"
-            f"child=subprocess.Popen([sys.executable, '-c', {child_source!r}])\n"
-            f"open({str(pid_path)!r}, 'w').write(str(child.pid))\n"
-            "signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))\n"
-            "while True: time.sleep(.1)\n",
-            encoding="utf-8",
-        )
-        worker.chmod(0o755)
-        child_pid: int | None = None
-        try:
-            with pytest.raises(ExtractionError, match="timed out"):
-                await extract_page(Path("page.png"), "model", "a" * 64, "b" * 16, 1,
-                                   pi_bin=str(worker), timeout=1)
-            child_pid = int(pid_path.read_text(encoding="utf-8"))
-            deadline = time.monotonic() + 2
-            while time.monotonic() < deadline:
-                try:
-                    os.kill(child_pid, 0)
-                except ProcessLookupError:
-                    break
-                await asyncio.sleep(.01)
-            else:
-                pytest.fail("detached extraction pipe holder survived cleanup")
-        finally:
-            if child_pid is not None:
-                try:
-                    os.kill(child_pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-
-    @pytest.mark.asyncio
-    async def test_negative_timeout_rejected_before_spawning_pi(self):
-        from btran.source_extractor import ExtractionError, extract_page
-
-        exec_mock = AsyncMock()
-        with patch("btran.source_extractor.asyncio.create_subprocess_exec", exec_mock):
-            with pytest.raises(ExtractionError, match="between 1 and 3600"):
-                await extract_page(
-                    Path("page.png"), "model", "a" * 64, "b" * 16, 1, timeout=-1
-                )
-
-        exec_mock.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_zero_timeout_is_rejected_before_spawning_pi(self):
-        from btran.source_extractor import ExtractionError, extract_page
-
-        exec_mock = AsyncMock()
-        with patch("btran.source_extractor.asyncio.create_subprocess_exec", exec_mock):
-            with pytest.raises(ExtractionError, match="between 1 and 3600"):
-                await extract_page(Path("page.png"), "model", "a" * 64, "b" * 16, 1, timeout=0)
-
-        exec_mock.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_group_signal_lookup_failure_still_directly_kills_and_reaps_child(self, monkeypatch):
@@ -526,13 +424,7 @@ class TestPersistedRawLeaves:
         )
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize(("timeout", "max_retries", "error"), [
-        (0, 3, "timeout must be finite and between 1 and 3600"),
-        (1, 6, "max_retries must be an integer between 0 and 5"),
-    ])
-    async def test_invalid_run_bounds_reject_before_decode_failure_fallback(
-        self, tmp_path, timeout, max_retries, error,
-    ):
+    async def test_invalid_retry_bound_rejects_before_decode_failure_fallback(self, tmp_path):
         from hashlib import sha256
 
         from btran.artifacts import ArtifactStore
@@ -542,12 +434,11 @@ class TestPersistedRawLeaves:
         raw = b"undecodable accepted input"
         digest = sha256(raw).hexdigest()
         store = ArtifactStore(tmp_path / "state")
-        with pytest.raises(ExtractionError, match=error):
+        with pytest.raises(ExtractionError, match="max_retries must be an integer between 0 and 5"):
             await extract_raw_pages([
                 RawPageInput(page_id_for_raw_sha256(digest), tmp_path / "missing.png", digest,
                              raw_bytes=raw)
-            ], store=store, workspace=tmp_path / "state", model="vision", timeout=timeout,
-               max_retries=max_retries)
+            ], store=store, workspace=tmp_path / "state", model="vision", max_retries=6)
 
         assert not list(store.artifacts_dir.iterdir())
         assert not list(store.findings_dir.iterdir())
