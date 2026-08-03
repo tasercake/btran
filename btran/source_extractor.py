@@ -6,7 +6,6 @@ import asyncio
 import hashlib
 import html
 import json
-import math
 import os
 import tempfile
 from dataclasses import asdict, dataclass
@@ -206,10 +205,9 @@ def parse_extraction(
 
 
 async def _extract_page_attempt(
-    image_path: Path, model: str, sha256: str, phash: str, page_number: int,
-    *, pi_bin: str, timeout: float,
+    image_path: Path, model: str, sha256: str, phash: str, page_number: int, *, pi_bin: str,
 ) -> PageExtraction:
-    """One bounded process attempt; retry policy lives in ``extract_page``."""
+    """One Pi attempt; retry policy lives in ``extract_page``."""
     proc: asyncio.subprocess.Process | None = None
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -220,11 +218,7 @@ async def _extract_page_attempt(
             stderr=asyncio.subprocess.PIPE, env={**os.environ, "PI_OFFLINE": "0"},
             start_new_session=os.name == "posix",
         )
-        stdout_bytes, stderr_bytes = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-    except asyncio.TimeoutError:
-        if proc is not None:
-            await _kill_and_reap(proc)
-        raise ExtractionError(f"pi timed out after {timeout}s") from None
+        stdout_bytes, stderr_bytes = await proc.communicate()
     except asyncio.CancelledError:
         if proc is not None:
             await _kill_and_reap(proc)
@@ -244,11 +238,8 @@ async def _extract_page_attempt(
                             phash=phash, page_number=page_number)
 
 
-def _validate_extraction_bounds(timeout: float, max_retries: int) -> None:
-    """Reject invalid execution policy before any page work or fallback."""
-    if (isinstance(timeout, bool) or not isinstance(timeout, (int, float))
-            or not math.isfinite(timeout) or not 1 <= timeout <= 3600):
-        raise ExtractionError("timeout must be finite and between 1 and 3600")
+def _validate_extraction_bounds(max_retries: int) -> None:
+    """Reject invalid retry policy before any page work or fallback."""
     if (isinstance(max_retries, bool) or not isinstance(max_retries, int)
             or not 0 <= max_retries <= 5):
         raise ExtractionError("max_retries must be an integer between 0 and 5")
@@ -256,19 +247,18 @@ def _validate_extraction_bounds(timeout: float, max_retries: int) -> None:
 
 async def extract_page(
     image_path: Path, model: str, sha256: str, phash: str, page_number: int,
-    pi_bin: str = "pi", timeout: int = 120, max_retries: int = 0,
+    pi_bin: str = "pi", max_retries: int = 0,
 ) -> PageExtraction:
-    """Extract one page with finite attempts and deterministic backoff.
+    """Extract one page with retries and deterministic backoff.
 
-    The default retains legacy one-call behavior.  Stage callers pass Config's
-    ``max_retries``; every retry gets a fresh full useful-execution timeout.
+    Pi execution has no deadline. Stage callers pass Config's ``max_retries``.
     """
-    _validate_extraction_bounds(timeout, max_retries)
+    _validate_extraction_bounds(max_retries)
     last_error: ExtractionError | None = None
     for attempt in range(max_retries + 1):
         try:
             return await _extract_page_attempt(image_path, model, sha256, phash, page_number,
-                                               pi_bin=pi_bin, timeout=timeout)
+                                               pi_bin=pi_bin)
         except asyncio.CancelledError:
             raise
         except ExtractionError as exc:
@@ -545,7 +535,7 @@ def empty_input_diagnostic_raw_run(*, store: ArtifactStore, base_revision_id: st
 
 async def extract_raw_pages(
     pages: Iterable[RawPageInput], *, store: ArtifactStore, workspace: Path, model: str,
-    pi_bin: str = "pi", timeout: int = 120, max_retries: int = 3,
+    pi_bin: str = "pi", max_retries: int = 3,
     model_executable_identity: str | None = None, base_revision_id: str = "unsealed",
     concurrency: int = 1, selected_snapshot: RevisionSnapshot | None = None,
     selected_page_artifact_ids: Mapping[str, str] | None = None,
@@ -555,9 +545,9 @@ async def extract_raw_pages(
     Failures return ``DiagnosticSourceFallback`` only.  This deliberately does
     not construct ``EffectiveSegment``/``EffectivePage`` or apply overlays.
     """
-    # Policy errors are run errors, never per-page diagnostic fallbacks.  Do
+    # Policy errors are run errors, never per-page diagnostic fallbacks. Do
     # this before reading/decoding any page so malformed input cannot mask them.
-    _validate_extraction_bounds(timeout, max_retries)
+    _validate_extraction_bounds(max_retries)
     if not isinstance(concurrency, int) or isinstance(concurrency, bool) or not 1 <= concurrency <= 32:
         raise ExtractionError("concurrency must be an integer between 1 and 32")
     page_list = tuple(pages)
@@ -671,7 +661,7 @@ async def extract_raw_pages(
                     return reused, CacheEvent("source_extraction", page.page_id, "hit", reused.page_artifact_id, key)
                 extraction = await extract_page(model_image_path, model, page.raw_file_sha256,
                                                 page.phash or "0", page.page_number, pi_bin=pi_bin,
-                                                timeout=timeout, max_retries=max_retries)
+                                                max_retries=max_retries)
                 roots = canonical_root_segments(page.page_id, [
                     {"kind": block.type, "reading_order": block.reading_order + 1,
                      "source_text": block.text, "source_lang": extraction.source_lang}

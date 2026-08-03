@@ -184,19 +184,16 @@ async def _reap_process(proc: asyncio.subprocess.Process) -> None:
                                 kill_grace=_CLEANUP_TIMEOUT_SECONDS)
 
 
-def _validate_translation_bounds(timeout: int, max_retries: int | None = None) -> None:
-    """Match Config's finite leaf timeout/retry policy before any model call."""
-    if isinstance(timeout, bool) or not isinstance(timeout, int) or not 1 <= timeout <= 3600:
-        raise TranslationError("timeout must be an integer between 1 and 3600")
+def _validate_translation_bounds(max_retries: int | None = None) -> None:
+    """Validate optional retry policy before model work."""
     if max_retries is not None and (
         isinstance(max_retries, bool) or not isinstance(max_retries, int) or not 0 <= max_retries <= 5
     ):
         raise TranslationError("max_retries must be an integer between 0 and 5")
 
 
-async def _pi_json(prompt: str, *, model: str, pi_bin: str, timeout: int) -> object:
+async def _pi_json(prompt: str, *, model: str, pi_bin: str) -> object:
     """Run one isolated text-only Pi request; shared by page migration and Task 10."""
-    _validate_translation_bounds(timeout)
     proc: asyncio.subprocess.Process | None = None
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -206,11 +203,7 @@ async def _pi_json(prompt: str, *, model: str, pi_bin: str, timeout: int) -> obj
             stderr=asyncio.subprocess.PIPE, env={**os.environ, "PI_OFFLINE": "0"},
             start_new_session=os.name == "posix",
         )
-        stdout_bytes, stderr_bytes = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-    except asyncio.TimeoutError:
-        if proc is not None:
-            await _reap_process(proc)
-        raise TranslationError(f"pi timed out after {timeout}s") from None
+        stdout_bytes, stderr_bytes = await proc.communicate()
     except asyncio.CancelledError:
         if proc is not None:
             await _reap_process(proc)
@@ -228,19 +221,14 @@ async def _pi_json(prompt: str, *, model: str, pi_bin: str, timeout: int) -> obj
 
 
 async def translate_blocks(
-    extraction: PageExtraction, glossary: TerminologyMap, *, model: str, pi_bin: str = "pi", timeout: int = 120,
+    extraction: PageExtraction, glossary: TerminologyMap, *, model: str, pi_bin: str = "pi",
     previous_page: PageExtraction | None = None, next_page: PageExtraction | None = None,
 ) -> list[TranslatedBlock]:
     """Translate legacy page blocks independently with adjacent source excerpts."""
     context = _translation_context(extraction, glossary, previous_page, next_page)
     prompt = TRANSLATION_PROMPT.format(source_lang=extraction.source_lang, target_lang=glossary.target_lang,
                                        context=json.dumps(context, ensure_ascii=False))
-    try:
-        data = await _pi_json(prompt, model=model, pi_bin=pi_bin, timeout=timeout)
-    except TranslationError as exc:
-        if "timed out" in str(exc):
-            raise TranslationError(f"pi timed out after {timeout}s for page {extraction.page_number}") from None
-        raise
+    data = await _pi_json(prompt, model=model, pi_bin=pi_bin)
     return _translated_blocks(data, [block.id for block in extraction.blocks])
 
 
@@ -478,7 +466,7 @@ def _mapping_rows(
 async def translate_segment(
     segment: EffectiveSegment, *, target_lang: str, projections: Sequence[Mapping[str, Any]] = (),
     previous: EffectiveSegment | None = None, following: EffectiveSegment | None = None,
-    model: str, pi_bin: str = "pi", timeout: int = 120, max_retries: int = 3,
+    model: str, pi_bin: str = "pi", max_retries: int = 3,
 ) -> str:
     """Translate exactly focal effective source; neighbors are context-only source records."""
     if segment.source_lang is None:
@@ -490,13 +478,13 @@ async def translate_segment(
         "projections": [{key: item[key] for key in ("projection_id", "concept_id", "selector_occurrence_ids", "target_form", "correction_id")}
                         for item in projections],
     }
-    _validate_translation_bounds(timeout, max_retries)
+    _validate_translation_bounds(max_retries)
     prompt = SEGMENT_TRANSLATION_PROMPT.format(source_lang=segment.source_lang, target_lang=target_lang,
                                                 context=canonical_json(context))
     last: TranslationError | None = None
     for attempt in range(max_retries + 1):
         try:
-            data = await _pi_json(prompt, model=model, pi_bin=pi_bin, timeout=timeout)
+            data = await _pi_json(prompt, model=model, pi_bin=pi_bin)
             if not isinstance(data, dict) or set(data) != {"translated_text"} or not isinstance(data["translated_text"], str):
                 raise TranslationError("pi output violates segment translation response schema")
             return data["translated_text"]
@@ -532,7 +520,7 @@ def _put_target_assessment(
 async def materialize_effective_target(
     effective_source: Any, terminology: Any = (), *, store: ArtifactStore, graph: DependencyGraph,
     mode: str, target_lang: str | None = None, target_overlays: Any = (), model: str = "translation",
-    model_executable_identity: str | None = None, pi_bin: str = "pi", timeout: int = 120,
+    model_executable_identity: str | None = None, pi_bin: str = "pi",
     base_revision_id: str = "unsealed", segment_translator: Callable[..., Any] | None = None,
     translation_call: Callable[[Mapping[str, Any]], Any] | None = None, max_retries: int = 3,
     selected_snapshot: RevisionSnapshot | None = None,
@@ -543,7 +531,7 @@ async def materialize_effective_target(
     Local target overlays read their exact translation base and bypass model calls.
     Native mode never touches terminology inputs or invokes a translator.
     """
-    _validate_translation_bounds(timeout, max_retries)
+    _validate_translation_bounds(max_retries)
     if not isinstance(store, ArtifactStore) or not isinstance(graph, DependencyGraph):
         raise TranslationError("target materialization requires ArtifactStore and DependencyGraph")
     if mode not in {"native", "translated"}:
@@ -745,7 +733,7 @@ async def materialize_effective_target(
                             raise TranslationError("translation_call confidence must be between 0 and 1")
                     elif segment_translator is None:
                         translated_text = await translate_segment(segment, target_lang=target_lang or "", projections=selected,
-                            previous=previous, following=following, model=model, pi_bin=pi_bin, timeout=timeout,
+                            previous=previous, following=following, model=model, pi_bin=pi_bin,
                             max_retries=max_retries)
                     else:
                         answer = segment_translator(segment=segment, target_lang=target_lang, projections=selected,

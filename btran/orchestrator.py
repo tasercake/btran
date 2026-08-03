@@ -398,7 +398,7 @@ async def _run_core(config: Config, on_page_error: PageErrorCallback | None = No
         result = (empty_input_diagnostic_raw_run(store=store, base_revision_id=selected.base_revision_id)
                   if empty_input else await extract_raw_pages(
                       raw_inputs, store=store, workspace=workspace, model=config.model,
-                      pi_bin=config.pi_bin, timeout=config.timeout, max_retries=config.max_retries,
+                      pi_bin=config.pi_bin, max_retries=config.max_retries,
                       base_revision_id=selected.base_revision_id, concurrency=config.concurrency,
                       selected_snapshot=selected_leaf_snapshot,
                       selected_page_artifact_ids=selected_source_leaf_ids))
@@ -515,7 +515,7 @@ async def _run_core(config: Config, on_page_error: PageErrorCallback | None = No
             result = await materialize_effective_target(effective_source_run, terminology_run, store=store, graph=graph,
                                                         mode=config.mode, target_lang=config.target_lang,
                                                         target_overlays=overlays, model=config.model, pi_bin=config.pi_bin,
-                                                        timeout=config.timeout, max_retries=config.max_retries,
+                                                        max_retries=config.max_retries,
                                                         base_revision_id=selected.base_revision_id,
                                                         selected_snapshot=selected_leaf_snapshot,
                                                         selected_translation_artifact_ids=selected_translation_leaf_ids)
@@ -531,7 +531,7 @@ async def _run_core(config: Config, on_page_error: PageErrorCallback | None = No
             result = await materialize_effective_target(effective_source_run, (), store=store, graph=graph,
                                                         mode=config.mode, target_lang=config.target_lang,
                                                         target_overlays=(), model=config.model, pi_bin=config.pi_bin,
-                                                        timeout=config.timeout, max_retries=config.max_retries,
+                                                        max_retries=config.max_retries,
                                                         base_revision_id=selected.base_revision_id,
                                                         segment_translator=fail_translation)
             status = "degraded"

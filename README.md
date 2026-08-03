@@ -51,10 +51,11 @@ selection.
 - `--embed-images` embeds original page images in the generated EPUB.
 - `--no-resume` bypasses the work-owned translation cache for this run.
 
-Resource minimums: concurrency is 1, while `--max-retries` and `--timeout` are 0.
-These controls have no configured upper bounds. A timeout of 0 disables the
-request deadline; zero retries still performs the initial attempt. `--pi-bin`
-selects the `pi` executable used by the model leaves.
+`--max-retries` is 0–5; zero still performs the initial model attempt.
+`--timeout` is 1–3600 seconds and bounds terminology consolidation and
+EPUBCheck only. Source extraction and translation Pi calls have no execution
+deadline; they run until exit, failure, or parent-task cancellation. `--pi-bin`
+selects the `pi` executable used by model leaves.
 
 ## Deterministic eval corpus
 

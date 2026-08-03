@@ -61,10 +61,10 @@ def test_finite_process_bounds_are_rejected_at_parse_time(clean_cwd, flag, value
     assert exc.value.code == 2
 
 
-def test_finite_process_policy_is_centralized(clean_cwd):
+def test_timeout_remains_available_for_bounded_utility_processes(clean_cwd):
     config = load_config(["photos", "book.epub", "--timeout", "10", "--max-retries", "3"])
+    assert config.timeout == 10
     assert config.retry_backoffs == (1, 2, 4)
-    assert config.max_leaf_seconds == 4 * 14 + 7
 
 
 def test_new_run_selectors_load_from_cli_and_environment(clean_cwd, monkeypatch):

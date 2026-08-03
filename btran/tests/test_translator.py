@@ -3,9 +3,6 @@
 import asyncio
 import json
 import os
-import signal
-import sys
-import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -87,9 +84,11 @@ async def test_translate_blocks_preserves_ids_and_sends_text_only_glossary_conte
     )
     exec_mock = AsyncMock(return_value=proc)
 
-    with patch("btran.translator.asyncio.create_subprocess_exec", exec_mock):
+    with patch("btran.translator.asyncio.create_subprocess_exec", exec_mock), \
+         patch("btran.translator.asyncio.wait_for", side_effect=AssertionError("execution deadline used")):
         result = await translate_blocks(_page(), _glossary(), model="text-model")
 
+    proc.communicate.assert_awaited_once_with()
     assert [block.block_id for block in result] == ["p7_b1", "p7_b2"]
     assert [block.translated_text for block in result] == ["The cat sleeps.", "The cat woke up."]
     prompt = exec_mock.call_args.args[-1]
@@ -227,28 +226,6 @@ async def test_translate_blocks_rejects_untrusted_non_schema_json(payload):
 
 
 @pytest.mark.asyncio
-async def test_translate_blocks_terminates_child_on_timeout():
-    """A timed out request reaps its Pi child before reporting TranslationError."""
-    from btran.translator import TranslationError, translate_blocks
-
-    proc = Mock()
-    proc.pid = 123
-    proc.poll = None  # asyncio.subprocess.Process has no synchronous poll().
-    proc.returncode = None
-    proc.communicate = AsyncMock(side_effect=asyncio.TimeoutError())
-    proc.wait = AsyncMock(return_value=None)
-    from btran.process_cleanup import _ProcessRef
-    with patch("btran.translator.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)), \
-         patch("btran.process_cleanup._proc_ref", return_value=_ProcessRef(123, 1)), \
-         patch("btran.process_cleanup._signal_group", return_value=False), \
-         patch("btran.process_cleanup.os.kill"):
-        with pytest.raises(TranslationError, match="timed out"):
-            await translate_blocks(_page(), _glossary(), model="text-model", timeout=1)
-
-    proc.terminate.assert_called_once_with()
-
-
-@pytest.mark.asyncio
 async def test_translate_blocks_terminates_child_on_cancellation():
     """Cancellation reaps the child and propagates cancellation to the caller."""
     from btran.translator import translate_blocks
@@ -276,87 +253,6 @@ async def test_translate_blocks_terminates_child_on_cancellation():
             await task
 
     proc.terminate.assert_called_once_with()
-
-
-@pytest.mark.asyncio
-@pytest.mark.skipif(os.name != "posix", reason="requires /proc POSIX process cleanup")
-async def test_translation_timeout_kills_detached_setsid_pipe_holder(tmp_path):
-    """Translation cleanup tracks Pi child that escaped original process group."""
-    from btran.translator import TranslationError, translate_blocks
-
-    pid_path = tmp_path / "escaped.pid"
-    child_source = (
-        "import os, signal, time\n"
-        "os.setsid()\n"
-        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
-        "while True: time.sleep(.1)\n"
-    )
-    worker = tmp_path / "fake-pi"
-    worker.write_text(
-        f"#!{sys.executable}\n"
-        "import signal, subprocess, sys, time\n"
-        f"child=subprocess.Popen([sys.executable, '-c', {child_source!r}])\n"
-        f"open({str(pid_path)!r}, 'w').write(str(child.pid))\n"
-        "signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))\n"
-        "while True: time.sleep(.1)\n",
-        encoding="utf-8",
-    )
-    worker.chmod(0o755)
-    child_pid: int | None = None
-    try:
-        with pytest.raises(TranslationError, match="timed out"):
-            await translate_blocks(_page(), _glossary(), model="model", pi_bin=str(worker), timeout=1)
-        child_pid = int(pid_path.read_text(encoding="utf-8"))
-        deadline = time.monotonic() + 2
-        while time.monotonic() < deadline:
-            try:
-                os.kill(child_pid, 0)
-            except ProcessLookupError:
-                break
-            await asyncio.sleep(.01)
-        else:
-            pytest.fail("detached translation pipe holder survived cleanup")
-    finally:
-        if child_pid is not None:
-            try:
-                os.kill(child_pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("timeout", [-1, 0, 3601, 1.5, True])
-async def test_translate_blocks_rejects_invalid_timeout_before_spawning_pi(timeout):
-    from btran.translator import TranslationError, translate_blocks
-
-    exec_mock = AsyncMock()
-    with patch("btran.translator.asyncio.create_subprocess_exec", exec_mock):
-        with pytest.raises(TranslationError, match="between 1 and 3600"):
-            await translate_blocks(_page(), _glossary(), model="text-model", timeout=timeout)
-
-    exec_mock.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_target_materialization_rejects_zero_timeout_before_fallback_page_work(tmp_path):
-    """Outer Task-10 fallback path cannot turn zero into an unbounded leaf."""
-    from btran.translator import TranslationError, materialize_effective_target
-
-    store, graph, source, _ = _task10_source(tmp_path, ["source"])
-    model_called = False
-
-    async def model(_):
-        nonlocal model_called
-        model_called = True
-        return {"translated_text": "unexpected"}
-
-    with pytest.raises(TranslationError, match="between 1 and 3600"):
-        await materialize_effective_target(
-            source, store=store, graph=graph, mode="translated", target_lang="en",
-            timeout=0, max_retries=0, translation_call=model,
-        )
-
-    assert not model_called
 
 
 def _task10_source(tmp_path, texts, *, diagnostic_indexes=()):
