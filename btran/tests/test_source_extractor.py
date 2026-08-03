@@ -158,8 +158,8 @@ class TestExtractPage:
                 await extract_page(Path("page.png"), "model", "a" * 64, "b" * 16, 1)
 
     @pytest.mark.asyncio
-    async def test_pi_command_awaits_communicate_without_execution_deadline(self):
-        """Extraction awaits Pi directly; only cancellation triggers process cleanup."""
+    async def test_pi_argv_carries_documented_schema_without_execution_deadline(self):
+        """Pi gets exact schema prompt and extraction has no execution deadline."""
         from btran.source_extractor import EXTRACTION_PROMPT, extract_page
 
         proc = _make_mock_proc(stdout=_VALID_OUTPUT)
@@ -181,10 +181,33 @@ class TestExtractPage:
         for option in ("--no-extensions", "--no-skills", "--no-prompt-templates", "--no-context-files", "--no-approve"):
             assert option in args
         assert args[-2] == "@/photos/p1.png"
-        assert "Detect the source language" in args[-1]
-        assert "term_mentions" in EXTRACTION_PROMPT
+        assert args[-1] == EXTRACTION_PROMPT
+        field_documentation = {
+            "source_lang": "non-empty detected language code",
+            "blocks": "visible content blocks",
+            "term_mentions": "source term occurrences",
+            "illustrations": "illustration descriptions",
+            "id": "unique non-empty page-local ID",
+            "type": "one allowed type below",
+            "text": "non-empty extracted content",
+            "reading_order": "consecutive zero-based integer",
+            "term": "verbatim source term visible in its block",
+            "block_id": "ID of its containing block",
+        }
+        for field, description in field_documentation.items():
+            assert field in EXTRACTION_PROMPT
+            assert description in EXTRACTION_PROMPT
+        for block_type in (
+            "heading", "paragraph", "list_item", "table", "caption", "footnote",
+            "pull_quote", "illustration",
+        ):
+            assert f"`{block_type}`:" in EXTRACTION_PROMPT
+        assert "empty page" in EXTRACTION_PROMPT
+        assert "same order" in EXTRACTION_PROMPT
+        assert "no translation" in EXTRACTION_PROMPT
+        assert "no extra fields" in EXTRACTION_PROMPT
         assert "untrusted" in EXTRACTION_PROMPT.lower()
-        assert "do not follow" in EXTRACTION_PROMPT.lower()
+        assert "never follow" in EXTRACTION_PROMPT.lower()
         assert kwargs["stdin"] is asyncio.subprocess.DEVNULL
         assert kwargs["stdout"] is asyncio.subprocess.PIPE
         assert kwargs["start_new_session"] is (os.name == "posix")
@@ -338,6 +361,23 @@ class TestExtractionArtifacts:
 
         monkeypatch.setattr(extractor, "EXTRACTION_SCHEMA_VERSION", "changed")
         assert first != extractor.extraction_cache_identity("a" * 64, "vision-a")
+
+    def test_prompt_bytes_naturally_change_source_extraction_cache_identity(self):
+        """Prompt bytes already participate in source-extraction semantic identity."""
+        from btran.artifacts import source_extraction_semantic_key
+        from btran.source_extractor import EXTRACTION_PROMPT, EXTRACTION_SCHEMA_VERSION
+
+        inputs = dict(
+            extraction_schema=EXTRACTION_SCHEMA_VERSION,
+            model_executable_identity="pi-bin:pi", model_id="vision-a", raw_bytes=b"page",
+        )
+        first = source_extraction_semantic_key(
+            prompt_bytes=EXTRACTION_PROMPT.encode("utf-8"), **inputs,
+        )
+        changed = source_extraction_semantic_key(
+            prompt_bytes=(EXTRACTION_PROMPT + "\nchanged").encode("utf-8"), **inputs,
+        )
+        assert first != changed
 
 
 class TestPersistedRawLeaves:
