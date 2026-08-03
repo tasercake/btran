@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+from pathlib import Path
 import zipfile
 
 import pytest
@@ -383,7 +384,9 @@ def test_tool_less_ephemeral_pi_call_returns_stdout_and_cleans_up_timeout(tmp_pa
         pi_bin=str(fake_pi), model="test-model", timeout=1
     )
     arguments = json.loads(bounded_success_call("prompt"))
-    assert "--no-session" in arguments
+    assert "--no-session" not in arguments
+    assert arguments[arguments.index("--thinking") + 1] == "low"
+    assert arguments[arguments.index("--session-dir") + 1] == str(Path.cwd() / ".btran" / "pi-sessions")
     assert "--no-tools" in arguments
     assert "--no-extensions" in arguments
     assert "--no-skills" in arguments

@@ -18,6 +18,7 @@ TIMEOUT_SECONDS_MINIMUM = 1
 TIMEOUT_SECONDS_MAXIMUM = 3600
 MAX_RETRIES_MINIMUM = 0
 MAX_RETRIES_MAXIMUM = 5
+PI_REASONING_LEVELS = frozenset({"off", "minimal", "low", "medium", "high", "xhigh", "max"})
 PROCESS_TERMINATE_GRACE_SECONDS = 2
 PROCESS_KILL_GRACE_SECONDS = 2
 _ENV_PREFIX = "BTRAN_"
@@ -34,7 +35,8 @@ _UNSUPPORTED_ENV_CONTROLS = {
 class Config:
     """Run settings.  ``target_lang=None`` selects native mode."""
 
-    model: str = "gemini-2.5-flash"
+    model: str = "openai-codex/gpt-5.6-terra"
+    reasoning_level: str = "low"
     target_lang: str | None = None
     concurrency: int = 4
     max_retries: int = 3
@@ -104,6 +106,18 @@ def validate_max_retries(value: object) -> int:
     return value
 
 
+def validate_reasoning_level(value: object) -> str:
+    """Validate btran's user-facing Pi thinking control."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("reasoning_level must not be blank")
+    normalized = value.strip()
+    if normalized not in PI_REASONING_LEVELS:
+        raise ValueError(
+            "reasoning_level must be one of: " + ", ".join(sorted(PI_REASONING_LEVELS))
+        )
+    return normalized
+
+
 def _flag_env(value: str) -> bool:
     normalized = value.strip().lower()
     if normalized in {"1", "true", "yes", "on"}:
@@ -115,6 +129,7 @@ def _flag_env(value: str) -> bool:
 
 _ENV_FIELDS: dict[str, tuple[str, Callable[[str], object]]] = {
     "model": ("MODEL", str),
+    "reasoning_level": ("REASONING_LEVEL", validate_reasoning_level),
     "concurrency": ("CONCURRENCY", int),
     "max_retries": ("MAX_RETRIES", int),
     "timeout": ("TIMEOUT", int),
@@ -141,6 +156,21 @@ _PATH_FIELDS = {"input_dir", "output_epub", "workspace", "intermediate_dir", "ma
 def default_workspace(output_epub: Path | str) -> Path:
     """Return output-adjacent state root; this is always fallback authority."""
     return Path(output_epub).parent / ".btran"
+
+
+def ensure_pi_session_dir(path: Path | str) -> Path:
+    """Race-safely create one explicit, non-global Pi session directory."""
+    resolved = Path(path)
+    resolved.mkdir(parents=True, exist_ok=True)
+    if not resolved.is_dir():
+        raise OSError(f"Pi session directory is not a directory: {resolved}")
+    return resolved
+
+
+def resolve_pi_session_dir(workspace: Path | None = None) -> Path:
+    """Resolve deterministic work-owned Pi session storage, never global Pi state."""
+    root = Path.cwd() / ".btran" if workspace is None else Path(workspace)
+    return ensure_pi_session_dir(root / "pi-sessions")
 
 
 def _ensure_writable_directory(path: Path) -> Path:
@@ -243,6 +273,7 @@ def _validate_config(config: Config, parser: argparse.ArgumentParser, cli_ns: ar
     try:
         validate_max_retries(config.max_retries)
         validate_timeout_seconds(config.timeout)
+        validate_reasoning_level(config.reasoning_level)
     except ValueError as exc:
         parser.error(str(exc))
     if not 1 <= config.glossary_budget <= GLOSSARY_BUDGET_MAXIMUM:
@@ -273,6 +304,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--correction-set", default=None, metavar="SET_ID")
     parser.add_argument("--refresh", action="store_true", default=None)
     parser.add_argument("--model", default=None)
+    parser.add_argument("--reasoning-level", default=None, metavar="LEVEL",
+                        help="Pi thinking level: off, minimal, low, medium, high, xhigh, or max.")
     parser.add_argument("--concurrency", type=int, default=None)
     parser.add_argument("--max-retries", type=int, default=None)
     parser.add_argument(

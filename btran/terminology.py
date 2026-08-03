@@ -10,6 +10,7 @@ import re
 import subprocess
 import unicodedata
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from btran.artifacts import (
@@ -21,7 +22,13 @@ from btran.artifacts import (
     occurrence_shard_semantic_key,
     projection_semantic_key,
 )
-from btran.config import PROCESS_KILL_GRACE_SECONDS, PROCESS_TERMINATE_GRACE_SECONDS
+from btran.config import (
+    PROCESS_KILL_GRACE_SECONDS,
+    PROCESS_TERMINATE_GRACE_SECONDS,
+    ensure_pi_session_dir,
+    resolve_pi_session_dir,
+    validate_reasoning_level,
+)
 from btran.process_cleanup import cleanup_popen
 from btran.corrections import OverlayInput
 from btran.identity import canonical_source_text, concept_for, occurrence_id_for
@@ -277,11 +284,17 @@ def _timed_out_cleanup(proc: subprocess.Popen[str]) -> tuple[str, str]:
 
 
 def make_pi_consolidation_call(
-    *, pi_bin: str = "pi", model: str, timeout: int = 120
+    *, pi_bin: str = "pi", model: str, timeout: int = 120, reasoning_level: str = "low",
+    session_dir: Path | None = None,
 ) -> Callable[[str], str]:
     """Create an ephemeral, tool-less text Pi caller with Config-bounded timeout."""
     if isinstance(timeout, bool) or not isinstance(timeout, int) or not 1 <= timeout <= 3600:
         raise ValueError("timeout must be an integer between 1 and 3600")
+
+    reasoning_level = validate_reasoning_level(reasoning_level)
+    resolved_session_dir = (
+        resolve_pi_session_dir() if session_dir is None else ensure_pi_session_dir(session_dir)
+    )
 
     def pi_call(prompt: str) -> str:
         if not isinstance(prompt, str):
@@ -291,7 +304,10 @@ def make_pi_consolidation_call(
             "-p",
             "--model",
             model,
-            "--no-session",
+            "--thinking",
+            reasoning_level,
+            "--session-dir",
+            str(resolved_session_dir),
             "--no-tools",
             "--no-extensions",
             "--no-skills",
@@ -987,7 +1003,7 @@ def build_terminology_evidence(
     selected_membership_artifact_ids: Sequence[str] = (), selected_projection_artifact_ids: Sequence[str] = (),
     previous_membership_artifact_ids: Sequence[str] = (),
     selected_snapshot: RevisionSnapshot | None = None,
-    model_executable_identity: str = "pi", model_id: str = "terminology",
+    model_executable_identity: str = "pi", model_id: str = "terminology", reasoning_level: str = "low",
     prompt_bytes: bytes = CONSOLIDATION_PROMPT.encode(), token_budget: int = DEFAULT_TOKEN_BUDGET,
     max_rounds: int = 8,
 ) -> TerminologyEvidenceRun:
@@ -1002,6 +1018,10 @@ def build_terminology_evidence(
         raise TerminologyEvidenceError("selected_snapshot must be RevisionSnapshot")
     if mode not in {"native", "translated"}:
         raise TerminologyEvidenceError("mode must be native or translated")
+    try:
+        reasoning_level = validate_reasoning_level(reasoning_level)
+    except ValueError as exc:
+        raise TerminologyEvidenceError(str(exc)) from exc
     if mode == "translated" and (not isinstance(target_lang, str) or not target_lang):
         raise TerminologyEvidenceError("translated terminology requires target_lang")
     if not isinstance(base_revision_id, str) or not base_revision_id:
@@ -1249,7 +1269,7 @@ def build_terminology_evidence(
                     concept_id=concept_id, occurrence_scope_selector=selector,
                     membership_id=membership.artifact_id, target_form=target_form,
                     active_terminology_corrections=(), model_executable_identity=model_executable_identity,
-                    model_id=model_id, prompt_bytes=prompt_bytes,
+                    model_id=model_id, reasoning_level=reasoning_level, prompt_bytes=prompt_bytes,
                     consolidation_schema=CONSOLIDATION_SCHEMA_VERSION,
                     algorithm_version=PROJECTION_ALGORITHM_VERSION,
                 )
@@ -1406,7 +1426,7 @@ def build_terminology_evidence(
                             concept_id=concept_id, occurrence_scope_selector={"kind": "all_concept_occurrences"},
                             membership_id=membership.artifact_id, target_form=target,
                             active_terminology_corrections=(), model_executable_identity=model_executable_identity,
-                            model_id=model_id, prompt_bytes=prompt_bytes,
+                            model_id=model_id, reasoning_level=reasoning_level, prompt_bytes=prompt_bytes,
                             consolidation_schema=CONSOLIDATION_SCHEMA_VERSION,
                             algorithm_version=PROJECTION_ALGORITHM_VERSION,
                         )
@@ -1455,7 +1475,8 @@ def build_terminology_evidence(
             semantic = projection_semantic_key(concept_id=concept_id, occurrence_scope_selector=selector_scope,
                 membership_id=membership.artifact_id, target_form=selected_target,
                 active_terminology_corrections=() if overlay is None else (overlay.correction_id,),
-                model_executable_identity=model_executable_identity, model_id=model_id, prompt_bytes=prompt_bytes,
+                model_executable_identity=model_executable_identity, model_id=model_id,
+                reasoning_level=reasoning_level, prompt_bytes=prompt_bytes,
                 consolidation_schema=CONSOLIDATION_SCHEMA_VERSION, algorithm_version=PROJECTION_ALGORITHM_VERSION)
             projection_artifact = store.put("ConceptProjection", projection.to_dict(), dependency_ids=tuple(sorted(set(deps))), semantic_key=semantic)
             projection_ids.append(projection_artifact.artifact_id)

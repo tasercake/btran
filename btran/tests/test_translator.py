@@ -3,6 +3,7 @@
 import asyncio
 import json
 import os
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -141,6 +142,10 @@ def test_translation_cache_identity_changes_for_source_artifact_or_glossary():
         source_artifact_hash="source-a", glossary_hash="glossary-a",
         target_lang="en", model="other-text-model",
     )
+    assert baseline != translation_cache_identity(
+        source_artifact_hash="source-a", glossary_hash="glossary-a",
+        target_lang="en", model="text-model", reasoning_level="high",
+    )
 
 
 def test_translation_context_uses_page_neighbors_and_slices_glossary_for_them():
@@ -247,9 +252,12 @@ async def test_translate_blocks_isolated_from_tools_and_project_configuration():
         await translate_blocks(_page(), _glossary(), model="text-model")
 
     args = exec_mock.call_args.args
-    for option in ("--no-session", "--no-tools", "--no-extensions", "--no-skills",
+    for option in ("--no-tools", "--no-extensions", "--no-skills",
                    "--no-prompt-templates", "--no-context-files", "--no-approve"):
         assert option in args
+    assert args[args.index("--thinking") + 1] == "low"
+    assert args[args.index("--session-dir") + 1] == str(Path.cwd() / ".btran" / "pi-sessions")
+    assert "--no-session" not in args
     assert exec_mock.call_args.kwargs["stdin"] is asyncio.subprocess.DEVNULL
     assert exec_mock.call_args.kwargs["start_new_session"] is (os.name == "posix")
 

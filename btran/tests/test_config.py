@@ -1,10 +1,11 @@
 """Task 4 configuration and finite-process policy tests."""
 
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
 
-from btran.config import Config, load_config, resolve_workspace
+from btran.config import Config, load_config, resolve_pi_session_dir, resolve_workspace
 
 
 @pytest.fixture
@@ -19,6 +20,37 @@ def test_absent_target_selects_native(clean_cwd):
     config = load_config(["photos", "book.epub"])
     assert config.target_lang is None
     assert config.mode == "native"
+
+
+def test_pi_model_and_reasoning_defaults_are_exact(clean_cwd):
+    config = load_config(["photos", "book.epub"])
+    assert config.model == "openai-codex/gpt-5.6-terra"
+    assert config.reasoning_level == "low"
+
+
+@pytest.mark.parametrize("value", ["off", "minimal", "low", "medium", "high", "xhigh", "max"])
+def test_reasoning_level_accepts_cli_and_environment_values(clean_cwd, monkeypatch, value):
+    assert load_config(["photos", "book.epub", "--reasoning-level", value]).reasoning_level == value
+    monkeypatch.setenv("BTRAN_REASONING_LEVEL", value)
+    assert load_config(["photos", "book.epub"]).reasoning_level == value
+
+
+@pytest.mark.parametrize("value", ["", " ", "fast", "LOW"])
+def test_reasoning_level_rejects_blank_and_unknown_values(clean_cwd, monkeypatch, value):
+    with pytest.raises(SystemExit):
+        load_config(["photos", "book.epub", "--reasoning-level", value])
+    monkeypatch.setenv("BTRAN_REASONING_LEVEL", value)
+    with pytest.raises(SystemExit):
+        load_config(["photos", "book.epub"])
+
+
+def test_pi_sessions_are_workspace_owned_and_concurrent_safe(clean_cwd, tmp_path):
+    workspace = tmp_path / "run-state"
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        paths = list(executor.map(lambda _: resolve_pi_session_dir(workspace), range(16)))
+    assert set(paths) == {workspace / "pi-sessions"}
+    assert (workspace / "pi-sessions").is_dir()
+    assert not (Path.home() / ".pi" / "agent" / "sessions" / "pi-sessions").exists()
 
 
 @pytest.mark.parametrize(("environment", "arguments", "expected"), [
