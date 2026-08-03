@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Mapping
 
 from btran.artifacts import ArtifactEnvelope, ArtifactError, ArtifactStore, DependencyGraph, RevisionStore
-from btran.config import Config, resolve_workspace
+from btran.config import Config, resolve_pi_session_dir, resolve_workspace
 from btran.corrections import (
     CorrectionError,
     CorrectionStore,
@@ -331,6 +331,7 @@ async def _run_core(config: Config, on_page_error: PageErrorCallback | None = No
     errors: list[str] = []
     try:
         workspace = resolve_workspace(config).workspace
+        pi_session_dir = resolve_pi_session_dir(workspace)
     except Exception as exc:
         failure = InvocationFailure.input_access(config.input_dir, exc)
         return RunResult([f"[btran] workspace unavailable: {type(exc).__name__}: {exc}"],
@@ -399,6 +400,7 @@ async def _run_core(config: Config, on_page_error: PageErrorCallback | None = No
                   if empty_input else await extract_raw_pages(
                       raw_inputs, store=store, workspace=workspace, model=config.model,
                       pi_bin=config.pi_bin, max_retries=config.max_retries,
+                      reasoning_level=config.reasoning_level, session_dir=pi_session_dir,
                       base_revision_id=selected.base_revision_id, concurrency=config.concurrency,
                       selected_snapshot=selected_leaf_snapshot,
                       selected_page_artifact_ids=selected_source_leaf_ids))
@@ -469,7 +471,10 @@ async def _run_core(config: Config, on_page_error: PageErrorCallback | None = No
     async def terminology_stage(_: StageInputs) -> StageOutputs:
         fallback_finding: str | None = None
         try:
-            pi_call = None if config.mode == "native" or empty_input else make_pi_consolidation_call(pi_bin=config.pi_bin, model=config.model, timeout=config.timeout)
+            pi_call = None if config.mode == "native" or empty_input else make_pi_consolidation_call(
+                pi_bin=config.pi_bin, model=config.model, timeout=config.timeout,
+                reasoning_level=config.reasoning_level, session_dir=pi_session_dir,
+            )
             result = build_terminology_evidence(effective_source_run, store=store, graph=graph, mode=config.mode,
                                                 target_lang=config.target_lang, terminology_overlays=overlays,
                                                 pi_call=pi_call, base_revision_id=selected.base_revision_id,
@@ -478,6 +483,7 @@ async def _run_core(config: Config, on_page_error: PageErrorCallback | None = No
                                                 selected_projection_artifact_ids=selected.base_snapshot_artifact_ids,
                                                 selected_snapshot=selected_leaf_snapshot,
                                                 model_executable_identity=f"pi-bin:{config.pi_bin}", model_id=config.model,
+                                                reasoning_level=config.reasoning_level,
                                                 token_budget=config.glossary_budget)
             status = result.status
         except Exception as exc:
@@ -493,6 +499,7 @@ async def _run_core(config: Config, on_page_error: PageErrorCallback | None = No
                                                 selected_projection_artifact_ids=selected.base_snapshot_artifact_ids,
                                                 selected_snapshot=selected_leaf_snapshot,
                                                 model_executable_identity=f"pi-bin:{config.pi_bin}", model_id=config.model,
+                                                reasoning_level=config.reasoning_level,
                                                 token_budget=config.glossary_budget)
             status = "degraded"
         roots = result.selected_artifact_ids
@@ -515,6 +522,7 @@ async def _run_core(config: Config, on_page_error: PageErrorCallback | None = No
             result = await materialize_effective_target(effective_source_run, terminology_run, store=store, graph=graph,
                                                         mode=config.mode, target_lang=config.target_lang,
                                                         target_overlays=overlays, model=config.model, pi_bin=config.pi_bin,
+                                                        reasoning_level=config.reasoning_level, session_dir=pi_session_dir,
                                                         max_retries=config.max_retries,
                                                         base_revision_id=selected.base_revision_id,
                                                         selected_snapshot=selected_leaf_snapshot,
@@ -531,6 +539,7 @@ async def _run_core(config: Config, on_page_error: PageErrorCallback | None = No
             result = await materialize_effective_target(effective_source_run, (), store=store, graph=graph,
                                                         mode=config.mode, target_lang=config.target_lang,
                                                         target_overlays=(), model=config.model, pi_bin=config.pi_bin,
+                                                        reasoning_level=config.reasoning_level, session_dir=pi_session_dir,
                                                         max_retries=config.max_retries,
                                                         base_revision_id=selected.base_revision_id,
                                                         segment_translator=fail_translation)

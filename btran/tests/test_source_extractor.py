@@ -176,7 +176,9 @@ class TestExtractPage:
         args, kwargs = exec_mock.call_args
         assert args[:2] == ("/bin/pi", "-p")
         assert args[args.index("--model") + 1] == "gemini-vision"
-        assert "--no-session" in args
+        assert args[args.index("--thinking") + 1] == "low"
+        assert args[args.index("--session-dir") + 1] == str(Path.cwd() / ".btran" / "pi-sessions")
+        assert "--no-session" not in args
         assert "--no-tools" in args
         for option in ("--no-extensions", "--no-skills", "--no-prompt-templates", "--no-context-files", "--no-approve"):
             assert option in args
@@ -358,6 +360,7 @@ class TestExtractionArtifacts:
         assert first == extractor.extraction_cache_identity("a" * 64, "vision-a")
         assert first.startswith("extraction:")
         assert first != extractor.extraction_cache_identity("a" * 64, "vision-b")
+        assert first != extractor.extraction_cache_identity("a" * 64, "vision-a", "high")
 
         monkeypatch.setattr(extractor, "EXTRACTION_SCHEMA_VERSION", "changed")
         assert first != extractor.extraction_cache_identity("a" * 64, "vision-a")

@@ -14,7 +14,13 @@ from typing import Any, Iterable, Mapping
 
 from btran.artifacts import ArtifactStore, CacheValidator, DependencyGraph, RevisionSnapshot, source_extraction_semantic_key
 from btran.orchestrator_contract import CacheEvent
-from btran.config import PROCESS_KILL_GRACE_SECONDS, PROCESS_TERMINATE_GRACE_SECONDS
+from btran.config import (
+    PROCESS_KILL_GRACE_SECONDS,
+    PROCESS_TERMINATE_GRACE_SECONDS,
+    ensure_pi_session_dir,
+    resolve_pi_session_dir,
+    validate_reasoning_level,
+)
 from btran.process_cleanup import cleanup_async_process
 from btran.identity import PagePlacement, canonical_root_segments, page_id_for_raw_sha256, raw_file_sha256, segment_for
 from btran.schema import (
@@ -203,13 +209,15 @@ def parse_extraction(
 
 async def _extract_page_attempt(
     image_path: Path, model: str, sha256: str, phash: str, page_number: int, *, pi_bin: str,
+    reasoning_level: str, session_dir: Path,
 ) -> PageExtraction:
     """One Pi attempt; retry policy lives in ``extract_page``."""
     proc: asyncio.subprocess.Process | None = None
     try:
         proc = await asyncio.create_subprocess_exec(
-            pi_bin, "-p", "--model", model, "--no-session", "--no-tools",
-            "--no-extensions", "--no-skills", "--no-prompt-templates",
+            pi_bin, "-p", "--model", model, "--thinking", reasoning_level,
+            "--session-dir", str(session_dir), "--no-tools", "--no-extensions",
+            "--no-skills", "--no-prompt-templates",
             "--no-context-files", "--no-approve", f"@{image_path}", EXTRACTION_PROMPT,
             stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE, env={**os.environ, "PI_OFFLINE": "0"},
@@ -244,18 +252,25 @@ def _validate_extraction_bounds(max_retries: int) -> None:
 
 async def extract_page(
     image_path: Path, model: str, sha256: str, phash: str, page_number: int,
-    pi_bin: str = "pi", max_retries: int = 0,
+    pi_bin: str = "pi", max_retries: int = 0, reasoning_level: str = "low",
+    session_dir: Path | None = None,
 ) -> PageExtraction:
     """Extract one page with retries and deterministic backoff.
 
     Pi execution has no deadline. Stage callers pass Config's ``max_retries``.
     """
     _validate_extraction_bounds(max_retries)
+    reasoning_level = validate_reasoning_level(reasoning_level)
+    resolved_session_dir = (
+        resolve_pi_session_dir() if session_dir is None else ensure_pi_session_dir(session_dir)
+    )
     last_error: ExtractionError | None = None
     for attempt in range(max_retries + 1):
         try:
-            return await _extract_page_attempt(image_path, model, sha256, phash, page_number,
-                                               pi_bin=pi_bin)
+            return await _extract_page_attempt(
+                image_path, model, sha256, phash, page_number, pi_bin=pi_bin,
+                reasoning_level=reasoning_level, session_dir=resolved_session_dir,
+            )
         except asyncio.CancelledError:
             raise
         except ExtractionError as exc:
@@ -336,10 +351,10 @@ def to_file(extraction: PageExtraction, path: Path) -> None:
         raise
 
 
-def extraction_cache_identity(sha256: str, model: str) -> str:
+def extraction_cache_identity(sha256: str, model: str, reasoning_level: str = "low") -> str:
     """Legacy cache identity. New state uses ``source_extraction_semantic_key``."""
     semantic_inputs = json.dumps({"kind": "source-extraction", "image_sha256": sha256,
-                                  "model": model, "prompt": EXTRACTION_PROMPT,
+                                  "model": model, "reasoning_level": reasoning_level, "prompt": EXTRACTION_PROMPT,
                                   "schema_version": EXTRACTION_SCHEMA_VERSION},
                                  sort_keys=True, separators=(",", ":"))
     return "extraction:" + hashlib.sha256(semantic_inputs.encode("utf-8")).hexdigest()
@@ -532,8 +547,9 @@ def empty_input_diagnostic_raw_run(*, store: ArtifactStore, base_revision_id: st
 
 async def extract_raw_pages(
     pages: Iterable[RawPageInput], *, store: ArtifactStore, workspace: Path, model: str,
-    pi_bin: str = "pi", max_retries: int = 3,
-    model_executable_identity: str | None = None, base_revision_id: str = "unsealed",
+    pi_bin: str = "pi", max_retries: int = 3, reasoning_level: str = "low",
+    session_dir: Path | None = None, model_executable_identity: str | None = None,
+    base_revision_id: str = "unsealed",
     concurrency: int = 1, selected_snapshot: RevisionSnapshot | None = None,
     selected_page_artifact_ids: Mapping[str, str] | None = None,
 ) -> RawExtractionRun:
@@ -545,6 +561,7 @@ async def extract_raw_pages(
     # Policy errors are run errors, never per-page diagnostic fallbacks. Do
     # this before reading/decoding any page so malformed input cannot mask them.
     _validate_extraction_bounds(max_retries)
+    reasoning_level = validate_reasoning_level(reasoning_level)
     if not isinstance(concurrency, int) or isinstance(concurrency, bool) or not 1 <= concurrency <= 32:
         raise ExtractionError("concurrency must be an integer between 1 and 32")
     page_list = tuple(pages)
@@ -559,6 +576,9 @@ async def extract_raw_pages(
             raise ExtractionError("duplicate logical page has conflicting raw identity")
     page_list = tuple(logical_pages.values())
     executable_identity = model_executable_identity or f"pi-bin:{pi_bin}"
+    resolved_session_dir = (
+        resolve_pi_session_dir(workspace) if session_dir is None else ensure_pi_session_dir(session_dir)
+    )
     if selected_snapshot is not None and not isinstance(selected_snapshot, RevisionSnapshot):
         raise ExtractionError("selected_snapshot must be RevisionSnapshot")
     selected_page_artifact_ids = {} if selected_page_artifact_ids is None else dict(selected_page_artifact_ids)
@@ -602,7 +622,7 @@ async def extract_raw_pages(
                 key_constructor=source_extraction_semantic_key,
                 extraction_schema=EXTRACTION_SCHEMA_VERSION, prompt_bytes=EXTRACTION_PROMPT.encode("utf-8"),
                 model_executable_identity=executable_identity, model_id=model,
-                raw_bytes=raw_bytes_for_key,
+                reasoning_level=reasoning_level, raw_bytes=raw_bytes_for_key,
             )
             if artifact is None:
                 continue
@@ -651,14 +671,16 @@ async def extract_raw_pages(
                 key = source_extraction_semantic_key(
                     extraction_schema=EXTRACTION_SCHEMA_VERSION, prompt_bytes=EXTRACTION_PROMPT.encode("utf-8"),
                     model_executable_identity=executable_identity, model_id=model,
-                    raw_bytes=raw_bytes,
+                    reasoning_level=reasoning_level, raw_bytes=raw_bytes,
                 )
                 reused = reused_leaf(page, raw_bytes)
                 if reused is not None:
                     return reused, CacheEvent("source_extraction", page.page_id, "hit", reused.page_artifact_id, key)
-                extraction = await extract_page(model_image_path, model, page.raw_file_sha256,
-                                                page.phash or "0", page.page_number, pi_bin=pi_bin,
-                                                max_retries=max_retries)
+                extraction = await extract_page(
+                    model_image_path, model, page.raw_file_sha256, page.phash or "0", page.page_number,
+                    pi_bin=pi_bin, max_retries=max_retries, reasoning_level=reasoning_level,
+                    session_dir=resolved_session_dir,
+                )
                 roots = canonical_root_segments(page.page_id, [
                     {"kind": block.type, "reading_order": block.reading_order + 1,
                      "source_text": block.text, "source_lang": extraction.source_lang}
@@ -714,6 +736,7 @@ async def extract_raw_pages(
                     key = source_extraction_semantic_key(
                         extraction_schema=EXTRACTION_SCHEMA_VERSION, prompt_bytes=EXTRACTION_PROMPT.encode("utf-8"),
                         model_executable_identity=executable_identity, model_id=model,
+                        reasoning_level=reasoning_level,
                         raw_bytes=(raw_bytes if raw_bytes is not None else b"unavailable:" + page.raw_file_sha256.encode("ascii")),
                     )
                 failure_kind = "page_unreadable" if raw_bytes is None else "source_extraction_failed"

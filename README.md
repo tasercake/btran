@@ -11,7 +11,7 @@ pip install -e ".[dev]"
 ## Usage
 
 ```bash
-btran ./photos/ output.epub --target-lang ja --model gemini-2.5-flash
+btran ./photos/ output.epub --target-lang ja --model openai-codex/gpt-5.6-terra --reasoning-level low
 ```
 
 The CLI requires `INPUT_DIR`, `OUTPUT_EPUB`, and a target language (flag or
@@ -55,7 +55,16 @@ selection.
 `--timeout` is 1–3600 seconds and bounds terminology consolidation and
 EPUBCheck only. Source extraction and translation Pi calls have no execution
 deadline; they run until exit, failure, or parent-task cancellation. `--pi-bin`
-selects the `pi` executable used by model leaves.
+selects the `pi` executable used by model leaves. The default model is exactly
+`openai-codex/gpt-5.6-terra`. `--reasoning-level` / `BTRAN_REASONING_LEVEL`
+accepts `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`; default
+is `low` and is passed to Pi as `--thinking LEVEL`.
+
+Every Pi model leaf retains `--no-tools` and writes persistent sessions to
+`WORKSPACE/pi-sessions` via `--session-dir`; it never uses global
+`~/.pi/agent/sessions`. Session location is execution metadata and does not
+change semantic cache keys. Model ID and reasoning level are semantic inputs,
+so changing either invalidates relevant model-output cache entries.
 
 ## Deterministic eval corpus
 

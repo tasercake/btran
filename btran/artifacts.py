@@ -97,13 +97,14 @@ def _semantic(tag: str, body: Mapping[str, Any], *raw_parts: bytes) -> str:
 
 def source_extraction_semantic_key(
     *, extraction_schema: str, prompt_bytes: bytes, model_executable_identity: str,
-    model_id: str, raw_bytes: bytes,
+    model_id: str, raw_bytes: bytes, reasoning_level: str = "low",
 ) -> str:
     """Key exact bytes supplied to bounded source-model invocation."""
     return _semantic("source-extraction-v2", {
         "extraction_schema": _text(extraction_schema, "extraction_schema"),
         "model_executable_identity": _text(model_executable_identity, "model_executable_identity"),
         "model_id": _text(model_id, "model_id"),
+        "reasoning_level": _text(reasoning_level, "reasoning_level"),
     }, _bytes(prompt_bytes, "prompt_bytes"), _bytes(raw_bytes, "raw_bytes"))
 
 
@@ -137,7 +138,7 @@ def concept_membership_semantic_key(
 def projection_semantic_key(
     *, concept_id: str, occurrence_scope_selector: Mapping[str, Any], membership_id: str, target_form: str,
     active_terminology_corrections: Sequence[str], model_executable_identity: str, model_id: str,
-    prompt_bytes: bytes, consolidation_schema: str, algorithm_version: str,
+    prompt_bytes: bytes, consolidation_schema: str, algorithm_version: str, reasoning_level: str = "low",
 ) -> str:
     return _semantic("projection-v1", {
         "concept_id": _text(concept_id, "concept_id"),
@@ -147,6 +148,7 @@ def projection_semantic_key(
         "active_terminology_corrections": list(_ids(active_terminology_corrections, "active_terminology_corrections")),
         "model_executable_identity": _text(model_executable_identity, "model_executable_identity"),
         "model_id": _text(model_id, "model_id"),
+        "reasoning_level": _text(reasoning_level, "reasoning_level"),
         "consolidation_schema": _text(consolidation_schema, "consolidation_schema"),
         "algorithm_version": _text(algorithm_version, "algorithm_version"),
     }, _bytes(prompt_bytes, "prompt_bytes"))
@@ -155,7 +157,7 @@ def projection_semantic_key(
 def translation_semantic_key(
     *, source_artifact_id: str, preceding_source_artifact_id: str | None,
     following_source_artifact_id: str | None, projection_ids: Sequence[str], model_executable_identity: str,
-    model_id: str, prompt_bytes: bytes, target_lang: str,
+    model_id: str, prompt_bytes: bytes, target_lang: str, reasoning_level: str = "low",
 ) -> str:
     return _semantic("translation-v1", {
         "source_artifact_id": _text(source_artifact_id, "source_artifact_id"),
@@ -164,6 +166,7 @@ def translation_semantic_key(
         "projection_ids": list(_ids(projection_ids, "projection_ids")),
         "model_executable_identity": _text(model_executable_identity, "model_executable_identity"),
         "model_id": _text(model_id, "model_id"),
+        "reasoning_level": _text(reasoning_level, "reasoning_level"),
         "target_lang": _text(target_lang, "target_lang"),
     }, _bytes(prompt_bytes, "prompt_bytes"))
 

@@ -59,7 +59,8 @@ No heavy frameworks. All pip-installable.
 - Load from `.env` file via `python-dotenv`
 - Override with CLI flags (argparse)
 - Config keys:
-  - `MODEL` — vision model ID (default: `gemini-2.5-flash`)
+  - `MODEL` — vision model ID (default: `openai-codex/gpt-5.6-terra`)
+  - `REASONING_LEVEL` — Pi thinking level (default: `low`; allowed: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`)
   - Source language is detected from each page during extraction; it is not configurable.
   - `TARGET_LANG` — target language (required, no default)
   - `CONCURRENCY` — max parallel pi processes (default: `4`)
@@ -89,7 +90,7 @@ from the page image, never supplied as configuration:
   "original_text": "こんにちは世界",
   "translated_text": "Hello world",
   "image_descriptions": [],
-  "model": "gemini-2.5-flash",
+  "model": "openai-codex/gpt-5.6-terra",
   "timestamp": "2026-07-24T06:22:57Z",
   "retry_count": 2
 }
@@ -115,7 +116,7 @@ Cache workflow:
 
 Each image is translated by spawning:
 ```bash
-pi -p --model <model> --no-session \
+pi -p --model <model> --thinking <reasoning_level> --session-dir WORKSPACE/pi-sessions --no-tools \
   "System: Translate this book page from <source> to <target>.
    Output ONLY a JSON object:
    {\"page_text\": \"...\", \"translated_text\": \"...\", \"image_descriptions\": []}
@@ -123,12 +124,13 @@ pi -p --model <model> --no-session \
 ```
 
 Key design points:
-- `--no-session` avoids session pollution (no sessions directory)
+- `--session-dir WORKSPACE/pi-sessions` isolates persistent sessions from global Pi state; directory is safe for concurrent creation
+- `--no-tools` remains: Pi print mode returns assistant text on stdout, which btran parses as JSON; tools are not needed
 - `--mode json` NOT used — we want raw text output that contains only our JSON
 - Prompt explicitly constrains output format
 - Response parsed from stdout, validated against schema
 - On parse failure → retry (counts as failure)
-- Timeout enforced via `asyncio.wait_for(proc.communicate(), timeout=TIMEOUT)`
+- Source extraction and translation have no execution deadline; terminology consolidation keeps its bounded timeout
 
 ### 5. Orchestrator (`orchestrator.py`)
 
@@ -193,7 +195,8 @@ positional arguments:
 
 options:
   --target-lang LANG    Target language code (required)
-  --model MODEL         Vision model ID (default: gemini-2.5-flash)
+  --model MODEL         Vision model ID (default: openai-codex/gpt-5.6-terra)
+  --reasoning-level LEVEL Pi thinking level (default: low)
   --concurrency N       Max parallel translations (default: 4)
   --max-retries N       Max retries per image (default: 3)
   --timeout SECONDS     Per-image timeout (default: 120)
@@ -249,4 +252,4 @@ All options readable from `.env` with `BTRAN_` prefix.
 | Large images exhaust API context | Option to resize images before sending (future feature) |
 | API rate limiting | Built-in retries with backoff handle transient rate limits |
 | pi binary not found | Configurable `--pi-bin` path; validate at startup |
-| Partial output on timeout | asyncio.wait_for kills subprocess; retry from scratch |
+| Partial source/translation output | Parse failure retries without an execution deadline; cancellation cleans up subprocess |

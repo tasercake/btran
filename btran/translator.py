@@ -10,11 +10,13 @@ import os
 import re
 import unicodedata
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Awaitable, Callable, Iterable, Mapping, Sequence
 
 from btran.artifacts import ArtifactStore, CacheValidator, DependencyGraph, RevisionSnapshot, translation_semantic_key
 from btran.orchestrator_contract import CacheEvent
 from btran.process_cleanup import cleanup_async_process
+from btran.config import ensure_pi_session_dir, resolve_pi_session_dir, validate_reasoning_level
 from btran.corrections import OverlayInput
 from btran.identity import occurrence_id_for
 from btran.schema import (
@@ -132,6 +134,7 @@ def translation_cache_identity(
     glossary_hash: str,
     target_lang: str,
     model: str,
+    reasoning_level: str = "low",
 ) -> str:
     """Legacy page-block cache fingerprint; new segment keys use translation_semantic_key."""
     context = {
@@ -139,6 +142,7 @@ def translation_cache_identity(
         "glossary_hash": glossary_hash,
         "target_lang": target_lang,
         "model": model,
+        "reasoning_level": reasoning_level,
         "prompt": TRANSLATION_PROMPT,
         "output_schema": TRANSLATION_OUTPUT_SCHEMA,
     }
@@ -196,12 +200,20 @@ def _validate_translation_bounds(max_retries: int | None = None) -> None:
         raise TranslationError("max_retries must be an integer between 0 and 5")
 
 
-async def _pi_json(prompt: str, *, model: str, pi_bin: str) -> object:
+async def _pi_json(
+    prompt: str, *, model: str, pi_bin: str, reasoning_level: str = "low",
+    session_dir: Path | None = None,
+) -> object:
     """Run one isolated text-only Pi request; shared by page migration and Task 10."""
+    reasoning_level = validate_reasoning_level(reasoning_level)
+    resolved_session_dir = (
+        resolve_pi_session_dir() if session_dir is None else ensure_pi_session_dir(session_dir)
+    )
     proc: asyncio.subprocess.Process | None = None
     try:
         proc = await asyncio.create_subprocess_exec(
-            pi_bin, "-p", "--model", model, "--no-session", "--no-tools", "--no-extensions",
+            pi_bin, "-p", "--model", model, "--thinking", reasoning_level,
+            "--session-dir", str(resolved_session_dir), "--no-tools", "--no-extensions",
             "--no-skills", "--no-prompt-templates", "--no-context-files", "--no-approve", prompt,
             stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE, env={**os.environ, "PI_OFFLINE": "0"},
@@ -227,12 +239,15 @@ async def _pi_json(prompt: str, *, model: str, pi_bin: str) -> object:
 async def translate_blocks(
     extraction: PageExtraction, glossary: TerminologyMap, *, model: str, pi_bin: str = "pi",
     previous_page: PageExtraction | None = None, next_page: PageExtraction | None = None,
+    reasoning_level: str = "low", session_dir: Path | None = None,
 ) -> list[TranslatedBlock]:
     """Translate legacy page blocks independently with adjacent source excerpts."""
     context = _translation_context(extraction, glossary, previous_page, next_page)
     prompt = TRANSLATION_PROMPT.format(source_lang=extraction.source_lang, target_lang=glossary.target_lang,
                                        context=json.dumps(context, ensure_ascii=False))
-    data = await _pi_json(prompt, model=model, pi_bin=pi_bin)
+    data = await _pi_json(
+        prompt, model=model, pi_bin=pi_bin, reasoning_level=reasoning_level, session_dir=session_dir,
+    )
     return _translated_blocks(data, [block.id for block in extraction.blocks])
 
 
@@ -470,7 +485,8 @@ def _mapping_rows(
 async def translate_segment(
     segment: EffectiveSegment, *, target_lang: str, projections: Sequence[Mapping[str, Any]] = (),
     previous: EffectiveSegment | None = None, following: EffectiveSegment | None = None,
-    model: str, pi_bin: str = "pi", max_retries: int = 3,
+    model: str, pi_bin: str = "pi", max_retries: int = 3, reasoning_level: str = "low",
+    session_dir: Path | None = None,
 ) -> str:
     """Translate exactly focal effective source; neighbors are context-only source records."""
     if segment.source_lang is None:
@@ -488,7 +504,10 @@ async def translate_segment(
     last: TranslationError | None = None
     for attempt in range(max_retries + 1):
         try:
-            data = await _pi_json(prompt, model=model, pi_bin=pi_bin)
+            data = await _pi_json(
+                prompt, model=model, pi_bin=pi_bin, reasoning_level=reasoning_level,
+                session_dir=session_dir,
+            )
             if not isinstance(data, dict) or set(data) != {"translated_text"} or not isinstance(data["translated_text"], str):
                 raise TranslationError("pi output violates segment translation response schema")
             return data["translated_text"]
@@ -524,8 +543,8 @@ def _put_target_assessment(
 async def materialize_effective_target(
     effective_source: Any, terminology: Any = (), *, store: ArtifactStore, graph: DependencyGraph,
     mode: str, target_lang: str | None = None, target_overlays: Any = (), model: str = "translation",
-    model_executable_identity: str | None = None, pi_bin: str = "pi",
-    base_revision_id: str = "unsealed", segment_translator: Callable[..., Any] | None = None,
+    model_executable_identity: str | None = None, pi_bin: str = "pi", reasoning_level: str = "low",
+    session_dir: Path | None = None, base_revision_id: str = "unsealed", segment_translator: Callable[..., Any] | None = None,
     translation_call: Callable[[Mapping[str, Any]], Any] | None = None, max_retries: int = 3,
     selected_snapshot: RevisionSnapshot | None = None,
     selected_translation_artifact_ids: Mapping[str, str] | None = None,
@@ -536,6 +555,7 @@ async def materialize_effective_target(
     Native mode never touches terminology inputs or invokes a translator.
     """
     _validate_translation_bounds(max_retries)
+    reasoning_level = validate_reasoning_level(reasoning_level)
     if not isinstance(store, ArtifactStore) or not isinstance(graph, DependencyGraph):
         raise TranslationError("target materialization requires ArtifactStore and DependencyGraph")
     if mode not in {"native", "translated"}:
@@ -656,7 +676,8 @@ async def materialize_effective_target(
                     preceding_source_artifact_id=source_context_ids[0] if previous is not None else None,
                     following_source_artifact_id=source_context_ids[-1] if following is not None else None,
                     projection_ids=tuple(item["artifact_id"] for item in selected), model_executable_identity=model_executable_identity,
-                    model_id=model, prompt_bytes=SEGMENT_TRANSLATION_PROMPT.encode(), target_lang=target_lang or "")
+                    model_id=model, reasoning_level=reasoning_level,
+                    prompt_bytes=SEGMENT_TRANSLATION_PROMPT.encode(), target_lang=target_lang or "")
                 requested = selected_translation_artifact_ids.get(segment.segment_id)
                 cached = cache_validator.select(selected_snapshot, requested_artifact_id=requested,
                     kind=TRANSLATION_ARTIFACT_KIND, key_constructor=translation_semantic_key,
@@ -665,6 +686,7 @@ async def materialize_effective_target(
                     following_source_artifact_id=source_context_ids[-1] if following is not None else None,
                     projection_ids=tuple(item["artifact_id"] for item in selected),
                     model_executable_identity=model_executable_identity, model_id=model,
+                    reasoning_level=reasoning_level,
                     prompt_bytes=SEGMENT_TRANSLATION_PROMPT.encode(), target_lang=target_lang or "")
                 if cached is None:
                     cached = cache_validator.select(selected_snapshot, requested_artifact_id=requested,
@@ -674,6 +696,7 @@ async def materialize_effective_target(
                         following_source_artifact_id=source_context_ids[-1] if following is not None else None,
                         projection_ids=tuple(item["artifact_id"] for item in selected),
                         model_executable_identity=model_executable_identity, model_id=model,
+                        reasoning_level=reasoning_level,
                         prompt_bytes=SEGMENT_TRANSLATION_PROMPT.encode(), target_lang=target_lang or "")
                 if cached is not None:
                     body = _translation_body(cached)
@@ -738,7 +761,8 @@ async def materialize_effective_target(
                     elif segment_translator is None:
                         translated_text = await translate_segment(segment, target_lang=target_lang or "", projections=selected,
                             previous=previous, following=following, model=model, pi_bin=pi_bin,
-                            max_retries=max_retries)
+                            max_retries=max_retries, reasoning_level=reasoning_level,
+                            session_dir=session_dir)
                     else:
                         answer = segment_translator(segment=segment, target_lang=target_lang, projections=selected,
                             previous=previous, following=following)
@@ -764,7 +788,8 @@ async def materialize_effective_target(
                     preceding_source_artifact_id=source_context_ids[0] if previous is not None else None,
                     following_source_artifact_id=source_context_ids[-1] if following is not None else None,
                     projection_ids=tuple(item["artifact_id"] for item in selected), model_executable_identity=model_executable_identity,
-                    model_id=model, prompt_bytes=SEGMENT_TRANSLATION_PROMPT.encode(), target_lang=target_lang or "")
+                    model_id=model, reasoning_level=reasoning_level,
+                    prompt_bytes=SEGMENT_TRANSLATION_PROMPT.encode(), target_lang=target_lang or "")
                 translation_envelope = store.put(DIAGNOSTIC_TRANSLATION_FALLBACK_KIND if translation_fallback else TRANSLATION_ARTIFACT_KIND,
                     body, dependency_ids=dependencies, finding_ids=tuple(sorted(item.finding_id for item in translation_findings)), semantic_key=semantic)
                 translations.append(translation_envelope.artifact_id)
