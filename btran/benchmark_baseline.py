@@ -273,12 +273,16 @@ def patched_legacy_callbacks(mode: str = "translated", *, timing: _Timing | None
         translation = native_translation_callback if mode == "native" else timed_translation
         artifacts = __import__("btran.artifacts", fromlist=["_atomic_bytes", "_atomic_json"])
         orchestrator = __import__("btran.orchestrator", fromlist=["_atomic_write"])
+        manifest = __import__("btran.manifest", fromlist=["_persist_discovery"])
+        source_extractor = __import__("btran.source_extractor", fromlist=["_atomic_image_copy"])
         with patch("btran.source_extractor.extract_page", new=timed_extraction), \
              patch("btran.orchestrator.make_pi_consolidation_call", return_value=consolidation), \
              patch("btran.translator.translate_segment", new=translation), \
              patch("btran.artifacts._atomic_bytes", new=timed(artifacts._atomic_bytes, timing.persistence)), \
              patch("btran.artifacts._atomic_json", new=timed(artifacts._atomic_json, timing.persistence)), \
-             patch("btran.orchestrator._atomic_write", new=timed(orchestrator._atomic_write, timing.persistence)):
+             patch("btran.orchestrator._atomic_write", new=timed(orchestrator._atomic_write, timing.persistence)), \
+             patch("btran.manifest._persist_discovery", new=timed(manifest._persist_discovery, timing.persistence)), \
+             patch("btran.source_extractor._atomic_image_copy", new=timed(source_extractor._atomic_image_copy, timing.persistence)):
             yield
     finally:
         _TRANSLATION_SEEN.reset(token)
@@ -366,6 +370,61 @@ def _run_once(config: Config, mode: str, timing: _Timing, stats: dict[str, int])
         return asyncio.run(run(config))
 
 
+def _selected_occurrence_correction(workspace: Path, result: Any) -> tuple[Any, dict[str, Any]]:
+    """Create FC8's occurrence correction from the sealed selected base.
+
+    The correction is deliberately addressed through the selected revision's
+    translation leaf and mapping row.  It must not be a free-standing oracle:
+    if the selected base does not contain the frozen p05 occurrence, the
+    benchmark fails instead of silently testing another occurrence.
+    """
+    from btran.artifacts import ArtifactStore, RevisionStore
+    from btran.corrections import CorrectionStore, base_hash_for_artifact, correction_transition
+
+    revision_id = result.candidate_revision_id
+    if not isinstance(revision_id, str) or not revision_id:
+        raise ValueError("FC8 correction requires a sealed cold candidate revision")
+    revisions = RevisionStore(workspace)
+    revisions.activate(revision_id)
+    snapshot = revisions.snapshot(revision_id)
+    store = ArtifactStore(workspace)
+    selected, _ = store.closure(snapshot.selected_artifact_ids)
+    selected_by_id = {artifact.artifact_id: artifact for artifact in selected}
+    for translation in selected:
+        if translation.kind not in {"TranslationArtifact", "DiagnosticTranslationFallback"}:
+            continue
+        body = translation.payload
+        source = selected_by_id.get(body.get("source_artifact_id"))
+        if source is None or source.payload.get("source_text") != P05_SOURCE:
+            continue
+        for mapping in body.get("mappings", ()):
+            if not isinstance(mapping, dict) or mapping.get("target_text") != "quantum sensor":
+                continue
+            scope = {
+                "occurrence_id": mapping["occurrence_id"], "segment_id": body["segment_id"],
+                "mapping_id": mapping["mapping_id"], "start": mapping["start"], "end": mapping["end"],
+                "expected_target_text": mapping["target_text"],
+            }
+            payload = {
+                "kind": "target_occurrence", "applies_to_revision_id": revision_id,
+                "scope": scope, "base": {"artifact_id": translation.artifact_id,
+                "sha256": base_hash_for_artifact(translation)}, "replacement": "quantum sensor",
+            }
+            correction_set, impact = correction_transition(
+                CorrectionStore(workspace), revisions, event_kind="apply", payload=payload,
+                revision_id=revision_id,
+            )
+            return correction_set, {
+                "correction_id": correction_set.active_correction_ids[-1],
+                "correction_set_id": correction_set.set_id, "base_revision_id": revision_id,
+                "occurrence_id": scope["occurrence_id"], "segment_id": scope["segment_id"],
+                "mapping_id": scope["mapping_id"], "start": scope["start"], "end": scope["end"],
+                "expected_target_text": scope["expected_target_text"],
+                "projected_universe": len(impact.projected_universe),
+            }
+    raise ValueError("FC8 selected sealed base does not contain p05:2 occurrence correction target")
+
+
 def run_benchmark_case(mode: str, root: Path | None = None) -> dict[str, Any]:
     """Run cold and warm legacy cases and write a sibling JSON measurement."""
     started = time.perf_counter_ns()
@@ -388,18 +447,39 @@ def run_benchmark_case(mode: str, root: Path | None = None) -> dict[str, Any]:
     # this is the selected-authority cache exercise, not a fresh unsealed run.
     warm_config = replace(config, base_revision=result.candidate_revision_id) if result.candidate_revision_id else config
     warm_result = _run_once(warm_config, mode, warm_timing, warm_stats)
+    warm_completed = time.perf_counter_ns()
+    correction_result = None
+    correction_timing = None
+    correction_stats: dict[str, int] = {}
+    correction_exercise: dict[str, Any] | None = None
+    if mode == "translated":
+        correction_config, correction_exercise = _selected_occurrence_correction(workspace, result)
+        correction_timing, correction_stats = _Timing(), {}
+        correction_result = _run_once(
+            replace(config, base_revision=correction_config.base_revision_id,
+                    correction_set=correction_config.correction_set_id),
+            mode, correction_timing, correction_stats,
+        )
+        correction_completed = time.perf_counter_ns()
+    else:
+        correction_completed = None
     completed = time.perf_counter_ns()
     report = result.report
     measurement = {"version": FIXTURE_VERSION, "mode": mode, "status": result.status, "workspace": str(workspace),
                    "output": str(output), "output_json": str(parent / f"{mode}-baseline.json"),
-                   "timing": cold_timing.report(cold_completed), "warm_timing": warm_timing.report(completed),
+                   "timing": cold_timing.report(cold_completed), "warm_timing": warm_timing.report(warm_completed),
                    "state": state_measure(workspace), "quality": quality_oracle(mode),
                    "quality_sha256": hashlib.sha256(canonical_quality_bytes(mode)).hexdigest(),
                    "report_non_actionable_finding_count": getattr(report, "non_actionable_finding_count", None) if report else None,
                    "terminology_oracle": _TERMINOLOGY if mode == "translated" else {},
                    "correction_oracle": expected_dirty_set() if mode == "translated" else None,
+                   "correction_exercise": correction_exercise,
+                   "correction_status": correction_result.status if correction_result is not None else None,
+                   "correction_timing": correction_timing.report(correction_completed) if correction_timing is not None else None,
                    "cache_oracle": {"cold_model_calls": cold_stats, "warm_model_calls": warm_stats,
+                                    "correction_model_calls": correction_stats,
                                     "cold_model_call_count": sum(cold_stats.values()), "warm_model_call_count": sum(warm_stats.values()),
+                                    "correction_model_call_count": sum(correction_stats.values()),
                                     "warm_cache_reuse": sum(warm_stats.values()) < sum(cold_stats.values())},
                    "corruption_oracle": _corruption_probe(workspace, parent)}
     output_json = parent / f"{mode}-baseline.json"
