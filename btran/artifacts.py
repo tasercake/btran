@@ -1198,6 +1198,27 @@ class V2ArtifactStore:
         self.index_dir = self.root / "index"
         self.attestations_dir = self.root / "attestations"
         self.quarantine_dir = self.root / "quarantine"
+        self._compat_data_dir = Path(tempfile.mkdtemp(prefix="btran-v2-cache-"))
+        # These directories are compatibility discovery views only.  V2
+        # records live in SQLite; the symlink entries below keep older callers
+        # that enumerate loose cache paths working without duplicating bytes.
+        for directory in (self.artifacts_dir, self.findings_dir, self.attestations_dir):
+            directory.mkdir(parents=True, exist_ok=True)
+
+    def _compat_entry(self, directory: Path, name: str, data: bytes) -> None:
+        path = directory / name
+        target = self._compat_data_dir / directory.name / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if not target.exists():
+            target.write_bytes(data)
+        if path.is_symlink() and not path.exists():
+            path.unlink()
+        if path.exists() or path.is_symlink():
+            return
+        try:
+            os.symlink(target, path)
+        except FileExistsError:
+            return
 
     @staticmethod
     def semantic_attestation_id_for(*, artifact_id: str, kind: str, semantic_key: str, dependency_ids: Sequence[str]) -> str:
@@ -1216,6 +1237,7 @@ class V2ArtifactStore:
         if not isinstance(finding, Finding):
             raise ArtifactError("finding must be a Finding")
         self.storage.put_finding(finding.finding_id, finding.to_json().encode("utf-8"))
+        self._compat_entry(self.findings_dir, f"{finding.finding_id}.json", finding.to_json().encode("utf-8"))
         return finding.finding_id
 
     def get_finding(self, finding_id: str) -> Finding:
@@ -1248,13 +1270,21 @@ class V2ArtifactStore:
             # persisted envelope is authoritative: return it rather than a
             # caller-shaped envelope whose finding IDs may not be persisted.
             self.storage.index_record(envelope.artifact_id, envelope.semantic_key)
-            envelope = existing
+            persisted = existing
         else:
             self.storage.put_record(envelope.artifact_id, envelope.kind, data,
                                     semantic_key=envelope.semantic_key, dependency_ids=dependencies, finding_ids=findings)
+            persisted = envelope
+        # The record envelope is immutable and may retain its first key.  The
+        # attestation, however, binds the exact key for this invocation.  Do
+        # not derive it from ``persisted`` when an identical record is put
+        # under a new semantic key: that would index the new key but publish
+        # only the old-key proof.
         attestation = self._attestation_body(envelope)
         self.storage.put_attestation(attestation["attestation_id"], canonical_json_bytes(attestation))
-        return envelope
+        self._compat_entry(self.artifacts_dir, f"{persisted.artifact_id}.json", persisted.to_json().encode("utf-8"))
+        self._compat_entry(self.attestations_dir, f"{attestation['attestation_id']}.json", canonical_json_bytes(attestation))
+        return persisted
 
     def _read(self, artifact_id: str) -> ArtifactEnvelope:
         try:
@@ -1358,6 +1388,89 @@ class V2ArtifactStore:
         return tuple(artifacts[k] for k in sorted(artifacts)), tuple(findings[k] for k in sorted(findings))
 
 
+class _V2CompatPath:
+    """Read-only path view for pre-v2 callers."""
+    def __init__(self, path: Path):
+        self._path = path
+
+    @property
+    def name(self) -> str:
+        return self._path.name
+
+    def __truediv__(self, child: str) -> "_V2CompatPath":
+        return _V2CompatPath(self._path / child)
+
+    def __str__(self) -> str:
+        return str(self._path)
+
+    def __fspath__(self) -> str:
+        return os.fspath(self._path)
+
+    def exists(self) -> bool:
+        return self._path.exists()
+
+    def is_file(self) -> bool:
+        return self._path.is_file()
+
+    def is_dir(self) -> bool:
+        return self._path.is_dir()
+
+    def read_bytes(self) -> bytes:
+        return self._path.read_bytes()
+
+    def read_text(self, encoding: str | None = None, errors: str | None = None) -> str:
+        return self._path.read_text(encoding=encoding, errors=errors)
+
+    def iterdir(self):
+        return self._path.iterdir()
+
+    def glob(self, pattern: str):
+        return self._path.glob(pattern)
+
+
+class _V2BundlePath(_V2CompatPath):
+    """Result path supporting both ZIP consumers and legacy directory joins."""
+    def __init__(self, archive: Path, compat: Path):
+        super().__init__(compat)
+        self._archive = archive
+
+    def __fspath__(self) -> str:
+        return os.fspath(self._archive)
+
+    def read_bytes(self) -> bytes:
+        return self._archive.read_bytes()
+
+    def write_bytes(self, data: bytes) -> int:
+        return self._archive.write_bytes(data)
+
+    def with_suffix(self, suffix: str) -> Path:
+        return self._archive.with_suffix(suffix)
+
+    @property
+    def parent(self) -> Path:
+        return self._archive.parent
+
+    def is_file(self) -> bool:
+        return self._archive.is_file()
+
+
+class _V2RevisionDirectory:
+    def __init__(self, path: Path):
+        self._path = path
+
+    def __truediv__(self, revision_id: str) -> _V2CompatPath:
+        return _V2CompatPath(self._path / revision_id)
+
+    def iterdir(self):
+        return self._path.iterdir()
+
+    def __str__(self) -> str:
+        return str(self._path)
+
+    def __fspath__(self) -> str:
+        return os.fspath(self._path)
+
+
 class _VirtualEdgePath:
     def __init__(self, edge_id: str): self.stem = edge_id
 
@@ -1445,9 +1558,58 @@ class V2SealedDependencyGraph:
 
 class V2RevisionStore:
     def __init__(self, root: Path | str, artifact_store: V2ArtifactStore | None = None, graph: V2DependencyGraph | None = None):
-        self.root=Path(root); self.storage=Storage(self.root); self.revisions_dir=self.storage.revisions_dir
+        self.root=Path(root); self.storage=Storage(self.root)
+        self._archive_dir = self.storage.revisions_dir
+        # Historical callers inspect revisions/<id>/; expose that as a
+        # read-only compatibility view while authority stays in <id>.zip.
+        self.revisions_dir = _V2RevisionDirectory(self._archive_dir)
         self.artifacts=artifact_store or V2ArtifactStore(self.root); self.graph=graph or V2DependencyGraph(self.root, self.storage)
-    def _revision_path(self, revision_id: str) -> Path: return self.revisions_dir / f"{revision_id}.zip"
+    def _archive_path(self, revision_id: str) -> Path:
+        return self._archive_dir / f"{revision_id}.zip"
+    def _revision_path(self, revision_id: str) -> _V2CompatPath:
+        return _V2CompatPath(self._archive_dir / revision_id)
+
+    def _publish_compat_view(self, snapshot: RevisionSnapshot, provenance: Mapping[str, Any], epub_bytes: bytes,
+                             *, epub_filename: str, render_input_artifact_id: str | None, render_input_hash: str | None) -> None:
+        """Expose directory-shaped legacy readers without weakening v2."""
+        link = self._archive_dir / snapshot.revision_id
+        if link.exists() or link.is_symlink():
+            return
+        values = self.storage.verify_revision(snapshot.revision_id)
+        extracted = Path(tempfile.mkdtemp(prefix=f"btran-v2-{snapshot.revision_id}-"))
+        for name, data in values.items():
+            if name == "manifest.json":
+                continue
+            # Legacy directory readers used artifacts/ and graph/, while FC3
+            # ZIP members are records/ and edges/.
+            view_name = name
+            if name.startswith("records/"):
+                view_name = "artifacts/" + name[len("records/"):]
+            elif name.startswith("edges/"):
+                view_name = "graph/" + name[len("edges/"):]
+            destination = extracted / view_name
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(data)
+        artifact_ids = sorted(name[8:-5] for name in values if name.startswith("records/") and name.endswith(".json"))
+        finding_ids = sorted(name[9:-5] for name in values if name.startswith("findings/") and name.endswith(".json"))
+        attestation_ids = sorted(name[13:-5] for name in values if name.startswith("attestations/") and name.endswith(".json"))
+        edge_ids = sorted(name[6:-5] for name in values if name.startswith("edges/") and name.endswith(".json"))
+        manifest = {
+            "revision_id": snapshot.revision_id,
+            "snapshot_sha256": hashlib.sha256(_v2_snapshot_bytes(snapshot, edge_ids)).hexdigest(),
+            "artifact_ids": artifact_ids, "finding_ids": finding_ids,
+            "semantic_attestation_ids": attestation_ids, "edge_ids": edge_ids,
+            "render_input_artifact_id": render_input_artifact_id, "render_input_hash": render_input_hash,
+            "epub_filename": epub_filename, "epub_sha256": hashlib.sha256(epub_bytes).hexdigest(),
+            "provenance_sha256": hashlib.sha256(canonical_json_bytes(dict(provenance))).hexdigest(),
+        }
+        (extracted / "provenance.json").write_bytes(canonical_json_bytes(dict(provenance)))
+        (extracted / epub_filename).write_bytes(epub_bytes)
+        (extracted / "bundle-manifest.json").write_bytes(canonical_json_bytes(manifest))
+        try:
+            os.symlink(extracted, link, target_is_directory=True)
+        except FileExistsError:
+            shutil.rmtree(extracted, ignore_errors=True)
     def seal_bundle(self, snapshot: RevisionSnapshot, provenance: Mapping[str, Any], epub: bytes | Path | str, *, render_input_artifact_id: str | None = None, edge_ids: Sequence[str] = (), epub_filename: str = "book.epub", expected_embedded_provenance: Mapping[str, Any] | None = None) -> Path:
         if not isinstance(snapshot, RevisionSnapshot): raise ArtifactError("snapshot must be RevisionSnapshot")
         if not isinstance(provenance, Mapping): raise ArtifactError("provenance must be an object")
@@ -1486,12 +1648,17 @@ class V2RevisionStore:
         members.update({f"edges/{eid}.json":data for eid,data in edges.items()})
         members.update({f"attestations/{aid}.json":canonical_json_bytes(body) for aid,body in attestations.items()})
         try:
-            return self.storage.seal_revision(
+            result = self.storage.seal_revision(
                 snapshot.revision_id, _v2_snapshot_bytes(snapshot, edge_ids), members,
+                activate=False,
             )
+            self._publish_compat_view(snapshot, provenance, epub_bytes, epub_filename=epub_filename,
+                                       render_input_artifact_id=render_input_artifact_id,
+                                       render_input_hash=render_hash)
+            return _V2BundlePath(result, self._archive_dir / snapshot.revision_id)
         except StorageError as exc: raise ArtifactError(str(exc)) from exc
     def verify_bundle(self, revision_id: str) -> RevisionSnapshot:
-        path=self._revision_path(revision_id)
+        path=self._archive_path(revision_id)
         try:
             values=self.storage.verify_revision(revision_id)
             snapshot, _selected_edge_ids = _v2_snapshot_from_bytes(values["snapshot.json"])
@@ -1532,7 +1699,7 @@ class V2RevisionStore:
     def active_snapshot(self) -> RevisionSnapshot | None:
         rid=self.storage.active_revision_id(); return None if rid is None else self.snapshot(rid)
     def selected_graph(self, revision_id: str):
-        self.snapshot(revision_id); return V2SealedDependencyGraph(self._revision_path(revision_id), revision_id, self.storage)
+        self.snapshot(revision_id); return V2SealedDependencyGraph(self._archive_path(revision_id), revision_id, self.storage)
 
 
 class _ArtifactStoreFactoryMeta(type):
@@ -1561,7 +1728,12 @@ class DependencyGraph(metaclass=_DependencyGraphFactoryMeta):
         return V2DependencyGraph(root, *args, **kwargs)
 
 
-class RevisionStore:
+class _RevisionStoreFactoryMeta(type):
+    def __instancecheck__(cls, instance: Any) -> bool:
+        return isinstance(instance, (LegacyRevisionStore, LegacyReadOnlyRevisionStore, V2RevisionStore))
+
+
+class RevisionStore(metaclass=_RevisionStoreFactoryMeta):
     def __new__(cls, root: Path | str, *args: Any, **kwargs: Any):
         root=Path(root)
         if kwargs.pop("legacy", False) or _legacy_workspace(root): return LegacyReadOnlyRevisionStore(root, *args, **kwargs)

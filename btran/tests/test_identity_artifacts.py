@@ -215,6 +215,20 @@ def test_v2_put_returns_persisted_envelope_for_existing_immutable_identity(tmp_p
     assert store.storage.findings_for(first.artifact_id) == (first_finding.finding_id,)
 
 
+def test_v2_put_same_record_under_new_key_publishes_exact_new_attestation(tmp_path):
+    store = ArtifactStore(tmp_path)
+    first = store.put("test", {"value": 1}, semantic_key="old-key")
+    second = store.put("test", {"value": 1}, semantic_key="new-key")
+
+    assert second == first
+    new_attestation = store.attestation_id_for(first.artifact_id, "test", "new-key")
+    old_attestation = store.attestation_id_for(first.artifact_id, "test", "old-key")
+    assert new_attestation != old_attestation
+    assert store.has_semantic_attestation(first.artifact_id, "test", "new-key")
+    assert store.get_semantic_attestation(new_attestation)["semantic_key"] == "new-key"
+    assert store.indexed_ids("test", "new-key") == (first.artifact_id,)
+
+
 def test_v2_store_uses_full_durability_schema_and_exact_relations(tmp_path):
     store = ArtifactStore(tmp_path)
     artifact = _store_artifact(store)

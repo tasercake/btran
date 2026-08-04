@@ -372,8 +372,12 @@ class Storage:
         finally:
             connection.close()
 
-    def seal_revision(self, revision_id: str, snapshot: bytes, members: Mapping[str, bytes]) -> Path:
-        """Build, verify, publish, and activate one immutable revision.
+    def seal_revision(self, revision_id: str, snapshot: bytes, members: Mapping[str, bytes], *, activate: bool = True) -> Path:
+        """Build and publish one immutable revision.
+
+        ``activate`` defaults to the low-level historical behavior.  Higher
+        level candidate sealing passes ``False`` so publication does not
+        silently change the selected active revision.
 
         The candidate is always built, including when the revision filename
         already exists.  This prevents a re-seal from silently ignoring new
@@ -457,9 +461,10 @@ class Storage:
                     raise StorageError("immutable revision ID has conflicting content")
                 if row is None:
                     connection.execute("INSERT INTO revisions VALUES(?,?,?,?)", values)
-                connection.execute(
-                    "INSERT INTO active_revision(slot, revision_id) VALUES(1,?) "
-                    "ON CONFLICT(slot) DO UPDATE SET revision_id=excluded.revision_id", (revision_id,))
+                if activate:
+                    connection.execute(
+                        "INSERT INTO active_revision(slot, revision_id) VALUES(1,?) "
+                        "ON CONFLICT(slot) DO UPDATE SET revision_id=excluded.revision_id", (revision_id,))
             self._write(operation)
             return destination
         finally:
