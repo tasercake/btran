@@ -43,6 +43,15 @@ def _text(value: str, name: str) -> str:
     return value
 
 
+def _revision_id(value: str) -> str:
+    """Return a revision ID that is safe to use as one archive filename."""
+    value = _text(value, "revision_id")
+    path = Path(value)
+    if value in {".", ".."} or path.name != value or "\x00" in value:
+        raise StorageError("revision_id must be a safe archive filename")
+    return value
+
+
 def _ids(values: Sequence[str], name: str) -> tuple[str, ...]:
     if not isinstance(values, (list, tuple, set, frozenset)):
         raise StorageError(f"{name} must be a sequence")
@@ -371,7 +380,7 @@ class Storage:
         closure bytes.  Revision insertion and active-pointer publication are
         one SQLite transaction.
         """
-        revision_id = _text(revision_id, "revision_id")
+        revision_id = _revision_id(revision_id)
         if not isinstance(snapshot, bytes) or not isinstance(members, Mapping):
             raise StorageError("snapshot and members have invalid types")
         snapshot = self._canonical_bytes(snapshot, "snapshot")
@@ -614,7 +623,7 @@ class Storage:
 
     def verify_revision(self, revision_id: str) -> Mapping[str, bytes]:
         """Verify an archive and its immutable repository row together."""
-        revision_id = _text(revision_id, "revision_id")
+        revision_id = _revision_id(revision_id)
         row = self.revision_row(revision_id)
         filename = row["zip_filename"]
         if not isinstance(filename, str) or Path(filename).name != filename:
@@ -629,7 +638,7 @@ class Storage:
         return values
 
     def register_revision(self, revision_id: str, zip_filename: str, zip_sha256: str, snapshot: bytes) -> None:
-        revision_id, zip_filename = _text(revision_id, "revision_id"), _text(zip_filename, "zip_filename")
+        revision_id, zip_filename = _revision_id(revision_id), _text(zip_filename, "zip_filename")
         if (Path(zip_filename).name != zip_filename or not isinstance(zip_sha256, str)
                 or len(zip_sha256) != 64 or any(char not in "0123456789abcdef" for char in zip_sha256)):
             raise StorageError("invalid revision row fields")
@@ -637,7 +646,9 @@ class Storage:
         path = self.revisions_dir / zip_filename
         if not path.is_file() or _sha(path.read_bytes()) != zip_sha256:
             raise StorageError("revision row SHA-256 does not match archive")
-        self.verify_zip(path, revision_id=revision_id)
+        values = self.verify_zip(path, revision_id=revision_id)
+        if values["snapshot.json"] != snapshot:
+            raise StorageError("revision snapshot differs from verified archive")
         def operation(connection: sqlite3.Connection) -> None:
             row = connection.execute("SELECT * FROM revisions WHERE revision_id=?", (revision_id,)).fetchone()
             values = (revision_id, zip_filename, zip_sha256, snapshot)

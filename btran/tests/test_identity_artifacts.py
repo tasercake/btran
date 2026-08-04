@@ -266,6 +266,20 @@ def test_legacy_workspace_is_not_migrated_or_mutated_on_read(tmp_path):
     assert marker.exists() and (marker.stat().st_size, marker.stat().st_mtime_ns) == before
 
 
+def test_dotted_legacy_revision_directory_is_read_only(tmp_path):
+    revision = tmp_path / "revisions" / "legacy.v1"
+    revision.mkdir(parents=True)
+    marker = revision / "snapshot.json"
+    marker.write_text("not-json")
+    before = (marker.read_bytes(), marker.stat().st_mtime_ns)
+
+    with pytest.raises(Exception):
+        ArtifactStore(tmp_path).get("missing")
+
+    assert not (tmp_path / "state-v2.sqlite3").exists()
+    assert (marker.read_bytes(), marker.stat().st_mtime_ns) == before
+
+
 def test_every_semantic_key_constructor_mutates_declared_inputs_and_rejects_metadata():
     cases = (
         (source_extraction_semantic_key, dict(extraction_schema="schema", prompt_bytes=b"prompt", model_executable_identity="pi", model_id="model", raw_bytes=b"raw"), {"extraction_schema": "schema-2", "prompt_bytes": b"prompt-2", "model_executable_identity": "pi-2", "model_id": "model-2", "raw_bytes": b"raw-2"}),
@@ -392,6 +406,37 @@ def _rewrite_zip(path: Path, values: dict[str, bytes], order: tuple[str, ...], *
                 info.external_attr ^= 1
             archive.writestr(info, values[name])
     os.replace(temporary, path)
+
+
+@pytest.mark.parametrize("revision_id", ("../bad", "/absolute/bad"))
+def test_revision_id_cannot_escape_revisions_directory(tmp_path, revision_id):
+    storage = Storage(tmp_path)
+    snapshot = RevisionSnapshot(revision_id="safe", selected_artifact_ids=())
+
+    with pytest.raises(StorageError, match="safe archive filename"):
+        storage.seal_revision(revision_id, snapshot.to_json().encode(), {})
+
+    assert not (tmp_path / "bad.zip").exists()
+    assert not (tmp_path / "revisions" / "bad.zip").exists()
+
+
+def test_register_revision_requires_supplied_snapshot_to_match_archive(tmp_path):
+    source_root = tmp_path / "source"
+    source_bundle = Storage(source_root).seal_revision(
+        "revision", RevisionSnapshot(revision_id="revision").to_json().encode(), {}
+    )
+    target = Storage(tmp_path / "target")
+    target_bundle = target.revisions_dir / "revision.zip"
+    target_bundle.write_bytes(source_bundle.read_bytes())
+    snapshot = RevisionSnapshot(revision_id="other")
+
+    with pytest.raises(StorageError, match="differs from verified archive"):
+        target.register_revision(
+            "revision", "revision.zip", hashlib.sha256(target_bundle.read_bytes()).hexdigest(),
+            snapshot.to_json().encode(),
+        )
+    with pytest.raises(StorageError, match="missing revision"):
+        target.revision_row("revision")
 
 
 def test_v2_writer_uses_wal_full_checkpoint_and_fsync(tmp_path, monkeypatch):

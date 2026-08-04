@@ -1182,7 +1182,7 @@ def _legacy_workspace(root: Path) -> bool:
     if (root / "state-v2.sqlite3").exists():
         return False
     return any((root / name).exists() for name in ("artifacts", "findings", "index", "attestations", "graph", "active-revision.json")) or any(
-        path.is_dir() and not path.name.startswith(".") and path.suffix == "" for path in (root / "revisions").glob("*")
+        path.is_dir() and not path.name.startswith(".") for path in (root / "revisions").glob("*")
     ) if (root / "revisions").exists() else any((root / name).exists() for name in ("artifacts", "findings", "index", "attestations", "graph", "active-revision.json"))
 
 
