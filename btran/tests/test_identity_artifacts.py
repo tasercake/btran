@@ -241,6 +241,25 @@ def test_v2_store_uses_full_durability_schema_and_exact_relations(tmp_path):
     assert store.get(artifact.artifact_id) == artifact
 
 
+def test_v2_compact_layout_has_no_loose_compatibility_state(tmp_path):
+    store = ArtifactStore(tmp_path)
+    artifact = _store_artifact(store)
+    snapshot = RevisionSnapshot(revision_id="compact", selected_artifact_ids=(artifact.artifact_id,))
+    bundle = RevisionStore(tmp_path).seal_bundle(snapshot, {"run": "compact"}, b"")
+
+    assert bundle == tmp_path / "revisions" / "compact.zip"
+    assert not (tmp_path / "artifacts").exists()
+    assert not (tmp_path / "findings").exists()
+    assert not (tmp_path / "attestations").exists()
+    assert not (tmp_path / "revisions" / "compact").exists()
+    assert not any(path.is_symlink() for path in tmp_path.rglob("*"))
+    with zipfile.ZipFile(bundle) as archive:
+        snapshot_body = json.loads(archive.read("snapshot.json"))
+        manifest = json.loads(archive.read("manifest.json"))
+    assert "selected_edge_ids" not in snapshot_body
+    assert manifest["edge_ids"] == []
+
+
 def test_v2_sealed_zip_is_deterministic_self_contained_and_active_pointer_is_db(tmp_path):
     store = ArtifactStore(tmp_path)
     artifact = _store_artifact(store)

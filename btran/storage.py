@@ -372,7 +372,7 @@ class Storage:
         finally:
             connection.close()
 
-    def seal_revision(self, revision_id: str, snapshot: bytes, members: Mapping[str, bytes], *, activate: bool = True) -> Path:
+    def seal_revision(self, revision_id: str, snapshot: bytes, members: Mapping[str, bytes], *, activate: bool = True, edge_ids: Sequence[str] | None = None) -> Path:
         """Build and publish one immutable revision.
 
         ``activate`` defaults to the low-level historical behavior.  Higher
@@ -389,22 +389,15 @@ class Storage:
             raise StorageError("snapshot and members have invalid types")
         snapshot = self._canonical_bytes(snapshot, "snapshot")
         all_members = {"snapshot.json": snapshot, **dict(members)}
-        # Bind every newly sealed v2 archive to the exact edge selection.  The
-        # optional field keeps already-sealed v2 snapshots readable while
-        # making standalone verification reject an added valid relationship.
-        try:
-            from btran.artifacts import _v2_snapshot_bytes, _v2_snapshot_from_bytes
-            base_snapshot, selected_edge_ids = _v2_snapshot_from_bytes(snapshot)
-            if selected_edge_ids is None:
-                selected_edge_ids = tuple(sorted(
-                    name[6:-5] for name in all_members
-                    if name.startswith("edges/") and name.endswith(".json")
-                ))
-                snapshot = _v2_snapshot_bytes(base_snapshot, selected_edge_ids)
-                all_members["snapshot.json"] = snapshot
-        except (ImportError, ValueError):
-            # Non-v2 callers retain the strict canonical-byte behavior below.
-            pass
+        # Edge selection is revision metadata, not a canonical snapshot
+        # extension. Direct callers select all supplied edge members.
+        selected_edge_ids = (
+            _ids(edge_ids, "edge_ids") if edge_ids is not None else
+            tuple(sorted(
+                name[6:-5] for name in all_members
+                if name.startswith("edges/") and name.endswith(".json")
+            ))
+        )
         if "manifest.json" in all_members or any(
             not isinstance(name, str) or not name or name.startswith("/") or ".." in Path(name).parts
             for name in all_members
@@ -416,7 +409,10 @@ class Storage:
         # accept an opaque/raw member escape hatch.
         for name, data in all_members.items():
             self._canonical_bytes(data, name)
-        manifest = {"members": {name: _sha(data) for name, data in sorted(all_members.items(), key=lambda item: item[0].encode("utf-8"))}}
+        manifest = {
+            "members": {name: _sha(data) for name, data in sorted(all_members.items(), key=lambda item: item[0].encode("utf-8"))},
+            "edge_ids": list(selected_edge_ids),
+        }
         all_members["manifest.json"] = canonical_json_bytes(manifest)
         filename = f"{revision_id}.zip"
         destination = self.revisions_dir / filename
@@ -506,9 +502,17 @@ class Storage:
             manifest = json.loads(values["manifest.json"].decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError, KeyError) as exc:
             raise StorageError("invalid revision manifest") from exc
-        if (canonical_json_bytes(manifest) != values["manifest.json"] or set(manifest) != {"members"}
+        if (canonical_json_bytes(manifest) != values["manifest.json"]
+                or set(manifest) not in ({"members"}, {"members", "edge_ids"})
                 or not isinstance(manifest["members"], dict)):
             raise StorageError("non-canonical revision manifest")
+        if "edge_ids" in manifest:
+            selected_edge_ids = _ids(manifest["edge_ids"], "edge_ids")
+        else:
+            selected_edge_ids = tuple(sorted(
+                name[6:-5] for name in values
+                if name.startswith("edges/") and name.endswith(".json")
+            ))
         expected_names = set(manifest["members"]) | {"manifest.json"}
         if set(values) != expected_names or "snapshot.json" not in manifest["members"]:
             raise StorageError("revision manifest member set mismatch")
@@ -524,12 +528,11 @@ class Storage:
 
         # Decode every selected closure object and recompute its canonical ID.
         try:
-            from btran.artifacts import (
-                _v2_snapshot_from_bytes, artifact_id_for, dependency_edge_id_for,
-                V2ArtifactStore,
-            )
-            from btran.schema import ArtifactEnvelope, DependencyGraphEdge, Finding, SchemaError
-            snapshot, selected_edge_ids = _v2_snapshot_from_bytes(values["snapshot.json"])
+            from btran.artifacts import artifact_id_for, dependency_edge_id_for, V2ArtifactStore
+            from btran.schema import ArtifactEnvelope, DependencyGraphEdge, Finding, RevisionSnapshot, SchemaError
+            snapshot = RevisionSnapshot.from_json(values["snapshot.json"].decode("utf-8"))
+            if canonical_json_bytes(snapshot.to_dict()) != values["snapshot.json"]:
+                raise StorageError("non-canonical revision snapshot")
         except (KeyError, UnicodeDecodeError, SchemaError, ValueError, TypeError) as exc:
             raise StorageError("invalid revision snapshot") from exc
         if revision_id is not None and snapshot.revision_id != revision_id:
@@ -617,7 +620,7 @@ class Storage:
             raise StorageError("sealed revision contains records or findings outside selected closure")
         if set(attestations) != selected_attestations:
             raise StorageError("sealed revision contains attestations outside selected closure")
-        if selected_edge_ids is not None and set(edges) != set(selected_edge_ids):
+        if set(edges) != set(selected_edge_ids):
             raise StorageError("sealed revision edges differ from selected snapshot closure")
         for body in attestations.values():
             record = records.get(body["artifact_id"])
