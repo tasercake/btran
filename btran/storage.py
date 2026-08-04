@@ -534,22 +534,60 @@ class Storage:
                     attestations[aid] = body
         except (UnicodeDecodeError, json.JSONDecodeError, SchemaError, TypeError, KeyError) as exc:
             raise StorageError("invalid sealed closure member") from exc
-        if (not set(snapshot.selected_artifact_ids).issubset(records)
-                or not set(snapshot.selected_finding_ids).issubset(findings)
-                or not set(snapshot.selected_cache_attestation_ids).issubset(attestations)):
+        selected_records = set(snapshot.selected_artifact_ids)
+        selected_findings = set(snapshot.selected_finding_ids)
+        selected_attestations = set(snapshot.selected_cache_attestation_ids)
+        if (not selected_records.issubset(records)
+                or not selected_findings.issubset(findings)
+                or not selected_attestations.issubset(attestations)):
             raise StorageError("sealed revision omits selected closure")
-        for record in records.values():
-            if not set(record.dependency_ids).issubset(records) or not set(record.finding_ids).issubset(findings):
-                raise StorageError("sealed record relationship escapes closure")
-        for finding in findings.values():
-            if not set(finding.dependency_ids).issubset(records):
-                raise StorageError("sealed finding relationship escapes closure")
+
+        # Compute the closure from the selected roots, rather than treating
+        # the snapshot IDs as a lower bound.  The archive is standalone: an
+        # unrelated valid object must not become part of the authority merely
+        # because its bytes and identity are valid.
+        expected_records = set(selected_records)
+        expected_findings = set(selected_findings)
+        pending_records = list(expected_records)
+        pending_findings = list(expected_findings)
+        while pending_records or pending_findings:
+            while pending_records:
+                record = records.get(pending_records.pop())
+                if record is None:
+                    raise StorageError("sealed revision omits selected closure")
+                for dependency_id in record.dependency_ids:
+                    if dependency_id not in records:
+                        raise StorageError("sealed record relationship escapes closure")
+                    if dependency_id not in expected_records:
+                        expected_records.add(dependency_id)
+                        pending_records.append(dependency_id)
+                for finding_id in record.finding_ids:
+                    if finding_id not in findings:
+                        raise StorageError("sealed record relationship escapes closure")
+                    if finding_id not in expected_findings:
+                        expected_findings.add(finding_id)
+                        pending_findings.append(finding_id)
+            while pending_findings:
+                finding = findings.get(pending_findings.pop())
+                if finding is None:
+                    raise StorageError("sealed revision omits selected closure")
+                for dependency_id in finding.dependency_ids:
+                    if dependency_id not in records:
+                        raise StorageError("sealed finding relationship escapes closure")
+                    if dependency_id not in expected_records:
+                        expected_records.add(dependency_id)
+                        pending_records.append(dependency_id)
+
+        if set(records) != expected_records or set(findings) != expected_findings:
+            raise StorageError("sealed revision contains records or findings outside selected closure")
+        if set(attestations) != selected_attestations:
+            raise StorageError("sealed revision contains attestations outside selected closure")
         for body in attestations.values():
             record = records.get(body["artifact_id"])
             if record is None or body["kind"] != record.kind or tuple(body["dependency_ids"]) != record.dependency_ids:
                 raise StorageError("sealed attestation relationship escapes closure")
         for edge in edges.values():
-            if edge.parent_artifact_id not in records or edge.child_artifact_id not in records:
+            if edge.parent_artifact_id not in expected_records or edge.child_artifact_id not in expected_records:
                 raise StorageError("sealed edge relationship escapes closure")
         return values
 

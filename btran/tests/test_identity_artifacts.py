@@ -463,6 +463,41 @@ def test_v2_standalone_verification_rejects_archive_corruption(tmp_path, corrupt
         Storage(tmp_path).verify_zip(bundle, revision_id="revision")
 
 
+def test_v2_standalone_verification_rejects_unrelated_valid_closure_members(tmp_path):
+    store = ArtifactStore(tmp_path)
+    selected = _store_artifact(store, payload={"value": "selected"})
+    selected_snapshot = RevisionSnapshot(revision_id="revision", selected_artifact_ids=(selected.artifact_id,))
+    bundle = RevisionStore(tmp_path).seal_bundle(selected_snapshot, {}, b"")
+
+    unrelated_finding = Finding(kind="unrelated", severity="info", stage="other", message="not selected")
+    store.put_finding(unrelated_finding)
+    unrelated = store.put("unrelated", {"value": "unselected"}, finding_ids=(unrelated_finding.finding_id,), semantic_key="unrelated")
+    graph = DependencyGraph(tmp_path)
+    unrelated_edge = graph.edge(stable_subject_id="unrelated", parent_artifact_id=selected.artifact_id,
+                                child_artifact_id=unrelated.artifact_id, stage="other", edge_kind="unrelated")
+    graph.put(unrelated_edge)
+    unrelated_attestation_id = store.attestation_id_for(unrelated.artifact_id, unrelated.kind, unrelated.semantic_key)
+
+    with zipfile.ZipFile(bundle) as archive:
+        values = {name: archive.read(name) for name in archive.namelist()}
+    extras = {
+        f"records/{unrelated.artifact_id}.json": unrelated.to_json().encode(),
+        f"findings/{unrelated_finding.finding_id}.json": unrelated_finding.to_json().encode(),
+        f"edges/{unrelated_edge.edge_id}.json": unrelated_edge.to_json().encode(),
+        f"attestations/{unrelated_attestation_id}.json": canonical_json_bytes(store.get_semantic_attestation(unrelated_attestation_id)),
+    }
+    manifest = json.loads(values["manifest.json"])
+    for name, data in extras.items():
+        values[name] = data
+        manifest["members"][name] = hashlib.sha256(data).hexdigest()
+    values["manifest.json"] = canonical_json_bytes(manifest)
+    order = tuple(sorted((name for name in values if name != "manifest.json"), key=lambda name: name.encode())) + ("manifest.json",)
+    _rewrite_zip(bundle, values, order)
+
+    with pytest.raises(StorageError, match="outside selected closure"):
+        Storage(tmp_path).verify_zip(bundle, revision_id="revision")
+
+
 def _tree_state(root: Path) -> dict[str, tuple[bytes, int]]:
     return {
         str(path.relative_to(root)): (path.read_bytes(), path.stat().st_mtime_ns)
