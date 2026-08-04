@@ -376,6 +376,22 @@ class Storage:
             raise StorageError("snapshot and members have invalid types")
         snapshot = self._canonical_bytes(snapshot, "snapshot")
         all_members = {"snapshot.json": snapshot, **dict(members)}
+        # Bind every newly sealed v2 archive to the exact edge selection.  The
+        # optional field keeps already-sealed v2 snapshots readable while
+        # making standalone verification reject an added valid relationship.
+        try:
+            from btran.artifacts import _v2_snapshot_bytes, _v2_snapshot_from_bytes
+            base_snapshot, selected_edge_ids = _v2_snapshot_from_bytes(snapshot)
+            if selected_edge_ids is None:
+                selected_edge_ids = tuple(sorted(
+                    name[6:-5] for name in all_members
+                    if name.startswith("edges/") and name.endswith(".json")
+                ))
+                snapshot = _v2_snapshot_bytes(base_snapshot, selected_edge_ids)
+                all_members["snapshot.json"] = snapshot
+        except (ImportError, ValueError):
+            # Non-v2 callers retain the strict canonical-byte behavior below.
+            pass
         if "manifest.json" in all_members or any(
             not isinstance(name, str) or not name or name.startswith("/") or ".." in Path(name).parts
             for name in all_members
@@ -492,9 +508,12 @@ class Storage:
 
         # Decode every selected closure object and recompute its canonical ID.
         try:
-            from btran.artifacts import artifact_id_for, dependency_edge_id_for, V2ArtifactStore
-            from btran.schema import ArtifactEnvelope, DependencyGraphEdge, Finding, RevisionSnapshot, SchemaError
-            snapshot = RevisionSnapshot.from_json(values["snapshot.json"].decode("utf-8"))
+            from btran.artifacts import (
+                _v2_snapshot_from_bytes, artifact_id_for, dependency_edge_id_for,
+                V2ArtifactStore,
+            )
+            from btran.schema import ArtifactEnvelope, DependencyGraphEdge, Finding, SchemaError
+            snapshot, selected_edge_ids = _v2_snapshot_from_bytes(values["snapshot.json"])
         except (KeyError, UnicodeDecodeError, SchemaError, ValueError, TypeError) as exc:
             raise StorageError("invalid revision snapshot") from exc
         if revision_id is not None and snapshot.revision_id != revision_id:
@@ -582,6 +601,8 @@ class Storage:
             raise StorageError("sealed revision contains records or findings outside selected closure")
         if set(attestations) != selected_attestations:
             raise StorageError("sealed revision contains attestations outside selected closure")
+        if selected_edge_ids is not None and set(edges) != set(selected_edge_ids):
+            raise StorageError("sealed revision edges differ from selected snapshot closure")
         for body in attestations.values():
             record = records.get(body["artifact_id"])
             if record is None or body["kind"] != record.kind or tuple(body["dependency_ids"]) != record.dependency_ids:

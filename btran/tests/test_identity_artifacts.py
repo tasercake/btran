@@ -244,6 +244,20 @@ def test_v2_exact_key_attestation_and_index_are_inspectable(tmp_path):
     assert validator.select(snapshot, requested_artifact_id=first.artifact_id, kind="test", key_constructor=lambda *, value: value, value="same") is None
 
 
+def test_cache_reuse_does_not_require_semantic_index_membership(tmp_path, monkeypatch):
+    store = ArtifactStore(tmp_path)
+    selected = _store_artifact(store, payload={"value": 1}, semantic_key="same")
+    snapshot = RevisionSnapshot(
+        revision_id="selected", selected_artifact_ids=(selected.artifact_id,),
+        selected_cache_attestation_ids=(store.attestation_id_for(selected.artifact_id, "test", "same"),),
+    )
+    monkeypatch.setattr(store, "indexed_ids", lambda kind, key: ())
+    assert CacheValidator(store).select(
+        snapshot, requested_artifact_id=selected.artifact_id, kind="test",
+        key_constructor=lambda *, value: value, value="same",
+    ) == selected
+
+
 def test_legacy_workspace_is_not_migrated_or_mutated_on_read(tmp_path):
     legacy = tmp_path / "artifacts"; legacy.mkdir(); marker = legacy / "old.json"; marker.write_text("not-json")
     before = (marker.stat().st_size, marker.stat().st_mtime_ns)
@@ -460,6 +474,36 @@ def test_v2_standalone_verification_rejects_archive_corruption(tmp_path, corrupt
         values["snapshot.json"] = changed.to_json().encode()
         _rewrite_zip(bundle, values, names)
     with pytest.raises(StorageError):
+        Storage(tmp_path).verify_zip(bundle, revision_id="revision")
+
+
+def test_v2_standalone_verification_rejects_extra_selected_relationship_edge(tmp_path):
+    store = ArtifactStore(tmp_path)
+    first = _store_artifact(store, payload={"value": 1})
+    second = store.put("render", {"value": 2}, dependency_ids=(first.artifact_id,), semantic_key="render")
+    graph = DependencyGraph(tmp_path)
+    selected_edge = graph.edge(
+        stable_subject_id="segment", parent_artifact_id=first.artifact_id,
+        child_artifact_id=second.artifact_id, stage="render", edge_kind="input",
+    )
+    extra_edge = graph.edge(
+        stable_subject_id="other-segment", parent_artifact_id=first.artifact_id,
+        child_artifact_id=second.artifact_id, stage="render", edge_kind="input",
+    )
+    graph.put(selected_edge)
+    graph.put(extra_edge)
+    snapshot = RevisionSnapshot(revision_id="revision", selected_artifact_ids=(second.artifact_id,))
+    bundle = RevisionStore(tmp_path).seal_bundle(snapshot, {}, b"", edge_ids=(selected_edge.edge_id,))
+    with zipfile.ZipFile(bundle) as archive:
+        values = {name: archive.read(name) for name in archive.namelist()}
+    extra_name = f"edges/{extra_edge.edge_id}.json"
+    values[extra_name] = extra_edge.to_json().encode("utf-8")
+    manifest = json.loads(values["manifest.json"])
+    manifest["members"][extra_name] = hashlib.sha256(values[extra_name]).hexdigest()
+    values["manifest.json"] = canonical_json_bytes(manifest)
+    order = tuple(sorted((name for name in values if name != "manifest.json"), key=lambda name: name.encode())) + ("manifest.json",)
+    _rewrite_zip(bundle, values, order)
+    with pytest.raises(StorageError, match="edges differ from selected snapshot closure"):
         Storage(tmp_path).verify_zip(bundle, revision_id="revision")
 
 

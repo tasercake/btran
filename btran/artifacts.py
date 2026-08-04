@@ -617,6 +617,43 @@ class LegacyArtifactStore:
         return tuple(artifact_map[key] for key in sorted(artifact_map)), tuple(finding_map[key] for key in sorted(finding_map))
 
 
+def _v2_snapshot_bytes(snapshot: RevisionSnapshot, edge_ids: Sequence[str]) -> bytes:
+    """Serialize a v2 snapshot with its exact selected relationship closure."""
+    if not isinstance(snapshot, RevisionSnapshot):
+        raise ArtifactError("snapshot must be RevisionSnapshot")
+    body = snapshot.to_dict()
+    body["selected_edge_ids"] = list(_ids(edge_ids, "edge_ids"))
+    return canonical_json_bytes(body)
+
+
+def _v2_snapshot_from_bytes(data: bytes) -> tuple[RevisionSnapshot, tuple[str, ...] | None]:
+    """Read a v2 snapshot and its edge selection; accept old snapshots."""
+    if not isinstance(data, bytes):
+        raise ArtifactError("snapshot data must be bytes")
+    try:
+        body = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ArtifactError("invalid v2 snapshot") from exc
+    if not isinstance(body, dict):
+        raise ArtifactError("v2 snapshot must be an object")
+    selected = body.pop("selected_edge_ids", None)
+    if selected is not None:
+        if not isinstance(selected, list):
+            raise ArtifactError("selected_edge_ids must be an array")
+        edge_ids = _ids(selected, "selected_edge_ids")
+        if list(edge_ids) != selected:
+            raise ArtifactError("selected_edge_ids must be sorted and unique")
+    else:
+        edge_ids = None
+    try:
+        snapshot = RevisionSnapshot.from_dict(body)
+    except SchemaError as exc:
+        raise ArtifactError("invalid v2 snapshot") from exc
+    if canonical_json_bytes(body) != canonical_json_bytes(snapshot.to_dict()):
+        raise ArtifactError("v2 snapshot is not canonical")
+    return snapshot, edge_ids
+
+
 class CacheValidator:
     """Fail-closed cache reuse from a named artifact in a named snapshot."""
 
@@ -629,8 +666,9 @@ class CacheValidator:
     ) -> ArtifactEnvelope | None:
         """Return only requested selected artifact after recomputing its key.
 
-        Caller supplies current semantic inputs, not a claimed key.  The exact
-        selected envelope must also remain a member of its matching index set.
+        Caller supplies current semantic inputs, not a claimed key.  Indexes
+        are discovery metadata only; selected closure, key, and attestation
+        authorize reuse.
         """
         if not isinstance(snapshot, RevisionSnapshot):
             raise ArtifactError("snapshot must be RevisionSnapshot")
@@ -648,12 +686,10 @@ class CacheValidator:
             return None
         if requested_artifact_id not in snapshot.selected_artifact_ids:
             return None
-        # Index is discovery data, but exact membership plus immutable
-        # key->canonical-closure attestation are both required.  The envelope's
-        # first-published key is deliberately not authoritative: one identical
-        # artifact can be independently attested by multiple model/prompt keys.
-        if requested_artifact_id not in self.store.indexed_ids(kind, requested_semantic_key):
-            return None
+        # The envelope's first-published key is deliberately not authoritative:
+        # one identical artifact can be independently attested by multiple
+        # model/prompt keys.  Indexes are only candidate discovery and must not
+        # be required for an explicitly selected artifact.
         try:
             envelope = self.store.get(requested_artifact_id)
             if envelope.kind != kind:
@@ -1420,8 +1456,9 @@ class V2RevisionStore:
             envelope = next((a for a in artifacts if a.artifact_id == body.get("artifact_id")), None)
             if envelope is None or body.get("kind") != envelope.kind or tuple(body.get("dependency_ids", ())) != envelope.dependency_ids:
                 raise ArtifactError("semantic attestation escapes selected artifact closure")
+        edge_ids = _ids(edge_ids, "edge_ids")
         edges={}
-        for eid in _ids(edge_ids,"edge_ids"):
+        for eid in edge_ids:
             edge=self.graph.get(eid)
             if edge.parent_artifact_id not in artifact_ids or edge.child_artifact_id not in artifact_ids: raise ArtifactError("bundle graph edge escapes selected closure")
             edges[eid]=edge.to_json().encode("utf-8")
@@ -1446,12 +1483,16 @@ class V2RevisionStore:
         members.update({f"edges/{eid}.json":data for eid,data in edges.items()})
         members.update({f"attestations/{aid}.json":canonical_json_bytes(body) for aid,body in attestations.items()})
         try:
-            return self.storage.seal_revision(snapshot.revision_id, snapshot.to_json().encode("utf-8"), members)
+            return self.storage.seal_revision(
+                snapshot.revision_id, _v2_snapshot_bytes(snapshot, edge_ids), members,
+            )
         except StorageError as exc: raise ArtifactError(str(exc)) from exc
     def verify_bundle(self, revision_id: str) -> RevisionSnapshot:
         path=self._revision_path(revision_id)
-        try: values=self.storage.verify_revision(revision_id); snapshot=RevisionSnapshot.from_json(values["snapshot.json"].decode("utf-8"))
-        except (StorageError, SchemaError, UnicodeDecodeError) as exc: raise ArtifactError(f"invalid or missing sealed revision {revision_id}: {exc}") from exc
+        try:
+            values=self.storage.verify_revision(revision_id)
+            snapshot, _selected_edge_ids = _v2_snapshot_from_bytes(values["snapshot.json"])
+        except (StorageError, SchemaError, UnicodeDecodeError, ArtifactError) as exc: raise ArtifactError(f"invalid or missing sealed revision {revision_id}: {exc}") from exc
         records={}; findings={}
         for name,data in values.items():
             if name.startswith("records/"):
