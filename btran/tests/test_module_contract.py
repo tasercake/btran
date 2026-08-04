@@ -30,8 +30,42 @@ from btran.orchestrator_contract import (
     StageInputs,
     StageOutputs,
     initialized_report,
+    OrderedEffectivePage,
+    SelectedEffectiveContent,
+    CandidateClosure,
 )
+from btran.timing import TimingLedger, noop_timing_ledger
 from btran.schema import EffectivePage, EffectiveSegment, ErrorResult, Manifest, PageResult
+
+
+def test_selected_content_rejects_missing_extra_or_out_of_order_children():
+    first = EffectiveSegment(effective_segment_id="e1", segment_id="s1", source_lang="en", source_text="one", effective_text="one", render_lang="en")
+    second = EffectiveSegment(effective_segment_id="e2", segment_id="s2", source_lang="en", source_text="two", effective_text="two", render_lang="en")
+    page = EffectivePage(effective_page_id="ep", page_id="p", effective_segment_ids=("e1", "e2"), source_langs=("en",))
+    with pytest.raises(ValueError, match="exactly match"):
+        OrderedEffectivePage(page, (second, first))
+    ordered = OrderedEffectivePage(page, (first, second))
+    selected = SelectedEffectiveContent((ordered,), finding_ids=("f1", "f2"))
+    assert selected.effective_segment_ids == ("e1", "e2")
+    assert selected.finding_ids == ("f1", "f2")
+    with pytest.raises(ValueError, match="duplicates"):
+        CandidateClosure(("stage-1", "stage-1"))
+
+
+def test_timing_boundaries_are_one_way_and_noop_is_finite():
+    ledger = TimingLedger("run_benchmark_case")
+    with ledger.model_execution():
+        with ledger.model_execution():
+            pass
+    snapshot = ledger.snapshot_before_report_persist()
+    assert snapshot["clock"] == "perf_counter_ns"
+    completion = ledger.complete_before_timing_serialization()
+    assert completion.to_dict()["completion_boundary"] == "before_completion_timing_serialization"
+    with pytest.raises(RuntimeError):
+        ledger.snapshot_before_report_persist()
+    noop = noop_timing_ledger()
+    noop.snapshot_before_report_persist()
+    assert noop.complete_before_timing_serialization().whole_process_wall_ms == 0.0
 
 
 @pytest.mark.asyncio
