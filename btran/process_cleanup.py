@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
+from enum import Enum
 import os
 import signal
 import subprocess
@@ -13,6 +14,19 @@ from typing import Any, Iterable
 TERM_GRACE_SECONDS = 2.0
 KILL_GRACE_SECONDS = 2.0
 TAIL_LIMIT = 8_192
+
+
+class CleanupCause(str, Enum):
+    """The only conditions under which a spawned process may be cleaned up."""
+
+    CANCELLATION = "cancellation"
+    FAILURE = "failure"
+
+
+def _validate_cleanup_cause(cause: CleanupCause) -> CleanupCause:
+    if not isinstance(cause, CleanupCause):
+        raise ValueError(f"invalid cleanup cause: {cause!r}")
+    return cause
 
 
 @dataclass(frozen=True)
@@ -228,9 +242,11 @@ def _signal_phase(proc: Any, tracked: _TrackedProcesses, sig: signal.Signals) ->
             pass
 
 
-def cleanup_popen(proc: subprocess.Popen[Any], *, term_grace: float = TERM_GRACE_SECONDS,
+def cleanup_popen(proc: subprocess.Popen[Any], *, cause: CleanupCause,
+                  term_grace: float = TERM_GRACE_SECONDS,
                   kill_grace: float = KILL_GRACE_SECONDS) -> tuple[str, str]:
     """TERM/KILL worker group plus escaped pipe owners; every wait is bounded."""
+    _validate_cleanup_cause(cause)
     streams = (proc.stdout, proc.stderr)
     tracked = _capture(proc.pid, _pipe_ids_from_fds(
         stream.fileno() for stream in streams if stream is not None
@@ -270,9 +286,11 @@ def _async_pipe_ids(proc: asyncio.subprocess.Process) -> set[str]:
     return _pipe_ids_from_fds(fds)
 
 
-async def cleanup_async_process(proc: asyncio.subprocess.Process, *, term_grace: float = TERM_GRACE_SECONDS,
+async def cleanup_async_process(proc: asyncio.subprocess.Process, *, cause: CleanupCause,
+                                term_grace: float = TERM_GRACE_SECONDS,
                                 kill_grace: float = KILL_GRACE_SECONDS) -> tuple[str, str]:
     """Async counterpart of :func:`cleanup_popen`, with bounded communicate/reap."""
+    _validate_cleanup_cause(cause)
     tracked = _capture(proc.pid, _async_pipe_ids(proc))
     _signal_phase(proc, tracked, signal.SIGTERM)
     first_out, first_err = await _communicate_async(proc, term_grace)

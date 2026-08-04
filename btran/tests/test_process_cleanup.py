@@ -8,6 +8,31 @@ import pytest
 import btran.process_cleanup as cleanup
 
 
+@pytest.mark.parametrize("cause", [None, "failure", object()])
+def test_popen_rejects_invalid_cause_before_process_operations(cause):
+    proc = Mock()
+    with patch.object(cleanup, "_capture") as capture, pytest.raises(ValueError):
+        cleanup.cleanup_popen(proc, cause=cause)
+    capture.assert_not_called()
+
+
+@pytest.mark.parametrize("cause", [None, "cancellation", object()])
+@pytest.mark.asyncio
+async def test_async_cleanup_rejects_invalid_cause_before_process_operations(cause):
+    proc = Mock()
+    with patch.object(cleanup, "_capture") as capture, pytest.raises(ValueError):
+        await cleanup.cleanup_async_process(proc, cause=cause)
+    capture.assert_not_called()
+
+
+def test_cleanup_requires_cause():
+    proc = Mock()
+    with pytest.raises(TypeError):
+        cleanup.cleanup_popen(proc)
+    with pytest.raises(TypeError):
+        cleanup.cleanup_async_process(proc)
+
+
 @pytest.mark.parametrize(
     ("sig", "method"),
     [(cleanup.signal.SIGTERM, "terminate"), (cleanup.signal.SIGKILL, "kill")],
