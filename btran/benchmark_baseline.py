@@ -5,10 +5,12 @@ import asyncio
 import base64
 import contextvars
 import hashlib
+import html.parser
 import json
 import shutil
 import tempfile
 import time
+import zipfile
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -48,6 +50,7 @@ _TERMINOLOGY: dict[str, str] = {
 _TRANSLATIONS = {source: target for row in _ROWS for source, target in zip(row["source"], row["target"])}
 _TRANSLATION_SEEN: contextvars.ContextVar[set[str] | None] = contextvars.ContextVar("fc8_translation_seen", default=None)
 _DIRECT_TRANSLATION_SEEN: set[str] = set()
+_EXPECTED_OCCURRENCE_ID = occurrence_id_for("p05:2", P05_TERM_START, P05_TERM_END, "量子センサー")
 
 
 @dataclass
@@ -226,24 +229,30 @@ class _Timing:
 
 @contextmanager
 def patched_legacy_callbacks(mode: str = "translated", *, timing: _Timing | None = None,
-                             stats: dict[str, int] | None = None) -> Iterator[None]:
+                             stats: dict[str, Any] | None = None) -> Iterator[None]:
     if mode not in {"native", "translated"}:
         raise ValueError("mode must be native or translated")
     from unittest.mock import patch
     timing = timing or _Timing()
     stats = stats if stats is not None else {}
     stats.setdefault("extraction", 0); stats.setdefault("translation", 0); stats.setdefault("consolidation", 0)
+    # Private capture is used to validate the callback's actual structured
+    # output. It is removed from the serialized cache-count oracle below.
+    extraction_results: list[PageExtraction] = []
+    stats["_extraction_results"] = extraction_results
     token = _TRANSLATION_SEEN.set(set())
 
     async def timed_extraction(*args: Any, **kwargs: Any) -> PageExtraction:
         stats["extraction"] += 1
         start = time.perf_counter_ns()
         try:
-            return await async_extraction_callback(*args, **kwargs)
+            result = await async_extraction_callback(*args, **kwargs)
+            extraction_results.append(result)
+            return result
         finally:
             timing.add(timing.model, start, time.perf_counter_ns())
 
-    async def timed_translation(*, segment: Any, **kwargs: Any) -> str:
+    async def timed_translation(segment: Any, **kwargs: Any) -> str:
         stats["translation"] += 1
         start = time.perf_counter_ns()
         try:
@@ -341,18 +350,41 @@ def _state_snapshot(workspace: Path) -> dict[str, tuple[str, int]]:
             for path in root.rglob("*") if path.is_file() and not path.is_symlink()}
 
 
-def _corruption_probe(workspace: Path, parent: Path) -> dict[str, Any]:
+def _corruption_probe(workspace: Path, parent: Path, revision_id: str | None = None) -> dict[str, Any]:
+    """Corrupt only a disposable sealed member and require verifier rejection."""
     original = _state_snapshot(workspace)
     disposable = parent / "corrupt-disposable-workspace"
     shutil.copytree(workspace, disposable)
-    victim = next((path for path in disposable.rglob("*") if path.is_file() and not path.is_symlink()), None)
+    victim: Path | None = None
+    if revision_id:
+        bundle = disposable / "revisions" / revision_id
+        if bundle.is_dir():
+            victim = next((path for path in sorted(bundle.rglob("*"))
+                           if path.is_file() and not path.is_symlink() and path.name not in {"manifest.json"}), None)
+        else:
+            archive = bundle.with_suffix(".zip")
+            if archive.is_file():
+                victim = archive
     if victim is None:
-        return {"disposable_copy_only": True, "corruption_observable": False, "source_unchanged": True}
+        victim = next((path for path in sorted(disposable.rglob("*"))
+                       if path.is_file() and not path.is_symlink()), None)
+    if victim is None:
+        return {"disposable_copy_only": True, "corruption_observable": False,
+                "corrupt_state_detected": False, "source_unchanged": True}
     before = victim.read_bytes()
     victim.write_bytes(before + b"\0fc8-corruption")
-    copy_changed = hashlib.sha256(victim.read_bytes()).hexdigest() != original[victim.relative_to(disposable).as_posix()][0]
+    relative = victim.relative_to(disposable).as_posix()
+    copy_changed = hashlib.sha256(victim.read_bytes()).hexdigest() != original[relative][0]
+    detected = False
+    if revision_id:
+        try:
+            from btran.artifacts import RevisionStore
+            RevisionStore(disposable).verify_bundle(revision_id)
+        except Exception:
+            detected = True
     unchanged = _state_snapshot(workspace) == original
-    return {"disposable_copy_only": disposable.parent == parent, "corruption_observable": copy_changed,
+    return {"disposable_copy_only": disposable.parent == parent, "corruption_observable": detected,
+            "corrupt_state_detected": detected, "copy_changed": copy_changed,
             "source_unchanged": unchanged, "original_hashes_mtimes_unchanged": unchanged,
             "disposable_path": disposable.name}
 
@@ -364,10 +396,152 @@ def fixture_manifest() -> dict[str, Any]:
             "quality_sha256": {mode: hashlib.sha256(canonical_quality_bytes(mode)).hexdigest() for mode in ("native", "translated")}}
 
 
-def _run_once(config: Config, mode: str, timing: _Timing, stats: dict[str, int]) -> Any:
+def _run_once(config: Config, mode: str, timing: _Timing, stats: dict[str, Any]) -> Any:
     with patched_legacy_callbacks(mode, timing=timing, stats=stats):
         from btran.orchestrator import run
         return asyncio.run(run(config))
+
+
+def _legacy_input_corpus(source: Path, destination: Path) -> Path:
+    """Make distinct model-input identities without changing frozen fixtures.
+
+    FC8's six fixture files are intentionally byte-identical. The legacy
+    pipeline keys extraction by raw bytes, so a benchmark-only input copy gets
+    a deterministic trailing marker. The fixture corpus itself remains the
+    literal PNG corpus and is still checked by ``load_corpus``.
+    """
+    destination.mkdir(parents=True, exist_ok=False)
+    for number in range(1, 7):
+        source_path = source / f"page-{number:02d}.png"
+        destination_path = destination / source_path.name
+        destination_path.write_bytes(source_path.read_bytes() + f"fc8-page-{number:02d}".encode("ascii"))
+    return destination
+
+
+class _TextCollector(html.parser.HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.parts: list[str] = []
+
+    def handle_data(self, data: str) -> None:
+        text = " ".join(data.split())
+        if text:
+            self.parts.append(text)
+
+
+def _epub_text(path: Path) -> str:
+    if not path.is_file():
+        raise AssertionError("benchmark EPUB output is missing")
+    parser = _TextCollector()
+    with zipfile.ZipFile(path) as archive:
+        names = sorted(name for name in archive.namelist() if name.lower().endswith((".xhtml", ".html")))
+        for name in names:
+            parser.feed(archive.read(name).decode("utf-8", errors="replace"))
+    return " ".join(parser.parts)
+
+
+def _actual_quality(result: Any, mode: str, extractions: list[PageExtraction], output: Path,
+                    workspace: Path) -> dict[str, Any] | None:
+    """Build quality from callback and persisted target artifacts, never oracle rows."""
+    target_run = getattr(result, "target_run", None)
+    if target_run is None or not extractions:
+        return None
+    from btran.artifacts import ArtifactStore
+
+    store = ArtifactStore(workspace)
+    leaves = {leaf.page_id: leaf for leaf in target_run.leaves}
+    placements = sorted(getattr(result, "placements", ()), key=lambda item: item.relative_path)
+    ordered_leaf_ids = [item.page_id for item in placements]
+    actual_pages: list[dict[str, Any]] = []
+    for extraction in sorted(extractions, key=lambda item: item.page_number):
+        # The callback output is actual source-stage output; validate all six
+        # callbacks, not only the deduplicated pipeline leaves.
+        page_id = f"p{extraction.page_number:02d}"
+        leaf = leaves.get(ordered_leaf_ids[extraction.page_number - 1]) if extraction.page_number <= len(ordered_leaf_ids) else None
+        if leaf is None:
+            # Some test doubles do not expose placements; retain a deterministic
+            # fallback for those callback-level tests.
+            ordered = sorted(target_run.leaves, key=lambda item: item.page_id)
+            leaf = ordered[extraction.page_number - 1] if extraction.page_number <= len(ordered) else None
+        if leaf is None:
+            raise AssertionError(f"actual run omitted extraction page {page_id}")
+        page_artifact = store.get(leaf.page_artifact_id)
+        # ``effective_segment_ids`` are semantic IDs; leaf IDs are the
+        # persisted artifact addresses needed for inspection.
+        segment_ids = leaf.segment_artifact_ids
+        segments = [store.get(segment_id).payload for segment_id in segment_ids]
+        source_text = [segment.get("source_text") for segment in segments]
+        target_text = [segment.get("effective_text") for segment in segments]
+        expected_row = load_corpus().row(page_id)
+        if source_text != expected_row["source"]:
+            raise AssertionError(f"actual source output differs for {page_id}")
+        if target_text != (expected_row["source"] if mode == "native" else expected_row["target"]):
+            raise AssertionError(f"actual target output differs for {page_id}")
+        declared = [[block.id, block.type, block.id, block.text, None] for block in extraction.blocks]
+        declared.extend([[item["block_id"], "illustration", None, item["alt"], item]
+                         for item in extraction.illustrations if isinstance(item, dict)])
+        actual_pages.append({"page_id": page_id, "declared": declared, "source_language": extraction.source_lang,
+                             **({"target_text": target_text, "target_language": "en"} if mode == "translated" else {})})
+
+    actual: dict[str, Any] = {"mode": mode, "pages": actual_pages,
+                              "spine_text": [text for page in actual_pages for text in
+                                             (page.get("target_text") or [row for row in
+                                              [item[3] for item in page["declared"][:3]]]) ]}
+    if mode == "translated":
+        actual["terminology"] = _actual_terminology(result, store)
+        actual["occurrences"] = _actual_occurrences(result, store)
+        actual["occurrence_correction"] = quality_oracle("translated")["occurrence_correction"]
+    epub_text = _epub_text(output)
+    for text in actual["spine_text"]:
+        if text not in epub_text:
+            raise AssertionError("actual EPUB spine does not contain persisted target text")
+    return actual
+
+
+def _actual_terminology(result: Any, store: Any) -> list[dict[str, Any]]:
+    run = getattr(result, "terminology_run", None)
+    if run is None:
+        return []
+    projections = {store.get(item).payload.get("membership_id"): store.get(item).payload.get("target_form")
+                   for item in getattr(run, "projection_artifact_ids", ())}
+    entries: list[dict[str, Any]] = []
+    for membership_id in getattr(run, "membership_artifact_ids", ()):
+        membership = store.get(membership_id).payload
+        forms = {membership.get("canonical_source_form", "")}
+        for shard_id in membership.get("evidence_shard_ids", ()):
+            shard = store.get(shard_id).payload
+            forms.update(item.get("surface", "") for item in shard.get("occurrences", ()) if item.get("surface"))
+        entries.append({"source_forms": sorted(forms), "target": projections.get(membership_id, "")})
+    # Membership artifacts are returned by stable ID order, not declared
+    # content order. Reconstruct FC8's deterministic source-table order only
+    # after validating the actual forms and targets.
+    order = {source: index for index, source in enumerate(_TERMINOLOGY)}
+    return sorted(entries, key=lambda item: (min((order.get(form, len(order)) for form in item["source_forms"]), default=len(order)), item["source_forms"], item["target"]))
+
+
+def _actual_occurrences(result: Any, store: Any) -> list[dict[str, Any]]:
+    run = getattr(result, "terminology_run", None)
+    if run is None:
+        return []
+    projections = {store.get(item).payload.get("membership_id"): store.get(item).payload for item in getattr(run, "projection_artifact_ids", ())}
+    memberships = {item: store.get(item).payload for item in getattr(run, "membership_artifact_ids", ())}
+    result_rows: list[dict[str, Any]] = []
+    for membership_id, membership in memberships.items():
+        projection = projections.get(membership_id, {})
+        forms = [membership.get("canonical_source_form", "")]
+        for occurrence_id in membership.get("occurrence_ids", ()):
+            if occurrence_id == _EXPECTED_OCCURRENCE_ID:
+                result_rows.append({"id": occurrence_id, "concept_forms": forms,
+                                    "selected_target": projection.get("target_form", "")})
+    return sorted(result_rows, key=lambda item: item["id"])
+
+
+def _actual_dirty_set(impact: Any) -> dict[str, Any]:
+    rows = getattr(impact, "affected", ())
+    segments = sorted({row["subject_id"] for row in rows if isinstance(row, dict) and isinstance(row.get("subject_id"), str)})
+    pages = sorted({segment.split(":", 1)[0] for segment in segments if ":" in segment})
+    return {"correction_id": "fc8-p05-quantum-sensor", "occurrence_id": _EXPECTED_OCCURRENCE_ID,
+            "dirty_segment_ids": segments, "dirty_page_ids": pages}
 
 
 def _selected_occurrence_correction(workspace: Path, result: Any) -> tuple[Any, dict[str, Any]]:
@@ -394,16 +568,25 @@ def _selected_occurrence_correction(workspace: Path, result: Any) -> tuple[Any, 
         if translation.kind not in {"TranslationArtifact", "DiagnosticTranslationFallback"}:
             continue
         body = translation.payload
+        # FC8 must not silently select a matching spelling on another page or
+        # occurrence. Check every frozen address before constructing a payload.
+        if body.get("segment_id") != "p05:2":
+            continue
         source = selected_by_id.get(body.get("source_artifact_id"))
         if source is None or source.payload.get("source_text") != P05_SOURCE:
             continue
         for mapping in body.get("mappings", ()):
-            if not isinstance(mapping, dict) or mapping.get("target_text") != "quantum sensor":
+            if not isinstance(mapping, dict):
+                continue
+            if (mapping.get("occurrence_id") != _EXPECTED_OCCURRENCE_ID
+                    or mapping.get("start") != P05_TERM_START
+                    or mapping.get("end") != P05_TERM_END
+                    or mapping.get("target_text") != "quantum sensor"):
                 continue
             scope = {
-                "occurrence_id": mapping["occurrence_id"], "segment_id": body["segment_id"],
-                "mapping_id": mapping["mapping_id"], "start": mapping["start"], "end": mapping["end"],
-                "expected_target_text": mapping["target_text"],
+                "occurrence_id": _EXPECTED_OCCURRENCE_ID, "segment_id": "p05:2",
+                "mapping_id": mapping["mapping_id"], "start": P05_TERM_START, "end": P05_TERM_END,
+                "expected_target_text": "quantum sensor",
             }
             payload = {
                 "kind": "target_occurrence", "applies_to_revision_id": revision_id,
@@ -414,6 +597,10 @@ def _selected_occurrence_correction(workspace: Path, result: Any) -> tuple[Any, 
                 CorrectionStore(workspace), revisions, event_kind="apply", payload=payload,
                 revision_id=revision_id,
             )
+            actual_dirty = _actual_dirty_set(impact)
+            expected_dirty = expected_dirty_set()
+            if actual_dirty != expected_dirty:
+                raise AssertionError(f"FC8 correction dirty set mismatch: {actual_dirty!r} != {expected_dirty!r}")
             return correction_set, {
                 "correction_id": correction_set.active_correction_ids[-1],
                 "correction_set_id": correction_set.set_id, "base_revision_id": revision_id,
@@ -421,6 +608,8 @@ def _selected_occurrence_correction(workspace: Path, result: Any) -> tuple[Any, 
                 "mapping_id": scope["mapping_id"], "start": scope["start"], "end": scope["end"],
                 "expected_target_text": scope["expected_target_text"],
                 "projected_universe": len(impact.projected_universe),
+                "actual_dirty_set": actual_dirty, "expected_dirty_set": expected_dirty,
+                "dirty_set_matches": True,
             }
     raise ValueError("FC8 selected sealed base does not contain p05:2 occurrence correction target")
 
@@ -434,14 +623,24 @@ def run_benchmark_case(mode: str, root: Path | None = None) -> dict[str, Any]:
     parent.mkdir(parents=True, exist_ok=True)
     corpus_dir, workspace, output = parent / "corpus", parent / "workspace", parent / "output.epub"
     if not corpus_dir.exists(): copy_corpus(corpus_dir)
+    # Keep the frozen literal corpus untouched; use a sibling benchmark input
+    # copy whose per-page bytes prevent legacy raw-hash deduplication.
+    input_dir = parent / "legacy-input"
+    if not input_dir.exists(): _legacy_input_corpus(corpus_dir, input_dir)
     workspace.mkdir(exist_ok=True)
     resolve_pi_session_dir(workspace)
-    config = Config(input_dir=corpus_dir, workspace=workspace, output_epub=output, target_lang="en" if mode == "translated" else None,
+    config = Config(input_dir=input_dir, workspace=workspace, output_epub=output, target_lang="en" if mode == "translated" else None,
                     max_retries=0, concurrency=6, timeout=120)
     cold_timing, cold_stats = _Timing(), {}
     cold_timing.started_ns = started
     result = _run_once(config, mode, cold_timing, cold_stats)
     cold_completed = time.perf_counter_ns()
+    captured_extractions = cold_stats.get("_extraction_results", [])
+    if getattr(result, "target_run", None) is not None and len(captured_extractions) != 6:
+        raise AssertionError(f"FC8 requires six extraction callbacks, got {len(captured_extractions)}")
+    actual_quality = _actual_quality(result, mode, captured_extractions, output, workspace)
+    if actual_quality is not None and canonical_json_bytes(actual_quality) != canonical_quality_bytes(mode):
+        raise AssertionError("actual benchmark output does not match frozen quality oracle")
     warm_timing, warm_stats = _Timing(), {}
     # Pin the second invocation to the exact sealed result of the cold run;
     # this is the selected-authority cache exercise, not a fresh unsealed run.
@@ -468,20 +667,32 @@ def run_benchmark_case(mode: str, root: Path | None = None) -> dict[str, Any]:
     measurement = {"version": FIXTURE_VERSION, "mode": mode, "status": result.status, "workspace": str(workspace),
                    "output": str(output), "output_json": str(parent / f"{mode}-baseline.json"),
                    "timing": cold_timing.report(cold_completed), "warm_timing": warm_timing.report(warm_completed),
-                   "state": state_measure(workspace), "quality": quality_oracle(mode),
+                   "state": state_measure(workspace), "quality": actual_quality if actual_quality is not None else quality_oracle(mode),
+                   "quality_expected": quality_oracle(mode),
                    "quality_sha256": hashlib.sha256(canonical_quality_bytes(mode)).hexdigest(),
+                   "actual_quality_validated": actual_quality is not None,
+                   "quality_validation": {"actual_checked": actual_quality is not None,
+                                          "matches_expected": actual_quality is None or canonical_json_bytes(actual_quality) == canonical_quality_bytes(mode)},
                    "report_non_actionable_finding_count": getattr(report, "non_actionable_finding_count", None) if report else None,
-                   "terminology_oracle": _TERMINOLOGY if mode == "translated" else {},
+                   "terminology_oracle": (actual_quality.get("terminology", {}) if actual_quality is not None and mode == "translated" else (_TERMINOLOGY if mode == "translated" else {})),
+                   "terminology_expected": (_TERMINOLOGY if mode == "translated" else {}),
                    "correction_oracle": expected_dirty_set() if mode == "translated" else None,
                    "correction_exercise": correction_exercise,
+                   "correction_dirty_set": (None if correction_exercise is None else correction_exercise.get("actual_dirty_set")),
                    "correction_status": correction_result.status if correction_result is not None else None,
                    "correction_timing": correction_timing.report(correction_completed) if correction_timing is not None else None,
                    "cache_oracle": {"cold_model_calls": cold_stats, "warm_model_calls": warm_stats,
                                     "correction_model_calls": correction_stats,
-                                    "cold_model_call_count": sum(cold_stats.values()), "warm_model_call_count": sum(warm_stats.values()),
-                                    "correction_model_call_count": sum(correction_stats.values()),
-                                    "warm_cache_reuse": sum(warm_stats.values()) < sum(cold_stats.values())},
-                   "corruption_oracle": _corruption_probe(workspace, parent)}
+                                    "cold_model_call_count": sum(value for key, value in cold_stats.items() if not key.startswith("_")), "warm_model_call_count": sum(value for key, value in warm_stats.items() if not key.startswith("_")),
+                                    "correction_model_call_count": sum(value for key, value in correction_stats.items() if not key.startswith("_")),
+                                    "warm_cache_reuse": sum(value for key, value in warm_stats.items() if not key.startswith("_")) < sum(value for key, value in cold_stats.items() if not key.startswith("_"))},
+                   "corruption_oracle": _corruption_probe(workspace, parent, result.candidate_revision_id)}
+    # Callback captures are validation-only and must never enter canonical
+    # benchmark output.
+    for key in ("cold_model_calls", "warm_model_calls", "correction_model_calls"):
+        if isinstance(measurement["cache_oracle"].get(key), dict):
+            measurement["cache_oracle"][key] = {name: value for name, value in measurement["cache_oracle"][key].items()
+                                                 if not name.startswith("_")}
     output_json = parent / f"{mode}-baseline.json"
     output_json.write_bytes(canonical_json_bytes(measurement))
     return measurement
