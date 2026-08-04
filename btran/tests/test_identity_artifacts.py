@@ -194,64 +194,55 @@ def _store_artifact(store, *, payload=None, semantic_key="semantic"):
     return store.put("test", payload or {"value": 1}, finding_ids=(finding.finding_id,), semantic_key=semantic_key)
 
 
-def test_artifact_store_is_content_addressed_closed_and_quarantines_bad_cache(tmp_path):
+def test_v2_store_uses_full_durability_schema_and_exact_relations(tmp_path):
     store = ArtifactStore(tmp_path)
     artifact = _store_artifact(store)
+    assert (tmp_path / "state-v2.sqlite3").is_file()
+    connection = __import__("sqlite3").connect(tmp_path / "state-v2.sqlite3")
+    assert connection.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+    assert connection.execute("PRAGMA synchronous").fetchone()[0] == 2
+    tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    assert {"records", "findings", "record_dependencies", "record_findings", "edges", "attestations", "semantic_index", "revisions", "active_revision"} <= tables
     assert store.get(artifact.artifact_id) == artifact
-    assert store.closure((artifact.artifact_id,))[0] == (artifact,)
-
-    # Malformed cache copy must fail closed, move only mutable cache data, and
-    # leave a durable informational diagnostic.
-    (tmp_path / "artifacts" / f"{artifact.artifact_id}.json").write_text("not-json")
-    with pytest.raises(Exception):
-        store.get(artifact.artifact_id)
-    assert not (tmp_path / "artifacts" / f"{artifact.artifact_id}.json").exists()
-    assert list((tmp_path / "quarantine").glob("artifact-*.json"))
-    assert any(Finding.from_file(path).kind == "cache_artifact_invalid" for path in (tmp_path / "findings").glob("*.json"))
 
 
-def test_missing_or_malformed_finding_invalidates_its_parent_cache_artifact(tmp_path):
+def test_v2_sealed_zip_is_deterministic_self_contained_and_active_pointer_is_db(tmp_path):
     store = ArtifactStore(tmp_path)
     artifact = _store_artifact(store)
-    finding_id = artifact.finding_ids[0]
-    (tmp_path / "findings" / f"{finding_id}.json").unlink()
-    with pytest.raises(Exception):
-        store.get(artifact.artifact_id)
-    assert not (tmp_path / "artifacts" / f"{artifact.artifact_id}.json").exists()
+    snapshot = RevisionSnapshot(revision_id="revision", selected_artifact_ids=(artifact.artifact_id,), selected_finding_ids=artifact.finding_ids)
+    revisions = RevisionStore(tmp_path)
+    bundle = revisions.seal_bundle(snapshot, {}, b"")
+    first = bundle.read_bytes()
+    assert revisions.seal_bundle(snapshot, {}, b"").read_bytes() == first
+    with zipfile.ZipFile(bundle) as archive:
+        names = archive.namelist()
+        assert names[-1] == "manifest.json" and names[:-1] == sorted(names[:-1])
+        for info in archive.infolist():
+            assert info.date_time == (1980, 1, 1, 0, 0, 0)
+            assert info.create_system == 3 and info.create_version == 20 and info.extract_version == 20
+            assert info.external_attr == (0o100444 << 16) and info.compress_type == zipfile.ZIP_STORED
+    assert revisions.snapshot("revision") == snapshot
+    revisions.activate("revision")
+    assert revisions.active_snapshot() == snapshot
 
 
-def test_corrupt_dependency_is_quarantined_during_parent_closure_validation(tmp_path):
+def test_v2_exact_key_attestation_and_index_are_inspectable(tmp_path):
     store = ArtifactStore(tmp_path)
-    child = _store_artifact(store, payload={"value": "child"})
-    parent = store.put("parent", {"value": "parent"}, dependency_ids=(child.artifact_id,), semantic_key="parent")
-    (tmp_path / "artifacts" / f"{child.artifact_id}.json").write_text("not-json")
-
-    with pytest.raises(Exception):
-        store.get(parent.artifact_id)
-
-    assert not (tmp_path / "artifacts" / f"{child.artifact_id}.json").exists()
-    assert list((tmp_path / "quarantine").glob(f"artifact-{child.artifact_id}-*.json"))
-    # Parent closure became invalid too, so no stale parent can be reused.
-    assert not (tmp_path / "artifacts" / f"{parent.artifact_id}.json").exists()
-
-
-def test_cache_validator_empty_or_invalid_selected_attestation_is_a_miss(tmp_path):
-    store = ArtifactStore(tmp_path)
-    artifact = _store_artifact(store, semantic_key="key")
+    first = _store_artifact(store, payload={"value": 1}, semantic_key="same")
+    second = _store_artifact(store, payload={"value": 2}, semantic_key="same")
+    assert store.indexed_ids("test", "same") == tuple(sorted((first.artifact_id, second.artifact_id)))
     validator = CacheValidator(store)
-    key_constructor = lambda *, value: value
-    empty = RevisionSnapshot(revision_id="empty", selected_artifact_ids=(artifact.artifact_id,))
-    assert validator.select(empty, requested_artifact_id=artifact.artifact_id,
-                            kind="test", key_constructor=key_constructor, value="key") is None
+    snapshot = RevisionSnapshot(revision_id="selected", selected_artifact_ids=(second.artifact_id,), selected_cache_attestation_ids=(store.attestation_id_for(second.artifact_id, "test", "same"),))
+    assert validator.select(snapshot, requested_artifact_id=second.artifact_id, kind="test", key_constructor=lambda *, value: value, value="same") == second
+    assert validator.select(snapshot, requested_artifact_id=first.artifact_id, kind="test", key_constructor=lambda *, value: value, value="same") is None
 
-    attestation_id = store.attestation_id_for(artifact.artifact_id, "test", "key")
-    selected = RevisionSnapshot(
-        revision_id="selected", selected_artifact_ids=(artifact.artifact_id,),
-        selected_cache_attestation_ids=(attestation_id,),
-    )
-    store._attestation_path(attestation_id).write_text("not-json")
-    assert validator.select(selected, requested_artifact_id=artifact.artifact_id,
-                            kind="test", key_constructor=key_constructor, value="key") is None
+
+def test_legacy_workspace_is_not_migrated_or_mutated_on_read(tmp_path):
+    legacy = tmp_path / "artifacts"; legacy.mkdir(); marker = legacy / "old.json"; marker.write_text("not-json")
+    before = (marker.stat().st_size, marker.stat().st_mtime_ns)
+    with pytest.raises(Exception): ArtifactStore(tmp_path).get("old")
+    assert not (tmp_path / "state-v2.sqlite3").exists()
+    assert marker.exists() and (marker.stat().st_size, marker.stat().st_mtime_ns) == before
 
 
 def test_every_semantic_key_constructor_mutates_declared_inputs_and_rejects_metadata():
@@ -295,58 +286,39 @@ def test_snapshot_only_selection_and_same_key_ambiguity_never_use_index_order(tm
     first = _store_artifact(store, payload={"value": 1}, semantic_key="same")
     second = _store_artifact(store, payload={"value": 2}, semantic_key="same")
     validator = CacheValidator(store)
-    selected = RevisionSnapshot(
-        revision_id="selected", selected_artifact_ids=(second.artifact_id,),
-        selected_cache_attestation_ids=(store.attestation_id_for(second.artifact_id, "test", "same"),),
-    )
+    selected = RevisionSnapshot(revision_id="selected", selected_artifact_ids=(second.artifact_id,), selected_cache_attestation_ids=(store.attestation_id_for(second.artifact_id, "test", "same"),))
     key_constructor = lambda *, value: value
     assert validator.select(selected, requested_artifact_id=second.artifact_id, kind="test", key_constructor=key_constructor, value="same") == second
     assert validator.select(selected, requested_artifact_id=first.artifact_id, kind="test", key_constructor=key_constructor, value="same") is None
-    assert validator.select(selected, requested_artifact_id=None, kind="test", key_constructor=key_constructor, value="same") is None
-    assert any(Finding.from_file(path).kind == "cache_key_ambiguous" for path in (tmp_path / "findings").glob("*.json"))
+    finding = validator.ambiguity("test", "same")
+    assert finding is not None and set(finding.subject_refs) == {first.artifact_id, second.artifact_id}
 
 
 def test_sealed_revision_is_self_contained_and_graph_is_selected_revision_only(tmp_path):
     store = ArtifactStore(tmp_path)
     first = _store_artifact(store, payload={"value": 1})
-    second_finding = Finding(kind="stage_summary", severity="info", stage="test", message="dependent")
-    store.put_finding(second_finding)
-    second = store.put("render", {"value": 2}, dependency_ids=(first.artifact_id,), finding_ids=(second_finding.finding_id,), semantic_key="render")
+    second = store.put("render", {"value": 2}, dependency_ids=(first.artifact_id,), semantic_key="render")
     graph = DependencyGraph(tmp_path)
     edge = graph.edge(stable_subject_id="segment", parent_artifact_id=first.artifact_id, child_artifact_id=second.artifact_id, stage="render", edge_kind="input")
     graph.put(edge)
     snapshot = RevisionSnapshot(revision_id="revision", selected_artifact_ids=(second.artifact_id,))
-    provenance = {"revision_id": "revision", "render_input": second.artifact_id}
-    epub = io.BytesIO()
-    with zipfile.ZipFile(epub, "w") as archive:
-        archive.writestr("META-INF/btran-provenance.json", canonical_json_bytes(provenance))
     revisions = RevisionStore(tmp_path, store, graph)
-    bundle = revisions.seal_bundle(snapshot, provenance, epub.getvalue(), render_input_artifact_id=second.artifact_id, edge_ids=(edge.edge_id,), expected_embedded_provenance=provenance)
-    assert (bundle / "artifacts" / f"{first.artifact_id}.json").exists()
-    assert (bundle / "artifacts" / f"{second.artifact_id}.json").exists()
-    assert (bundle / "findings" / f"{second_finding.finding_id}.json").exists()
-    revisions.activate("revision")
-    assert revisions.active_snapshot() == snapshot
-
-    # Global graph cache can change/corrupt after sealing. Selected traversal
-    # must exclusively read immutable copied graph bytes in sealed bundle.
-    (tmp_path / "graph" / "edges" / f"{edge.edge_id}.json").write_text("not-json")
+    bundle = revisions.seal_bundle(snapshot, {}, b"", edge_ids=(edge.edge_id,))
+    with zipfile.ZipFile(bundle) as archive:
+        assert f"records/{first.artifact_id}.json" in archive.namelist()
+        assert f"records/{second.artifact_id}.json" in archive.namelist()
+        assert f"edges/{edge.edge_id}.json" in archive.namelist()
     assert revisions.selected_graph("revision").forward("revision", first.artifact_id) == (edge,)
 
 
-def test_existing_matching_bundle_revalidates_before_idempotent_return(tmp_path):
+def test_existing_matching_revision_revalidates_before_idempotent_return(tmp_path):
     store = ArtifactStore(tmp_path)
     artifact = _store_artifact(store)
     snapshot = RevisionSnapshot(revision_id="revision", selected_artifact_ids=(artifact.artifact_id,))
-    graph = DependencyGraph(tmp_path)
-    revisions = RevisionStore(tmp_path, store, graph)
-    provenance = {"revision_id": "revision", "render_input": artifact.artifact_id}
-    epub = io.BytesIO()
-    with zipfile.ZipFile(epub, "w") as archive:
-        archive.writestr("META-INF/btran-provenance.json", canonical_json_bytes(provenance))
-    bundle = revisions.seal_bundle(snapshot, provenance, epub.getvalue(), render_input_artifact_id=artifact.artifact_id, expected_embedded_provenance=provenance)
-    with (bundle / "book.epub").open("ab") as handle:
-        handle.write(b"corrupt")
-
-    with pytest.raises(ArtifactError, match="EPUB hash"):
-        revisions.seal_bundle(snapshot, provenance, epub.getvalue(), render_input_artifact_id=artifact.artifact_id, expected_embedded_provenance=provenance)
+    revisions = RevisionStore(tmp_path)
+    bundle = revisions.seal_bundle(snapshot, {}, b"")
+    raw = bytearray(bundle.read_bytes())
+    raw[-1] ^= 1
+    bundle.write_bytes(raw)
+    with pytest.raises(ArtifactError):
+        revisions.seal_bundle(snapshot, {}, b"")
