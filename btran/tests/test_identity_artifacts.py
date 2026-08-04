@@ -276,7 +276,8 @@ def test_v2_sealed_zip_is_deterministic_self_contained_and_active_pointer_is_db(
             assert info.create_system == 3 and info.create_version == 20 and info.extract_version == 20
             assert info.external_attr == (0o100444 << 16) and info.compress_type == zipfile.ZIP_STORED
     assert revisions.snapshot("revision") == snapshot
-    revisions.activate("revision")
+    # V2 sealing publishes the revision and active pointer in one durable
+    # transaction; callers must not need a separate activation step.
     assert revisions.active_snapshot() == snapshot
 
 

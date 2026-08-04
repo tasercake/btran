@@ -1466,7 +1466,7 @@ class V2RevisionStore:
         try:
             return self.storage.seal_revision(
                 snapshot.revision_id, snapshot.to_json().encode("utf-8"), members,
-                activate=False, edge_ids=edge_ids,
+                activate=True, edge_ids=edge_ids,
             )
         except StorageError as exc: raise ArtifactError(str(exc)) from exc
     def verify_bundle(self, revision_id: str) -> RevisionSnapshot:
