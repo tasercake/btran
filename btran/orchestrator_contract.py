@@ -15,7 +15,7 @@ from typing import Any, Protocol, TypeAlias
 from btran.config import Config
 from btran.identity import PagePlacement
 from btran.manifest import InvocationFailure
-from btran.schema import RunReport, StageRecord
+from btran.schema import EffectivePage, EffectiveSegment, RunReport, StageRecord, _identifier, _sorted_unique
 
 
 PageErrorCallback: TypeAlias = Callable[[int, str], None]
@@ -163,6 +163,84 @@ class StageContract:
         if not isinstance(result, StageOutputs):
             raise TypeError("stage runner must return StageOutputs")
         return result
+
+
+@dataclass(frozen=True)
+class OrderedEffectivePage:
+    """A selected effective page plus its children in declared order."""
+
+    page: EffectivePage
+    segments: tuple[EffectiveSegment, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.page, EffectivePage):
+            raise TypeError("page must be EffectivePage")
+        segments = tuple(self.segments)
+        if any(not isinstance(item, EffectiveSegment) for item in segments):
+            raise TypeError("segments must contain EffectiveSegment values")
+        ids = tuple(item.effective_segment_id for item in segments)
+        if len(set(ids)) != len(ids):
+            raise ValueError("page segments must not be duplicated")
+        if ids != self.page.effective_segment_ids:
+            raise ValueError("page children must exactly match declared order")
+        for segment in segments:
+            if segment.segment_id == "":
+                raise ValueError("page segment must have a stable segment ID")
+        object.__setattr__(self, "segments", segments)
+
+    @property
+    def effective_page(self) -> EffectivePage:
+        """Compatibility spelling for callers using the record's full name."""
+        return self.page
+
+
+@dataclass(frozen=True)
+class SelectedEffectiveContent:
+    """The immutable selected effective content view for one invocation."""
+
+    pages: tuple[OrderedEffectivePage, ...] = ()
+    finding_ids: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        pages = tuple(self.pages)
+        if any(not isinstance(item, OrderedEffectivePage) for item in pages):
+            raise TypeError("pages must contain OrderedEffectivePage values")
+        page_ids = tuple(item.page.page_id for item in pages)
+        if len(set(page_ids)) != len(page_ids):
+            raise ValueError("selected pages must not be duplicated")
+        # Effective segment identities are globally unique in a selected closure.
+        segment_ids = [segment.effective_segment_id for page in pages for segment in page.segments]
+        if len(set(segment_ids)) != len(segment_ids):
+            raise ValueError("selected segments must not be duplicated")
+        object.__setattr__(self, "pages", pages)
+        object.__setattr__(self, "finding_ids", _sorted_unique(self.finding_ids, "finding_ids"))
+
+    @property
+    def segments(self) -> tuple[EffectiveSegment, ...]:
+        return tuple(segment for page in self.pages for segment in page.segments)
+
+    @property
+    def ordered_page_ids(self) -> tuple[str, ...]:
+        return tuple(page.page.page_id for page in self.pages)
+
+    @property
+    def effective_segment_ids(self) -> tuple[str, ...]:
+        return tuple(segment.effective_segment_id for segment in self.segments)
+
+
+@dataclass(frozen=True)
+class CandidateClosure:
+    """Execution-only ordered references to newly persisted stage records."""
+
+    stage_record_ids: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        values = tuple(self.stage_record_ids)
+        if any(not isinstance(value, str) or not value for value in values):
+            raise ValueError("stage_record_ids must contain stable IDs")
+        if len(set(values)) != len(values):
+            raise ValueError("stage_record_ids must not contain duplicates")
+        object.__setattr__(self, "stage_record_ids", values)
 
 
 def initialized_report(*, run_id: str, mode: str, selected: SelectedRunInputs) -> RunReport:

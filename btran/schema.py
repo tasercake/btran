@@ -23,6 +23,14 @@ _SEVERITIES = frozenset({"info", "warning", "error"})
 _STAGE_STATUSES = frozenset({"completed", "degraded"})
 _MODES = frozenset({"native", "translated"})
 _REVIEW_SCOPES = frozenset({"occurrence", "segment", "all_concept_occurrences", "subset_occurrence_ids"})
+_AUDIT_CATEGORIES = frozenset({
+    "actionable_ambiguity", "conflict", "failure", "fallback", "validation", "correction_impact",
+})
+_TERM_CATEGORIES = frozenset({"declared", "proper_name", "technical_term", "other"})
+_BLOCK_TYPES = frozenset({
+    "heading", "paragraph", "list_item", "table", "caption", "footnote", "pull_quote", "illustration",
+})
+_CONFIDENCE_ORIGINS = frozenset({"direct", "inherited_routine"})
 
 
 class SchemaError(ValueError):
@@ -231,6 +239,9 @@ class Finding(CanonicalRecord):
     message: str = ""
     dependency_ids: tuple[str, ...] = ()
     requires_action: bool = False
+    # Categorized findings are the only findings which degrade the final audit.
+    # ``None`` preserves the pre-audit finding format.
+    audit_category: str | None = None
     _schema_name: ClassVar[str] = "finding"
 
     def _validate(self) -> None:
@@ -241,8 +252,20 @@ class Finding(CanonicalRecord):
             raise SchemaError("finding severity must be info, warning, or error")
         if self.requires_action is not False:
             raise SchemaError("findings are informational and requires_action must be False")
+        if self.audit_category is not None and self.audit_category not in _AUDIT_CATEGORIES:
+            raise SchemaError("finding audit_category is invalid")
         _sorted_unique(self.subject_refs, "subject_refs")
         _sorted_unique(self.dependency_ids, "dependency_ids")
+        if self.audit_category is not None:
+            if not self.subject_refs and not self.dependency_ids:
+                raise SchemaError("categorized finding needs affected stable IDs")
+            if not self.message.strip():
+                raise SchemaError("categorized finding needs a readable message")
+            # A category alone is not evidence.  Every actionable finding must
+            # identify the concrete trigger which caused it.
+            trigger = self.evidence.get("trigger") if isinstance(self.evidence, dict) else None
+            if not isinstance(trigger, str) or not trigger.strip():
+                raise SchemaError("categorized finding needs trigger evidence")
         if not isinstance(self.evidence, dict):
             raise SchemaError("finding evidence must be an object")
         _require_nfc(self.evidence, "finding evidence")
@@ -252,18 +275,40 @@ class Finding(CanonicalRecord):
                 "schema_version": self.schema_version, "kind": self.kind, "severity": self.severity,
                 "stage": self.stage, "subject_refs": list(self.subject_refs), "evidence": self.evidence,
                 "message": self.message, "dependency_ids": list(self.dependency_ids),
-                "requires_action": False,
+                "requires_action": False, "audit_category": self.audit_category,
             }),
         )
         if self.finding_id and self.finding_id != expected_id:
-            raise SchemaError("finding_id does not match canonical finding body")
-        self.finding_id = expected_id
+            # Keep IDs from the pre-audit finding schema readable.  They are
+            # immutable historical identities, not new records.
+            legacy_expected = tagged_sha256(
+                "finding-v1",
+                canonical_json_bytes({
+                    "schema_version": self.schema_version, "kind": self.kind, "severity": self.severity,
+                    "stage": self.stage, "subject_refs": list(self.subject_refs), "evidence": self.evidence,
+                    "message": self.message, "dependency_ids": list(self.dependency_ids),
+                    "requires_action": False,
+                }),
+            )
+            if not (self.audit_category is None and self.finding_id == legacy_expected):
+                raise SchemaError("finding_id does not match canonical finding body")
+        else:
+            self.finding_id = expected_id
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]):
         if not isinstance(data, Mapping) or not data.get("finding_id"):
             raise SchemaError("persisted finding requires canonical finding_id")
+        # Findings written before audit categorization remain readable.
+        data = dict(data)
+        data.setdefault("audit_category", None)
         return super().from_dict(data)
+
+    @classmethod
+    def from_json(cls, text: str):
+        if "audit_category" in json.loads(text):
+            return super().from_json(text)
+        return cls.from_dict(json.loads(text))
 
 
 @dataclass
@@ -274,8 +319,22 @@ class ConfidenceAssessment(CanonicalRecord):
     score: float | None = None
     signals: tuple[str, ...] = ()
     assessment_version: str = "confidence-v1"
+    confidence_origin: str = "direct"
     uncertainty_finding_id: str | None = None
     _schema_name: ClassVar[str] = "confidence_assessment"
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]):
+        data = dict(data)
+        # Old assessments predate provenance for confidence.
+        data.setdefault("confidence_origin", "direct")
+        return super().from_dict(data)
+
+    @classmethod
+    def from_json(cls, text: str):
+        if "confidence_origin" in json.loads(text):
+            return super().from_json(text)
+        return cls.from_dict(json.loads(text))
 
     def _validate(self) -> None:
         _identifier(self.subject_id, "subject_id")
@@ -286,6 +345,8 @@ class ConfidenceAssessment(CanonicalRecord):
                 raise SchemaError("confidence score must be in [0, 1] or null")
         _sorted_unique(self.signals, "signals")
         _string(self.assessment_version, "assessment_version")
+        if self.confidence_origin not in _CONFIDENCE_ORIGINS:
+            raise SchemaError("confidence_origin must be direct or inherited_routine")
         if self.uncertainty_finding_id is not None:
             _identifier(self.uncertainty_finding_id, "uncertainty_finding_id")
 
@@ -324,6 +385,13 @@ class StageRecord(CanonicalRecord):
         data = dict(data)
         data.setdefault("duration_ms", 0.0)
         return super().from_dict(data)
+
+    @classmethod
+    def from_json(cls, text: str):
+        data = json.loads(text)
+        if "duration_ms" in data:
+            return super().from_json(text)
+        return cls.from_dict(data)
 
 
 @dataclass
@@ -775,6 +843,10 @@ class RunReport(CanonicalRecord):
     final_epub_status: str = ""
     stage_records: tuple[StageRecord, ...] = ()
     total_stage_duration_ms: float = 0.0
+    audit_finding_ids: tuple[str, ...] = ()
+    non_actionable_finding_count: int | None = 0
+    audit_status: str = "clean"
+    timing_snapshot: dict[str, Any] | None = None
     _schema_name: ClassVar[str] = "run_report"
 
     def _validate(self) -> None:
@@ -784,8 +856,25 @@ class RunReport(CanonicalRecord):
         groups = ("content_finding_ids", "uncertainty_finding_ids", "review_finding_ids", "recoverable_failure_finding_ids")
         for name in groups:
             _sorted_unique(getattr(self, name), name)
-        for name in ("correction_execution_projection_plan_ids", "refresh_attempt_ids"):
+        for name in ("correction_execution_projection_plan_ids", "refresh_attempt_ids", "audit_finding_ids"):
             _sorted_unique(getattr(self, name), name)
+        if self.audit_status not in {"clean", "degraded", "unknown_legacy"}:
+            raise SchemaError("audit_status is invalid")
+        if self.audit_status == "clean" and self.audit_finding_ids:
+            raise SchemaError("clean audit cannot contain categorized findings")
+        if self.audit_status == "degraded" and not self.audit_finding_ids:
+            raise SchemaError("degraded audit needs categorized findings")
+        if self.non_actionable_finding_count is not None:
+            if (isinstance(self.non_actionable_finding_count, bool)
+                    or not isinstance(self.non_actionable_finding_count, int)
+                    or self.non_actionable_finding_count < 0):
+                raise SchemaError("non_actionable_finding_count must be a non-negative integer or null")
+        elif self.audit_status != "unknown_legacy":
+            raise SchemaError("new reports need non_actionable_finding_count")
+        if self.timing_snapshot is not None:
+            if not isinstance(self.timing_snapshot, dict):
+                raise SchemaError("timing_snapshot must be an object or null")
+            _require_nfc(self.timing_snapshot, "timing_snapshot")
         for name in ("selected_base_revision_id", "candidate_revision_id", "active_revision_id"):
             value = getattr(self, name)
             if value is not None:
@@ -840,6 +929,17 @@ class RunReport(CanonicalRecord):
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]):
         data = dict(data)
+        historical = "audit_finding_ids" not in data and "audit_status" not in data
+        if historical:
+            data["audit_finding_ids"] = ()
+            data["non_actionable_finding_count"] = None
+            data["audit_status"] = "unknown_legacy"
+            data["timing_snapshot"] = None
+        else:
+            data.setdefault("audit_finding_ids", ())
+            data.setdefault("non_actionable_finding_count", 0)
+            data.setdefault("audit_status", "clean")
+            data.setdefault("timing_snapshot", None)
         raw_records = data.get("stage_records", ())
         if "total_stage_duration_ms" not in data and isinstance(raw_records, (list, tuple)):
             data["total_stage_duration_ms"] = round(sum(
@@ -850,9 +950,55 @@ class RunReport(CanonicalRecord):
             data["stage_records"] = tuple(StageRecord.from_dict(item) for item in raw_records)
         return super().from_dict(data)
 
+    @classmethod
+    def from_json(cls, text: str):
+        data = json.loads(text)
+        if "audit_finding_ids" in data:
+            return super().from_json(text)
+        return cls.from_dict(data)
+
+
+def actionable_uncertainty_finding(assessment: ConfidenceAssessment) -> Finding | None:
+    """Return an audit finding only when assessment carries actionable evidence.
+
+    Confidence values alone, including a missing score on direct assessments,
+    are not actionable.  Routine inherited confidence is explicitly silent.
+    """
+    if not isinstance(assessment, ConfidenceAssessment):
+        raise SchemaError("assessment must be ConfidenceAssessment")
+    if assessment.confidence_origin == "inherited_routine":
+        return None
+    category_by_signal = (
+        ("actionable_ambiguity", {"ambiguity", "ambiguous", "mapping_ambiguity", "source_sense_ambiguity", "concept_ambiguity"}),
+        ("conflict", {"conflict", "reconciliation_conflict", "correction_conflict"}),
+        ("failure", {"failure", "exception", "model_failure", "execution_failure"}),
+        ("fallback", {"fallback", "parser_fallback", "model_fallback", "diagnostic_placeholder", "retry_exhaustion"}),
+        ("validation", {"validation", "validation_error", "malformed_output", "invalid_response"}),
+        ("correction_impact", {"correction_impact", "correction", "dirty_set"}),
+    )
+    signals = set(assessment.signals)
+    category = next((name for name, values in category_by_signal if signals & values), None)
+    if category is None:
+        return None
+    evidence = {
+        "assessment_version": assessment.assessment_version,
+        "confidence_origin": assessment.confidence_origin,
+        "signals": list(assessment.signals),
+        "trigger": category,
+        "score": assessment.score,
+    }
+    finding = Finding(
+        kind="uncertainty", severity="warning", stage=assessment.producing_stage,
+        audit_category=category, subject_refs=(assessment.subject_id,), evidence=evidence,
+        message=f"Actionable {category.replace('_', ' ')} evidence recorded.",
+        dependency_ids=(assessment.producing_artifact_id,),
+    )
+    assessment.uncertainty_finding_id = finding.finding_id
+    return finding
+
 
 def uncertainty_finding(assessment: ConfidenceAssessment) -> Finding:
-    """Create deterministic informational uncertainty finding for an assessment."""
+    """Create deterministic informational uncertainty finding for compatibility."""
     if not isinstance(assessment, ConfidenceAssessment):
         raise SchemaError("assessment must be ConfidenceAssessment")
     evidence = {
@@ -942,6 +1088,147 @@ def review_requests_for(
     return tuple(review_request(trigger=trigger, stage=actual_stage, subject_ids=subject_ids, suggested_correction_kind=suggested_correction_kind, base_revision_id=base_revision_id, base_artifact_ids=base_artifact_ids, scope=scope, occurrence_ids=occurrence_ids) for trigger in sorted(set(triggers)))
 
 
+@dataclass
+class ExtractionBlockSemantics(CanonicalRecord):
+    """Validated, ordered semantics for one extracted block.
+
+    Text-bearing blocks map to exactly one stable source segment. Illustration
+    blocks intentionally have no segment: their descriptor is retained on the
+    parent extraction semantics instead.
+    """
+
+    block_id: str = ""
+    block_type: str = ""
+    reading_order: int = 0
+    source_text: str = ""
+    segment_id: str | None = None
+    _schema_name: ClassVar[str] = "extraction_block_semantics"
+
+    def _validate(self) -> None:
+        _identifier(self.block_id, "block_id")
+        if self.block_type not in _BLOCK_TYPES:
+            raise SchemaError("block_type is unknown")
+        if isinstance(self.reading_order, bool) or not isinstance(self.reading_order, int) or self.reading_order < 0:
+            raise SchemaError("reading_order must be a non-negative integer")
+        _string(self.source_text, "source_text", allow_empty=(self.block_type == "illustration"))
+        if self.segment_id is not None:
+            _identifier(self.segment_id, "segment_id")
+        if self.block_type == "illustration" and self.segment_id is not None:
+            raise SchemaError("illustration block must not map to a segment")
+        if self.block_type != "illustration" and self.segment_id is None:
+            raise SchemaError("text block must map to exactly one segment")
+
+
+@dataclass
+class DeclaredTermMention(CanonicalRecord):
+    """An explicit terminology declaration from extraction."""
+
+    term: str = ""
+    block_id: str = ""
+    category: str = "other"
+    _schema_name: ClassVar[str] = "declared_term_mention"
+
+    def _validate(self) -> None:
+        _string(self.term, "term")
+        _identifier(self.block_id, "block_id")
+        if self.category not in _TERM_CATEGORIES:
+            raise SchemaError("term mention category is invalid")
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]):
+        data = dict(data)
+        # Extraction responses before categorization are ordinary declarations.
+        data.setdefault("category", "other")
+        return super().from_dict(data)
+
+
+@dataclass
+class ExtractionSemantics(CanonicalRecord):
+    """All validated extraction data required by downstream stages."""
+
+    page_id: str = ""
+    source_lang: str = ""
+    blocks: tuple[ExtractionBlockSemantics, ...] = ()
+    illustrations: tuple[dict[str, Any] | str, ...] = ()
+    term_mentions: tuple[DeclaredTermMention, ...] = ()
+    _schema_name: ClassVar[str] = "extraction_semantics"
+
+    def _validate(self) -> None:
+        _identifier(self.page_id, "page_id")
+        _language(self.source_lang, "source_lang")
+        if not isinstance(self.blocks, (tuple, list)):
+            raise SchemaError("blocks must be an array")
+        blocks: list[ExtractionBlockSemantics] = []
+        for item in self.blocks:
+            if not isinstance(item, ExtractionBlockSemantics):
+                if not isinstance(item, Mapping):
+                    raise SchemaError("blocks must contain ExtractionBlockSemantics")
+                item = ExtractionBlockSemantics.from_dict(item)
+            blocks.append(item)
+        if len({item.block_id for item in blocks}) != len(blocks):
+            raise SchemaError("block IDs must be unique")
+        orders = [item.reading_order for item in blocks]
+        if len(set(orders)) != len(orders):
+            raise SchemaError("reading_order values must be unique")
+        if orders != sorted(orders):
+            raise SchemaError("blocks must be in declared reading order")
+        segment_ids = [item.segment_id for item in blocks if item.segment_id is not None]
+        if len(set(segment_ids)) != len(segment_ids):
+            raise SchemaError("each segment ID must map to exactly one block")
+        self.blocks = tuple(blocks)
+        block_ids = {item.block_id for item in blocks}
+        illustrations: list[dict[str, Any] | str] = []
+        illustration_orders: list[int] = []
+        for item in self.illustrations:
+            if isinstance(item, str):
+                block_id = _identifier(item, "illustration block_id")
+                descriptor: dict[str, Any] | str = item
+            elif isinstance(item, Mapping):
+                if "block_id" not in item:
+                    raise SchemaError("illustration needs block_id")
+                block_id = _identifier(item["block_id"], "illustration block_id")
+                descriptor = dict(item)
+                _require_nfc(descriptor, "illustration")
+            else:
+                raise SchemaError("illustrations must contain descriptors")
+            if block_id not in block_ids:
+                raise SchemaError("illustration references unknown block")
+            block = next(block for block in blocks if block.block_id == block_id)
+            if block.block_type != "illustration":
+                raise SchemaError("illustration descriptor must reference illustration block")
+            if block_id in {self._illustration_block_id(value) for value in illustrations}:
+                raise SchemaError("illustrations must be unique")
+            illustrations.append(descriptor)
+            illustration_orders.append(block.reading_order)
+        if illustration_orders != sorted(illustration_orders):
+            raise SchemaError("illustrations must be in declared order")
+        self.illustrations = tuple(illustrations)
+        mentions: list[DeclaredTermMention] = []
+        for item in self.term_mentions:
+            if not isinstance(item, DeclaredTermMention):
+                if not isinstance(item, Mapping):
+                    raise SchemaError("term_mentions must contain DeclaredTermMention")
+                item = DeclaredTermMention.from_dict(item)
+            if item.block_id not in block_ids:
+                raise SchemaError("term mention references unknown block")
+            if next(block for block in blocks if block.block_id == item.block_id).block_type == "illustration":
+                raise SchemaError("term mention must reference a text block")
+            mentions.append(item)
+        self.term_mentions = tuple(mentions)
+
+    @staticmethod
+    def _illustration_block_id(item: dict[str, Any] | str) -> str:
+        return item if isinstance(item, str) else str(item["block_id"])
+
+    @property
+    def ordered_block_ids(self) -> tuple[str, ...]:
+        return tuple(block.block_id for block in self.blocks)
+
+    @property
+    def effective_segment_ids(self) -> tuple[str, ...]:
+        return tuple(block.segment_id for block in self.blocks if block.segment_id is not None)
+
+
 # ---------------------------------------------------------------------------
 # Legacy migration readers. New state must not use these permissive schemas.
 # ---------------------------------------------------------------------------
@@ -973,9 +1260,14 @@ class SourceBlock:
 class TermMention:
     term: str
     block_id: str
+    category: str = "other"
     def to_dict(self) -> dict: return asdict(self)
     @classmethod
-    def from_dict(cls, d: dict): return cls(**d)
+    def from_dict(cls, d: dict):
+        values = d.copy()
+        # Legacy extraction omitted categories; those declarations are ordinary.
+        values.setdefault("category", "other")
+        return cls(**values)
     def to_file(self, path: Path) -> None: _write_json(path, self.to_dict())
     @classmethod
     def from_file(cls, path: Path): return cls.from_dict(_read_json(path))

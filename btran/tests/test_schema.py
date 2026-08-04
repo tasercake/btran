@@ -24,6 +24,11 @@ from btran.schema import (
     TerminologyMap,
     TranslatedBlock,
     canonical_json,
+    ExtractionBlockSemantics,
+    ExtractionSemantics,
+    DeclaredTermMention,
+    ConfidenceAssessment,
+    actionable_uncertainty_finding,
 )
 
 
@@ -164,6 +169,46 @@ class TestTerminologyMigrationRecords:
         path = tmp_path / "glossary.json"
         sample_terminology_map.to_file(path)
         assert TerminologyMap.from_file(path) == sample_terminology_map
+
+
+class TestWaveOneFoundations:
+    def test_extraction_semantics_validates_order_mapping_and_legacy_category(self):
+        text = ExtractionBlockSemantics(
+            block_id="p:1", block_type="paragraph", reading_order=1,
+            source_text="Bonjour", segment_id="segment-1",
+        )
+        image = ExtractionBlockSemantics(
+            block_id="p:2", block_type="illustration", reading_order=2,
+            source_text="", segment_id=None,
+        )
+        semantics = ExtractionSemantics(
+            page_id="page-1", source_lang="fr", blocks=(text, image),
+            illustrations=({"block_id": "p:2", "path": "page.png", "alt": "figure"},),
+            term_mentions=(DeclaredTermMention(term="Bonjour", block_id="p:1"),),
+        )
+        assert semantics.effective_segment_ids == ("segment-1",)
+        assert semantics.term_mentions[0].category == "other"
+        with pytest.raises(SchemaError, match="unknown block"):
+            ExtractionSemantics(
+                page_id="page-1", source_lang="fr", blocks=(text,),
+                term_mentions=(DeclaredTermMention(term="x", block_id="missing"),),
+            )
+        with pytest.raises(SchemaError, match="declared reading order"):
+            ExtractionSemantics(page_id="page-1", source_lang="fr", blocks=(image, text))
+
+    def test_actionable_uncertainty_has_no_routine_threshold(self):
+        routine = ConfidenceAssessment(
+            subject_id="s", producing_stage="validation", producing_artifact_id="a",
+            score=0.1, confidence_origin="inherited_routine",
+        )
+        assert actionable_uncertainty_finding(routine) is None
+        direct = ConfidenceAssessment(
+            subject_id="s", producing_stage="validation", producing_artifact_id="a",
+            score=None, signals=("fallback",),
+        )
+        finding = actionable_uncertainty_finding(direct)
+        assert finding is not None and finding.audit_category == "fallback"
+        assert finding.subject_refs == ("s",) and finding.dependency_ids == ("a",)
 
 
 class TestCanonicalSchemas:
