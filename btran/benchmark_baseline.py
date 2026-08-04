@@ -773,7 +773,14 @@ def run_benchmark_case(mode: str, root: Path | None = None) -> dict[str, Any]:
     # copy whose per-page bytes prevent legacy raw-hash deduplication.
     input_dir = parent / "legacy-input"
     if not input_dir.exists(): _legacy_input_corpus(corpus_dir, input_dir)
-    workspace.mkdir(exist_ok=True)
+    # The workspace is the measured state root. Reusing an old state tree can
+    # make both file/byte counts and cache results look like this invocation's
+    # baseline, so require a directory that has never contained measured state.
+    if workspace.exists():
+        if not workspace.is_dir() or any(workspace.iterdir()):
+            raise AssertionError(f"FC8 measured workspace must be empty: {workspace}")
+    else:
+        workspace.mkdir(parents=True)
     resolve_pi_session_dir(workspace)
     config = Config(input_dir=input_dir, workspace=workspace, output_epub=output, target_lang="en" if mode == "translated" else None,
                     max_retries=0, concurrency=6, timeout=120)
@@ -793,6 +800,12 @@ def run_benchmark_case(mode: str, root: Path | None = None) -> dict[str, Any]:
     warm_config = replace(config, base_revision=result.candidate_revision_id) if result.candidate_revision_id else config
     warm_result = _run_once(warm_config, mode, warm_timing, warm_stats)
     warm_completed = time.perf_counter_ns()
+    cold_model_call_count = sum(value for key, value in cold_stats.items() if not key.startswith("_"))
+    warm_model_call_count = sum(value for key, value in warm_stats.items() if not key.startswith("_"))
+    if warm_model_call_count >= cold_model_call_count:
+        raise AssertionError(
+            "FC8 cache-reuse oracle failed: warm run did not reduce model calls"
+        )
     correction_result = None
     correction_timing = None
     correction_stats: dict[str, int] = {}
@@ -829,10 +842,16 @@ def run_benchmark_case(mode: str, root: Path | None = None) -> dict[str, Any]:
                    "correction_timing": correction_timing.report(correction_completed) if correction_timing is not None else None,
                    "cache_oracle": {"cold_model_calls": cold_stats, "warm_model_calls": warm_stats,
                                     "correction_model_calls": correction_stats,
-                                    "cold_model_call_count": sum(value for key, value in cold_stats.items() if not key.startswith("_")), "warm_model_call_count": sum(value for key, value in warm_stats.items() if not key.startswith("_")),
+                                    "cold_model_call_count": cold_model_call_count, "warm_model_call_count": warm_model_call_count,
                                     "correction_model_call_count": sum(value for key, value in correction_stats.items() if not key.startswith("_")),
-                                    "warm_cache_reuse": sum(value for key, value in warm_stats.items() if not key.startswith("_")) < sum(value for key, value in cold_stats.items() if not key.startswith("_"))},
+                                    "warm_cache_reuse": warm_model_call_count < cold_model_call_count},
                    "corruption_oracle": _corruption_probe(workspace, parent, result.candidate_revision_id)}
+    corruption_oracle = measurement["corruption_oracle"]
+    if corruption_oracle.get("corruption_observable") is not True:
+        raise AssertionError("FC8 corruption oracle failed: corruption was not detected")
+    if corruption_oracle.get("original_hashes_mtimes_unchanged") is not True:
+        raise AssertionError("FC8 corruption oracle failed: measured workspace changed")
+
     # Callback captures are validation-only and must never enter canonical
     # benchmark output.
     for key in ("cold_model_calls", "warm_model_calls", "correction_model_calls"):

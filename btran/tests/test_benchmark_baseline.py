@@ -8,6 +8,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 import btran.benchmark_baseline as baseline
 
 from btran.benchmark_baseline import (
@@ -126,6 +128,43 @@ def test_harness_executes_warm_cache_corruption_probe_and_sibling_json(tmp_path:
     output_json = tmp_path / "native-baseline.json"
     assert output_json.is_file()
     assert json.loads(output_json.read_text(encoding="utf-8"))["mode"] == "native"
+
+
+def test_benchmark_rejects_non_empty_measured_workspace(tmp_path: Path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "stale-state").write_text("stale", encoding="utf-8")
+
+    def unexpected_run(*_args, **_kwargs):
+        raise AssertionError("benchmark must reject stale state before running")
+
+    monkeypatch.setattr(baseline, "_run_once", unexpected_run)
+    with pytest.raises(AssertionError, match="measured workspace must be empty"):
+        baseline.run_benchmark_case("native", tmp_path)
+
+
+def test_benchmark_fails_cache_and_corruption_oracles(tmp_path: Path, monkeypatch):
+    def fake_run(config, mode, timing, stats):
+        stats["extraction"] = 1 if config.base_revision is None else 1
+        (config.workspace / "record.json").write_text("immutable", encoding="utf-8")
+        return SimpleNamespace(status="completed", report=SimpleNamespace(non_actionable_finding_count=0), candidate_revision_id="sealed-revision")
+
+    monkeypatch.setattr(baseline, "_run_once", fake_run)
+    with pytest.raises(AssertionError, match="cache-reuse oracle failed"):
+        baseline.run_benchmark_case("native", tmp_path / "cache-failure")
+
+    def cached_run(config, mode, timing, stats):
+        stats["extraction"] = 1 if config.base_revision is None else 0
+        (config.workspace / "record.json").write_text("immutable", encoding="utf-8")
+        return SimpleNamespace(status="completed", report=SimpleNamespace(non_actionable_finding_count=0), candidate_revision_id="sealed-revision")
+
+    monkeypatch.setattr(baseline, "_run_once", cached_run)
+    monkeypatch.setattr(baseline, "_corruption_probe", lambda *_args: {
+        "corruption_observable": False,
+        "original_hashes_mtimes_unchanged": True,
+    })
+    with pytest.raises(AssertionError, match="corruption oracle failed"):
+        baseline.run_benchmark_case("native", tmp_path / "corruption-failure")
 
 
 def test_state_measure_excludes_directories_and_symlinks(tmp_path: Path):
