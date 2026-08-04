@@ -201,6 +201,20 @@ def _store_artifact(store, *, payload=None, semantic_key="semantic"):
     return store.put("test", payload or {"value": 1}, finding_ids=(finding.finding_id,), semantic_key=semantic_key)
 
 
+def test_v2_put_returns_persisted_envelope_for_existing_immutable_identity(tmp_path):
+    store = ArtifactStore(tmp_path)
+    first_finding = Finding(kind="stage_summary", severity="info", stage="test", message="first")
+    second_finding = Finding(kind="stage_summary", severity="info", stage="test", message="second")
+    store.put_finding(first_finding)
+    store.put_finding(second_finding)
+
+    first = store.put("test", {"value": 1}, finding_ids=(first_finding.finding_id,), semantic_key="semantic")
+    returned = store.put("test", {"value": 1}, finding_ids=(second_finding.finding_id,), semantic_key="semantic")
+
+    assert returned == first == store.get(first.artifact_id)
+    assert store.storage.findings_for(first.artifact_id) == (first_finding.finding_id,)
+
+
 def test_v2_store_uses_full_durability_schema_and_exact_relations(tmp_path):
     store = ArtifactStore(tmp_path)
     artifact = _store_artifact(store)
@@ -386,7 +400,7 @@ def test_existing_matching_revision_revalidates_before_idempotent_return(tmp_pat
         revisions.seal_bundle(snapshot, {}, b"")
 
 
-def _rewrite_zip(path: Path, values: dict[str, bytes], order: tuple[str, ...], *, changed_name: str | None = None, changed_metadata: bool = False) -> None:
+def _rewrite_zip(path: Path, values: dict[str, bytes], order: tuple[str, ...], *, changed_name: str | None = None, changed_metadata: bool = False, changed_internal_attr: bool = False) -> None:
     """Rewrite a test archive with FC3 metadata, optionally changing one field."""
     temporary = path.with_suffix(".rewrite")
     with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_STORED) as archive:
@@ -404,6 +418,8 @@ def _rewrite_zip(path: Path, values: dict[str, bytes], order: tuple[str, ...], *
                 info.date_time = (1980, 1, 1, 0, 0, 2)
             if changed_metadata and name == "snapshot.json":
                 info.external_attr ^= 1
+            if changed_internal_attr and name == "snapshot.json":
+                info.internal_attr = 1
             archive.writestr(info, values[name])
     os.replace(temporary, path)
 
@@ -491,7 +507,7 @@ def test_empty_v2_workspaces_produce_equal_zip_bytes(tmp_path):
     assert hashlib.sha256(first.read_bytes()).digest() == hashlib.sha256(second.read_bytes()).digest()
 
 
-@pytest.mark.parametrize("corruption", ("timestamp", "metadata", "order", "member", "manifest", "snapshot"))
+@pytest.mark.parametrize("corruption", ("timestamp", "metadata", "internal_attr", "order", "member", "manifest", "snapshot"))
 def test_v2_standalone_verification_rejects_archive_corruption(tmp_path, corruption):
     store = ArtifactStore(tmp_path)
     artifact = _store_artifact(store)
@@ -504,6 +520,8 @@ def test_v2_standalone_verification_rejects_archive_corruption(tmp_path, corrupt
         _rewrite_zip(bundle, values, names, changed_name="snapshot.json")
     elif corruption == "metadata":
         _rewrite_zip(bundle, values, names, changed_metadata=True)
+    elif corruption == "internal_attr":
+        _rewrite_zip(bundle, values, names, changed_internal_attr=True)
     elif corruption == "order":
         _rewrite_zip(bundle, values, ("manifest.json",) + names[:-1], changed_name=None)
     elif corruption == "member":

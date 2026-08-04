@@ -1244,8 +1244,11 @@ class V2ArtifactStore:
                 and existing.payload == envelope.payload and existing.dependency_ids == envelope.dependency_ids):
             # Identity intentionally excludes diagnostic and cache-key
             # annotations.  Preserve the first immutable record bytes while
-            # publishing a new semantic index binding and attestation.
+            # publishing a new semantic index binding and attestation.  The
+            # persisted envelope is authoritative: return it rather than a
+            # caller-shaped envelope whose finding IDs may not be persisted.
             self.storage.index_record(envelope.artifact_id, envelope.semantic_key)
+            envelope = existing
         else:
             self.storage.put_record(envelope.artifact_id, envelope.kind, data,
                                     semantic_key=envelope.semantic_key, dependency_ids=dependencies, finding_ids=findings)

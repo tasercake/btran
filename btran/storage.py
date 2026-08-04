@@ -427,6 +427,7 @@ class Storage:
                     info.create_version = 20
                     info.extract_version = 20
                     info.external_attr = 0o100444 << 16
+                    info.internal_attr = 0
                     info.extra = b""
                     info.comment = b""
                     info.flag_bits = 0
@@ -482,8 +483,9 @@ class Storage:
                 for info in infos:
                     if (info.date_time != (1980, 1, 1, 0, 0, 0) or info.create_system != 3
                             or info.create_version != 20 or info.extract_version != 20
-                            or info.external_attr != (0o100444 << 16) or info.extra != b""
-                            or info.comment != b"" or info.flag_bits != 0 or info.compress_type != zipfile.ZIP_STORED):
+                            or info.external_attr != (0o100444 << 16) or info.internal_attr != 0
+                            or info.extra != b"" or info.comment != b"" or info.flag_bits != 0
+                            or info.compress_type != zipfile.ZIP_STORED):
                         raise StorageError("revision ZIP metadata is not deterministic")
                 for name in names[:-1]:
                     parts = name.split("/")
