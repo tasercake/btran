@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import sqlite3
 import zipfile
 
 import pytest
@@ -43,6 +44,7 @@ from btran.identity import (
     structural_anchor_for,
 )
 from btran.schema import Finding, RevisionSnapshot, canonical_json_bytes, tagged_sha256
+from btran.storage import Storage
 
 
 def test_source_text_and_raw_byte_page_identity_are_exact():
@@ -309,6 +311,33 @@ def test_sealed_revision_is_self_contained_and_graph_is_selected_revision_only(t
         assert f"records/{second.artifact_id}.json" in archive.namelist()
         assert f"edges/{edge.edge_id}.json" in archive.namelist()
     assert revisions.selected_graph("revision").forward("revision", first.artifact_id) == (edge,)
+
+
+def test_standalone_verification_rejects_closure_relationship_mutation(tmp_path):
+    store = ArtifactStore(tmp_path)
+    artifact = _store_artifact(store)
+    snapshot = RevisionSnapshot(revision_id="revision", selected_artifact_ids=(artifact.artifact_id,))
+    bundle = RevisionStore(tmp_path).seal_bundle(snapshot, {}, b"")
+    values = Storage(tmp_path).verify_revision("revision")
+    raw = bytearray(bundle.read_bytes())
+    # The repository row must detect archive bytes before any mutable index is
+    # consulted.  This also covers the immutable SHA comparison boundary.
+    connection = sqlite3.connect(tmp_path / "state-v2.sqlite3")
+    connection.execute("UPDATE revisions SET zip_sha256=? WHERE revision_id=?", ("0" * 64, "revision"))
+    connection.commit(); connection.close()
+    with pytest.raises(ArtifactError, match="SHA"):
+        RevisionStore(tmp_path).verify_bundle("revision")
+    assert values["snapshot.json"]
+
+
+def test_resealing_revision_id_with_changed_snapshot_does_not_reuse_old_zip(tmp_path):
+    store = ArtifactStore(tmp_path)
+    first = _store_artifact(store, payload={"value": 1})
+    second = _store_artifact(store, payload={"value": 2})
+    revisions = RevisionStore(tmp_path)
+    revisions.seal_bundle(RevisionSnapshot(revision_id="revision", selected_artifact_ids=(first.artifact_id,)), {}, b"")
+    with pytest.raises(ArtifactError, match="conflicting ZIP"):
+        revisions.seal_bundle(RevisionSnapshot(revision_id="revision", selected_artifact_ids=(second.artifact_id,)), {}, b"")
 
 
 def test_existing_matching_revision_revalidates_before_idempotent_return(tmp_path):

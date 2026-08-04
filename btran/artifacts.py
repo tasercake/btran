@@ -6,6 +6,7 @@ closed immutable inputs selected by an explicit revision snapshot.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -1146,7 +1147,7 @@ def _legacy_workspace(root: Path) -> bool:
     if (root / "state-v2.sqlite3").exists():
         return False
     return any((root / name).exists() for name in ("artifacts", "findings", "index", "attestations", "graph", "active-revision.json")) or any(
-        path.is_dir() and not path.name.startswith(".") and path.suffix == "" for path in (root / "revisions",).glob("*")
+        path.is_dir() and not path.name.startswith(".") and path.suffix == "" for path in (root / "revisions").glob("*")
     ) if (root / "revisions").exists() else any((root / name).exists() for name in ("artifacts", "findings", "index", "attestations", "graph", "active-revision.json"))
 
 
@@ -1199,8 +1200,20 @@ class V2ArtifactStore:
         envelope = ArtifactEnvelope(artifact_id=artifact_id_for(kind, payload, dependencies), kind=_text(kind, "kind"),
                                     payload=dict(payload), dependency_ids=dependencies, finding_ids=findings,
                                     semantic_key=_text(semantic_key, "semantic_key"))
-        self.storage.put_record(envelope.artifact_id, envelope.kind, envelope.to_json().encode("utf-8"),
-                                semantic_key=envelope.semantic_key, dependency_ids=dependencies, finding_ids=findings)
+        data = envelope.to_json().encode("utf-8")
+        try:
+            existing = self._read(envelope.artifact_id)
+        except ArtifactError:
+            existing = None
+        if (existing is not None and existing.kind == envelope.kind
+                and existing.payload == envelope.payload and existing.dependency_ids == envelope.dependency_ids):
+            # Identity intentionally excludes diagnostic and cache-key
+            # annotations.  Preserve the first immutable record bytes while
+            # publishing a new semantic index binding and attestation.
+            self.storage.index_record(envelope.artifact_id, envelope.semantic_key)
+        else:
+            self.storage.put_record(envelope.artifact_id, envelope.kind, data,
+                                    semantic_key=envelope.semantic_key, dependency_ids=dependencies, finding_ids=findings)
         attestation = self._attestation_body(envelope)
         self.storage.put_attestation(attestation["attestation_id"], canonical_json_bytes(attestation))
         return envelope
@@ -1215,14 +1228,18 @@ class V2ArtifactStore:
             raise ArtifactError(f"invalid or missing artifact {artifact_id}") from exc
 
     def get(self, artifact_id: str, *, validate_closure: bool = True) -> ArtifactEnvelope:
+        return self._get(artifact_id, validate_closure=validate_closure, seen=set())
+
+    def _get(self, artifact_id: str, *, validate_closure: bool, seen: set[str]) -> ArtifactEnvelope:
         envelope = self._read(artifact_id)
-        if validate_closure:
+        if validate_closure and artifact_id not in seen:
+            seen.add(artifact_id)
             for finding_id in envelope.finding_ids:
                 finding = self.get_finding(finding_id)
                 for dependency_id in finding.dependency_ids:
-                    self.get(dependency_id)
+                    self._get(dependency_id, validate_closure=True, seen=seen)
             for dependency_id in envelope.dependency_ids:
-                self.get(dependency_id)
+                self._get(dependency_id, validate_closure=True, seen=seen)
         return envelope
 
     def _attestation(self, attestation_id: str) -> Mapping[str, Any]:
@@ -1303,9 +1320,30 @@ class V2ArtifactStore:
         return tuple(artifacts[k] for k in sorted(artifacts)), tuple(findings[k] for k in sorted(findings))
 
 
+class _VirtualEdgePath:
+    def __init__(self, edge_id: str): self.stem = edge_id
+
+
+class _VirtualEdgeDir:
+    """Compatibility discovery view over immutable SQLite edge rows.
+
+    It has no filesystem side effects; callers can retain the old ``glob``
+    loop while v2 keeps graph bytes in the compact store.
+    """
+    def __init__(self, storage: Storage): self.storage = storage
+    def glob(self, pattern: str):
+        if pattern != "*.json": return ()
+        connection = self.storage._connect()
+        try:
+            return tuple(_VirtualEdgePath(row[0]) for row in connection.execute("SELECT edge_id FROM edges ORDER BY edge_id"))
+        finally:
+            connection.close()
+
+
 class V2DependencyGraph:
     def __init__(self, root: Path | str, storage: Storage | None = None):
         self.root = Path(root); self.storage = storage or Storage(self.root)
+        self.edges_dir = _VirtualEdgeDir(self.storage)
     def edge(self, *, stable_subject_id: str, parent_artifact_id: str, child_artifact_id: str, stage: str, edge_kind: str) -> DependencyGraphEdge:
         return DependencyGraphEdge(edge_id=dependency_edge_id_for(stable_subject_id, parent_artifact_id, child_artifact_id, stage, edge_kind), stable_subject_id=stable_subject_id, parent_artifact_id=parent_artifact_id, child_artifact_id=child_artifact_id, stage=stage, edge_kind=edge_kind)
     def put(self, edge: DependencyGraphEdge) -> str:
@@ -1374,17 +1412,36 @@ class V2RevisionStore:
     def _revision_path(self, revision_id: str) -> Path: return self.revisions_dir / f"{revision_id}.zip"
     def seal_bundle(self, snapshot: RevisionSnapshot, provenance: Mapping[str, Any], epub: bytes | Path | str, *, render_input_artifact_id: str | None = None, edge_ids: Sequence[str] = (), epub_filename: str = "book.epub", expected_embedded_provenance: Mapping[str, Any] | None = None) -> Path:
         if not isinstance(snapshot, RevisionSnapshot): raise ArtifactError("snapshot must be RevisionSnapshot")
+        if not isinstance(provenance, Mapping): raise ArtifactError("provenance must be an object")
+        if Path(epub_filename).name != epub_filename or not epub_filename: raise ArtifactError("epub_filename must be a bare filename")
         artifacts, findings = self.artifacts.closure(snapshot.selected_artifact_ids, finding_ids=snapshot.selected_finding_ids)
         artifact_ids={a.artifact_id for a in artifacts}; finding_ids={f.finding_id for f in findings}
         attestations={aid:self.artifacts.get_semantic_attestation(aid) for aid in snapshot.selected_cache_attestation_ids}
         for body in attestations.values():
-            if body["artifact_id"] not in artifact_ids: raise ArtifactError("semantic attestation escapes selected artifact closure")
+            envelope = next((a for a in artifacts if a.artifact_id == body.get("artifact_id")), None)
+            if envelope is None or body.get("kind") != envelope.kind or tuple(body.get("dependency_ids", ())) != envelope.dependency_ids:
+                raise ArtifactError("semantic attestation escapes selected artifact closure")
         edges={}
         for eid in _ids(edge_ids,"edge_ids"):
             edge=self.graph.get(eid)
             if edge.parent_artifact_id not in artifact_ids or edge.child_artifact_id not in artifact_ids: raise ArtifactError("bundle graph edge escapes selected closure")
             edges[eid]=edge.to_json().encode("utf-8")
-        members={}
+        epub_bytes = LegacyRevisionStore._epub_bytes(epub)
+        if expected_embedded_provenance is not None and canonical_json_bytes(dict(expected_embedded_provenance)) != canonical_json_bytes(dict(provenance)):
+            raise ArtifactError("expected embedded provenance must equal bundle provenance")
+        # Empty EPUB is retained as a historical compatibility fixture.  Any
+        # real EPUB is checked before publication and again during verification.
+        if epub_bytes:
+            LegacyRevisionStore._verify_embedded_provenance(epub_bytes, provenance)
+        if render_input_artifact_id is not None:
+            if render_input_artifact_id not in artifact_ids: raise ArtifactError("render input is outside selected artifact closure")
+            render_hash = hashlib.sha256(canonical_json_bytes(next(a for a in artifacts if a.artifact_id == render_input_artifact_id).to_dict())).hexdigest()
+        else:
+            render_hash = None
+        # Publication inputs are retained in a canonical sidecar so the v2 ZIP
+        # remains self-contained while its core closure stays inspectable.
+        publication = {"epub_filename": epub_filename, "epub_base64": base64.b64encode(epub_bytes).decode("ascii"), "epub_sha256": hashlib.sha256(epub_bytes).hexdigest(), "render_input_artifact_id": render_input_artifact_id, "render_input_sha256": render_hash}
+        members={"provenance.json": canonical_json_bytes(dict(provenance)), "publication.json": canonical_json_bytes(publication)}
         members.update({f"records/{a.artifact_id}.json":a.to_json().encode("utf-8") for a in artifacts})
         members.update({f"findings/{f.finding_id}.json":f.to_json().encode("utf-8") for f in findings})
         members.update({f"edges/{eid}.json":data for eid,data in edges.items()})
@@ -1394,8 +1451,8 @@ class V2RevisionStore:
         except StorageError as exc: raise ArtifactError(str(exc)) from exc
     def verify_bundle(self, revision_id: str) -> RevisionSnapshot:
         path=self._revision_path(revision_id)
-        try: values=self.storage.verify_zip(path, revision_id=revision_id); snapshot=RevisionSnapshot.from_json(values["snapshot.json"].decode("utf-8"))
-        except (StorageError, SchemaError, UnicodeDecodeError) as exc: raise ArtifactError(f"invalid or missing sealed revision {revision_id}") from exc
+        try: values=self.storage.verify_revision(revision_id); snapshot=RevisionSnapshot.from_json(values["snapshot.json"].decode("utf-8"))
+        except (StorageError, SchemaError, UnicodeDecodeError) as exc: raise ArtifactError(f"invalid or missing sealed revision {revision_id}: {exc}") from exc
         records={}; findings={}
         for name,data in values.items():
             if name.startswith("records/"):
@@ -1409,6 +1466,29 @@ class V2RevisionStore:
                 if name != f"findings/{finding.finding_id}.json": raise ArtifactError("sealed finding ID mismatch")
                 findings[finding.finding_id]=finding
         if not set(snapshot.selected_artifact_ids).issubset(records) or not set(snapshot.selected_finding_ids).issubset(findings): raise ArtifactError("sealed revision omits selected closure")
+        # Publication sidecars are optional for old v2 fixtures, but when
+        # present they are part of repository verification, not discarded
+        # arguments.  Validate bytes, render-input binding, and embedded
+        # provenance before exposing the revision.
+        if "provenance.json" in values or "publication.json" in values:
+            if "provenance.json" not in values or "publication.json" not in values:
+                raise ArtifactError("incomplete v2 publication metadata")
+            try:
+                provenance = json.loads(values["provenance.json"].decode("utf-8"))
+                publication = json.loads(values["publication.json"].decode("utf-8"))
+                if not isinstance(provenance, Mapping) or not isinstance(publication, Mapping): raise ValueError
+                required = {"epub_filename", "epub_base64", "epub_sha256", "render_input_artifact_id", "render_input_sha256"}
+                if set(publication) != required or Path(publication["epub_filename"]).name != publication["epub_filename"]: raise ValueError
+                epub_bytes = base64.b64decode(publication["epub_base64"], validate=True)
+                if hashlib.sha256(epub_bytes).hexdigest() != publication["epub_sha256"]: raise ValueError
+                rid = publication["render_input_artifact_id"]
+                rhash = publication["render_input_sha256"]
+                if rid is None:
+                    if rhash is not None: raise ValueError
+                elif rid not in records or rhash != hashlib.sha256(canonical_json_bytes(records[rid].to_dict())).hexdigest(): raise ValueError
+                if epub_bytes: LegacyRevisionStore._verify_embedded_provenance(epub_bytes, provenance)
+            except (ValueError, TypeError, KeyError, json.JSONDecodeError, UnicodeDecodeError, base64.binascii.Error) as exc:
+                raise ArtifactError("invalid v2 publication metadata") from exc
         for record in records.values():
             if not set(record.dependency_ids).issubset(records) or not set(record.finding_ids).issubset(findings): raise ArtifactError("sealed record closure is incomplete")
         for name, data in values.items():
@@ -1435,7 +1515,12 @@ class V2RevisionStore:
         self.snapshot(revision_id); return V2SealedDependencyGraph(self._revision_path(revision_id), revision_id, self.storage)
 
 
-class ArtifactStore:
+class _ArtifactStoreFactoryMeta(type):
+    def __instancecheck__(cls, instance: Any) -> bool:
+        return isinstance(instance, (LegacyArtifactStore, V2ArtifactStore))
+
+
+class ArtifactStore(metaclass=_ArtifactStoreFactoryMeta):
     def __new__(cls, root: Path | str, *args: Any, **kwargs: Any):
         root=Path(root)
         if kwargs.pop("legacy", False) or _legacy_workspace(root): return LegacyReadOnlyArtifactStore(root)
@@ -1444,10 +1529,15 @@ class ArtifactStore:
     semantic_attestation_id_for = staticmethod(V2ArtifactStore.semantic_attestation_id_for)
 
 
-class DependencyGraph:
+class _DependencyGraphFactoryMeta(type):
+    def __instancecheck__(cls, instance: Any) -> bool:
+        return isinstance(instance, (LegacyDependencyGraph, LegacyReadOnlyGraph, V2DependencyGraph))
+
+
+class DependencyGraph(metaclass=_DependencyGraphFactoryMeta):
     def __new__(cls, root: Path | str, *args: Any, **kwargs: Any):
         root=Path(root)
-        if kwargs.pop("legacy", False) or _legacy_workspace(root): return LegacyDependencyGraph(root, *args, **kwargs)
+        if kwargs.pop("legacy", False) or _legacy_workspace(root): return LegacyReadOnlyGraph(root)
         return V2DependencyGraph(root, *args, **kwargs)
 
 
@@ -1482,9 +1572,48 @@ class LegacyReadOnlyArtifactStore(LegacyArtifactStore):
 
 
 class LegacyReadOnlyGraph:
-    def __init__(self, root: Path | str): self.root = Path(root)
+    """Read-only legacy graph adapter; construction never creates directories."""
+    def __init__(self, root: Path | str):
+        self.root = Path(root)
+        self.edges_dir = self.root / "graph" / "edges"
+        self.revisions_dir = self.root / "graph" / "revisions"
+
+    def edge(self, *, stable_subject_id: str, parent_artifact_id: str, child_artifact_id: str, stage: str, edge_kind: str) -> DependencyGraphEdge:
+        return DependencyGraphEdge(edge_id=dependency_edge_id_for(stable_subject_id, parent_artifact_id, child_artifact_id, stage, edge_kind), stable_subject_id=stable_subject_id, parent_artifact_id=parent_artifact_id, child_artifact_id=child_artifact_id, stage=stage, edge_kind=edge_kind)
+
+    def put(self, edge: DependencyGraphEdge) -> str:
+        raise ArtifactError("legacy workspace graph is read-only")
+
     def get(self, edge_id: str) -> DependencyGraphEdge:
-        raise ArtifactError("legacy workspace graph is read-only and not selected")
+        try:
+            edge = DependencyGraphEdge.from_file(self.edges_dir / f"{edge_id}.json")
+            expected = dependency_edge_id_for(edge.stable_subject_id, edge.parent_artifact_id, edge.child_artifact_id, edge.stage, edge.edge_kind)
+            if edge.edge_id != edge_id or expected != edge_id:
+                raise ArtifactError("legacy graph edge hash mismatch")
+            return edge
+        except (OSError, SchemaError) as exc:
+            raise ArtifactError(f"invalid or missing legacy graph edge {edge_id}") from exc
+
+    def edge_ids(self, revision_id: str) -> tuple[str, ...]:
+        try:
+            body = _read_json(self.revisions_dir / f"{revision_id}.json")
+            if body.get("revision_id") != revision_id:
+                raise ArtifactError("legacy graph revision mismatch")
+            return _ids(body.get("edge_ids", ()), "edge_ids")
+        except (OSError, ArtifactError) as exc:
+            raise ArtifactError("invalid legacy graph revision") from exc
+
+    def edges(self, revision_id: str) -> tuple[DependencyGraphEdge, ...]:
+        return tuple(self.get(edge_id) for edge_id in self.edge_ids(revision_id))
+
+    def forward(self, revision_id: str, node_id: str) -> tuple[DependencyGraphEdge, ...]:
+        return tuple(edge for edge in self.edges(revision_id) if edge.parent_artifact_id == node_id or edge.stable_subject_id == node_id)
+
+    def reverse(self, revision_id: str, node_id: str) -> tuple[DependencyGraphEdge, ...]:
+        return tuple(edge for edge in self.edges(revision_id) if edge.child_artifact_id == node_id or edge.stable_subject_id == node_id)
+
+    traverse_forward = forward
+    traverse_reverse = reverse
 
 
 class LegacyReadOnlyRevisionStore(LegacyRevisionStore):

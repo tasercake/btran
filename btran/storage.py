@@ -125,7 +125,12 @@ class Storage:
         try:
             connection.executescript(_SCHEMA)
             connection.commit()
-            connection.execute("PRAGMA wal_checkpoint(FULL)")
+            result = connection.execute("PRAGMA wal_checkpoint(FULL)").fetchone()
+            # SQLite returns (busy, log-pages, checkpointed-pages).  A busy
+            # checkpoint is not a durable initialization, even if the schema
+            # statement itself committed successfully.
+            if result is None or int(result[0]) != 0:
+                raise StorageError("SQLite WAL checkpoint was not successful")
         finally:
             connection.close()
         self._fsync_db()
@@ -159,10 +164,59 @@ class Storage:
             connection.close()
 
     @staticmethod
+    def _canonical_bytes(data: bytes, name: str = "record") -> bytes:
+        if not isinstance(data, bytes):
+            raise StorageError(f"{name} data must be bytes")
+        try:
+            value = json.loads(data.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise StorageError(f"{name} data must be canonical UTF-8 JSON") from exc
+        canonical = canonical_json_bytes(value)
+        if canonical != data:
+            raise StorageError(f"{name} data is not canonical JSON")
+        return data
+
+    @staticmethod
+    def _validate_identity(table: str, key: str, data: bytes) -> None:
+        """Recompute the public v2 identity at the low-level boundary.
+
+        The adapters normally do this first, but Storage is public and must
+        not become an escape hatch for caller-supplied IDs or raw bytes.
+        Imports stay local to avoid the artifacts -> storage import cycle.
+        """
+        try:
+            from btran.artifacts import artifact_id_for, dependency_edge_id_for, V2ArtifactStore
+            from btran.schema import ArtifactEnvelope, DependencyGraphEdge, Finding
+            if table == "records":
+                value = ArtifactEnvelope.from_json(data.decode("utf-8"))
+                expected = artifact_id_for(value.kind, value.payload, value.dependency_ids)
+            elif table == "findings":
+                value = Finding.from_json(data.decode("utf-8"))
+                expected = value.finding_id
+            elif table == "edges":
+                value = DependencyGraphEdge.from_json(data.decode("utf-8"))
+                expected = dependency_edge_id_for(value.stable_subject_id, value.parent_artifact_id, value.child_artifact_id, value.stage, value.edge_kind)
+            elif table == "attestations":
+                value = json.loads(data.decode("utf-8"))
+                required = {"attestation_id", "artifact_id", "kind", "semantic_key", "dependency_ids"}
+                if not isinstance(value, dict) or set(value) != required:
+                    raise StorageError("invalid attestation body")
+                expected = V2ArtifactStore.semantic_attestation_id_for(
+                    artifact_id=value["artifact_id"], kind=value["kind"], semantic_key=value["semantic_key"], dependency_ids=value["dependency_ids"])
+            else:
+                return
+            if key != expected:
+                raise StorageError(f"{table} ID does not match canonical content")
+        except StorageError:
+            raise
+        except Exception as exc:
+            raise StorageError(f"invalid {table} content") from exc
+
+    @staticmethod
     def _insert_immutable(connection: sqlite3.Connection, table: str, key: str,
                           key_column: str, data: bytes, sha_column: str = "content_sha256") -> None:
-        if not isinstance(data, bytes):
-            raise StorageError("canonical record data must be bytes")
+        data = Storage._canonical_bytes(data, table)
+        Storage._validate_identity(table, key, data)
         digest = _sha(data)
         row = connection.execute(
             f"SELECT {key_column}, canonical_json_bytes, {sha_column} FROM {table} WHERE {key_column}=?", (key,)
@@ -179,9 +233,22 @@ class Storage:
     def put_record(self, record_id: str, kind: str, data: bytes, *, semantic_key: str | None = None,
                    dependency_ids: Sequence[str] = (), finding_ids: Sequence[str] = ()) -> None:
         record_id, kind = _text(record_id, "record_id"), _text(kind, "kind")
+        data = self._canonical_bytes(data, "record")
+        self._validate_identity("records", record_id, data)
         dependencies, findings = _ids(dependency_ids, "dependency_ids"), _ids(finding_ids, "finding_ids")
         if semantic_key is not None:
             _text(semantic_key, "semantic_key")
+        try:
+            from btran.schema import ArtifactEnvelope
+            envelope = ArtifactEnvelope.from_json(data.decode("utf-8"))
+            if (envelope.kind != kind or envelope.dependency_ids != dependencies
+                    or envelope.finding_ids != findings
+                    or (semantic_key is not None and envelope.semantic_key != semantic_key)):
+                raise StorageError("record arguments do not match canonical record content")
+        except StorageError:
+            raise
+        except Exception as exc:
+            raise StorageError("invalid record content") from exc
 
         def operation(connection: sqlite3.Connection) -> None:
             digest = _sha(data)
@@ -199,6 +266,14 @@ class Storage:
             if semantic_key is not None:
                 connection.execute("INSERT OR IGNORE INTO semantic_index VALUES(?,?)", (semantic_key, record_id))
 
+        self._write(operation)
+
+    def index_record(self, record_id: str, semantic_key: str) -> None:
+        record_id, semantic_key = _text(record_id, "record_id"), _text(semantic_key, "semantic_key")
+        def operation(connection: sqlite3.Connection) -> None:
+            if connection.execute("SELECT 1 FROM records WHERE record_id=?", (record_id,)).fetchone() is None:
+                raise StorageError("cannot index missing record")
+            connection.execute("INSERT OR IGNORE INTO semantic_index VALUES(?,?)", (semantic_key, record_id))
         self._write(operation)
 
     def put_finding(self, finding_id: str, data: bytes) -> None:
@@ -278,68 +353,86 @@ class Storage:
             connection.close()
 
     def seal_revision(self, revision_id: str, snapshot: bytes, members: Mapping[str, bytes]) -> Path:
-        """Write and verify one deterministic ZIP, then publish its DB row."""
+        """Build, verify, publish, and activate one immutable revision.
+
+        The candidate is always built, including when the revision filename
+        already exists.  This prevents a re-seal from silently ignoring new
+        closure bytes.  Revision insertion and active-pointer publication are
+        one SQLite transaction.
+        """
         revision_id = _text(revision_id, "revision_id")
         if not isinstance(snapshot, bytes) or not isinstance(members, Mapping):
             raise StorageError("snapshot and members have invalid types")
+        snapshot = self._canonical_bytes(snapshot, "snapshot")
         all_members = {"snapshot.json": snapshot, **dict(members)}
-        if "manifest.json" in all_members or any(not name or name.startswith("/") or ".." in Path(name).parts for name in all_members):
+        if "manifest.json" in all_members or any(
+            not isinstance(name, str) or not name or name.startswith("/") or ".." in Path(name).parts
+            for name in all_members
+        ):
             raise StorageError("invalid revision member path")
         if any(not isinstance(data, bytes) for data in all_members.values()):
             raise StorageError("revision members must be bytes")
+        # FC3 closure members are canonical JSON.  The storage layer does not
+        # accept an opaque/raw member escape hatch.
+        for name, data in all_members.items():
+            self._canonical_bytes(data, name)
         manifest = {"members": {name: _sha(data) for name, data in sorted(all_members.items(), key=lambda item: item[0].encode("utf-8"))}}
-        manifest_bytes = canonical_json_bytes(manifest)
-        all_members["manifest.json"] = manifest_bytes
+        all_members["manifest.json"] = canonical_json_bytes(manifest)
         filename = f"{revision_id}.zip"
         destination = self.revisions_dir / filename
-        temporary = self.revisions_dir / f"{revision_id}.zip.tmp"
-        if destination.exists():
-            if destination.read_bytes() != self._read_bytes(temporary if temporary.exists() else destination):
-                self.verify_zip(destination, revision_id=revision_id)
-            self.verify_zip(destination, revision_id=revision_id)
-        else:
-            try:
-                with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_STORED) as archive:
-                    # The manifest is deliberately the final member.  All
-                    # closure paths before it are UTF-8 lexical sorted.
-                    member_names = sorted((name for name in all_members if name != "manifest.json"),
-                                          key=lambda item: item.encode("utf-8")) + ["manifest.json"]
-                    for name in member_names:
-                        info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
-                        info.create_system = 3
-                        info.create_version = 20
-                        info.extract_version = 20
-                        info.external_attr = 0o100444 << 16
-                        info.extra = b""
-                        info.comment = b""
-                        info.flag_bits = 0
-                        info.compress_type = zipfile.ZIP_STORED
-                        archive.writestr(info, all_members[name])
-                    archive.fp.flush()
-                    os.fsync(archive.fp.fileno())
-                self.verify_zip(temporary, revision_id=revision_id)
+        temporary = self.revisions_dir / f".{revision_id}.zip.tmp"
+        try:
+            with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_STORED) as archive:
+                member_names = sorted((name for name in all_members if name != "manifest.json"),
+                                      key=lambda item: item.encode("utf-8")) + ["manifest.json"]
+                for name in member_names:
+                    info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
+                    info.create_system = 3
+                    info.create_version = 20
+                    info.extract_version = 20
+                    info.external_attr = 0o100444 << 16
+                    info.extra = b""
+                    info.comment = b""
+                    info.flag_bits = 0
+                    info.compress_type = zipfile.ZIP_STORED
+                    archive.writestr(info, all_members[name])
+                archive.fp.flush()
+                os.fsync(archive.fp.fileno())
+            # This is standalone validation: no DB row or active pointer is
+            # consulted before the immutable candidate is complete.
+            self.verify_zip(temporary, revision_id=revision_id)
+            candidate = temporary.read_bytes()
+            if destination.exists():
+                existing = destination.read_bytes()
+                if existing != candidate:
+                    raise StorageError("immutable revision ID has conflicting ZIP bytes")
+            else:
                 os.replace(temporary, destination)
                 _fsync_dir(self.revisions_dir)
-            finally:
-                if temporary.exists():
-                    temporary.unlink()
-        zip_sha = _sha(destination.read_bytes())
-        snapshot_json = snapshot
-        def operation(connection: sqlite3.Connection) -> None:
-            row = connection.execute("SELECT * FROM revisions WHERE revision_id=?", (revision_id,)).fetchone()
-            values = (revision_id, filename, zip_sha, snapshot_json)
-            if row is not None and tuple(row) != values:
-                raise StorageError("immutable revision ID has conflicting content")
-            if row is None:
-                connection.execute("INSERT INTO revisions VALUES(?,?,?,?)", values)
-        self._write(operation)
-        return destination
+            zip_sha = _sha(candidate)
+            snapshot_json = snapshot
+            def operation(connection: sqlite3.Connection) -> None:
+                row = connection.execute("SELECT revision_id, zip_filename, zip_sha256, canonical_snapshot_json FROM revisions WHERE revision_id=?", (revision_id,)).fetchone()
+                values = (revision_id, filename, zip_sha, snapshot_json)
+                if row is not None and tuple(row) != values:
+                    raise StorageError("immutable revision ID has conflicting content")
+                if row is None:
+                    connection.execute("INSERT INTO revisions VALUES(?,?,?,?)", values)
+                connection.execute(
+                    "INSERT INTO active_revision(slot, revision_id) VALUES(1,?) "
+                    "ON CONFLICT(slot) DO UPDATE SET revision_id=excluded.revision_id", (revision_id,))
+            self._write(operation)
+            return destination
+        finally:
+            if temporary.exists():
+                temporary.unlink()
 
     @staticmethod
     def _read_bytes(path: Path) -> bytes:
         return path.read_bytes()
 
     def verify_zip(self, path: Path | str, *, revision_id: str | None = None) -> Mapping[str, bytes]:
+        """Standalone-verify bytes, identities, selected closure, and relations."""
         path = Path(path)
         try:
             with zipfile.ZipFile(path, "r") as archive:
@@ -349,28 +442,27 @@ class Storage:
                         or names[:-1] != sorted(names[:-1], key=lambda n: n.encode("utf-8"))):
                     raise StorageError("revision ZIP members are not unique and UTF-8 sorted")
                 for info in infos:
-                    expected = zipfile.ZipInfo(info.filename, date_time=(1980, 1, 1, 0, 0, 0))
-                    if (info.date_time != expected.date_time or info.create_system != 3 or info.create_version != 20
-                            or info.extract_version != 20 or info.external_attr != (0o100444 << 16)
-                            or info.extra != b"" or info.comment != b"" or info.flag_bits != 0
-                            or info.compress_type != zipfile.ZIP_STORED):
+                    if (info.date_time != (1980, 1, 1, 0, 0, 0) or info.create_system != 3
+                            or info.create_version != 20 or info.extract_version != 20
+                            or info.external_attr != (0o100444 << 16) or info.extra != b""
+                            or info.comment != b"" or info.flag_bits != 0 or info.compress_type != zipfile.ZIP_STORED):
                         raise StorageError("revision ZIP metadata is not deterministic")
-                if names[-1:] != ["manifest.json"]:
-                    raise StorageError("revision ZIP has no final manifest")
                 for name in names[:-1]:
                     parts = name.split("/")
-                    if (name == "snapshot.json" or len(parts) != 2 or parts[0] not in {"records", "findings", "edges", "attestations"}
-                            or not parts[1].endswith(".json") or not parts[1][:-5]):
-                        if name != "snapshot.json":
-                            raise StorageError("unexpected revision ZIP member")
+                    if name not in {"snapshot.json", "provenance.json", "publication.json"} and (
+                        len(parts) != 2 or parts[0] not in {"records", "findings", "edges", "attestations"}
+                        or not parts[1].endswith(".json") or not parts[1][:-5]
+                    ):
+                        raise StorageError("unexpected revision ZIP member")
                 values = {name: archive.read(name) for name in names}
-        except (OSError, zipfile.BadZipFile, IndexError) as exc:
+        except (OSError, zipfile.BadZipFile, IndexError, KeyError) as exc:
             raise StorageError("invalid revision ZIP") from exc
         try:
             manifest = json.loads(values["manifest.json"].decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        except (UnicodeDecodeError, json.JSONDecodeError, KeyError) as exc:
             raise StorageError("invalid revision manifest") from exc
-        if canonical_json_bytes(manifest) != values["manifest.json"] or set(manifest) != {"members"} or not isinstance(manifest["members"], dict):
+        if (canonical_json_bytes(manifest) != values["manifest.json"] or set(manifest) != {"members"}
+                or not isinstance(manifest["members"], dict)):
             raise StorageError("non-canonical revision manifest")
         expected_names = set(manifest["members"]) | {"manifest.json"}
         if set(values) != expected_names or "snapshot.json" not in manifest["members"]:
@@ -384,16 +476,96 @@ class Storage:
                 raise StorageError("revision member is not canonical JSON") from exc
             if canonical_json_bytes(parsed) != values[name] or _sha(values[name]) != digest:
                 raise StorageError("revision manifest hash mismatch")
-        if revision_id is not None:
-            try:
-                snapshot = json.loads(values["snapshot.json"].decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                raise StorageError("invalid revision snapshot") from exc
-            if not isinstance(snapshot, dict) or snapshot.get("revision_id") != revision_id:
-                raise StorageError("revision snapshot ID mismatch")
+
+        # Decode every selected closure object and recompute its canonical ID.
+        try:
+            from btran.artifacts import artifact_id_for, dependency_edge_id_for, V2ArtifactStore
+            from btran.schema import ArtifactEnvelope, DependencyGraphEdge, Finding, RevisionSnapshot, SchemaError
+            snapshot = RevisionSnapshot.from_json(values["snapshot.json"].decode("utf-8"))
+        except (KeyError, UnicodeDecodeError, SchemaError, ValueError, TypeError) as exc:
+            raise StorageError("invalid revision snapshot") from exc
+        if revision_id is not None and snapshot.revision_id != revision_id:
+            raise StorageError("revision snapshot ID mismatch")
+        records: dict[str, Any] = {}
+        findings: dict[str, Any] = {}
+        attestations: dict[str, Mapping[str, Any]] = {}
+        edges: dict[str, Any] = {}
+        try:
+            for name, data in values.items():
+                if name.startswith("records/"):
+                    record = ArtifactEnvelope.from_json(data.decode("utf-8"))
+                    if name != f"records/{record.artifact_id}.json" or artifact_id_for(record.kind, record.payload, record.dependency_ids) != record.artifact_id:
+                        raise StorageError("sealed record identity mismatch")
+                    if record.artifact_id in records:
+                        raise StorageError("duplicate sealed record identity")
+                    records[record.artifact_id] = record
+                elif name.startswith("findings/"):
+                    finding = Finding.from_json(data.decode("utf-8"))
+                    if name != f"findings/{finding.finding_id}.json" or finding.finding_id in findings:
+                        raise StorageError("sealed finding identity mismatch")
+                    findings[finding.finding_id] = finding
+                elif name.startswith("edges/"):
+                    edge = DependencyGraphEdge.from_json(data.decode("utf-8"))
+                    if name != f"edges/{edge.edge_id}.json" or dependency_edge_id_for(edge.stable_subject_id, edge.parent_artifact_id, edge.child_artifact_id, edge.stage, edge.edge_kind) != edge.edge_id or edge.edge_id in edges:
+                        raise StorageError("sealed edge identity mismatch")
+                    edges[edge.edge_id] = edge
+                elif name.startswith("attestations/"):
+                    body = json.loads(data.decode("utf-8"))
+                    required = {"attestation_id", "artifact_id", "kind", "semantic_key", "dependency_ids"}
+                    if not isinstance(body, dict) or set(body) != required:
+                        raise StorageError("sealed attestation schema mismatch")
+                    aid = body["attestation_id"]
+                    expected = V2ArtifactStore.semantic_attestation_id_for(artifact_id=body["artifact_id"], kind=body["kind"], semantic_key=body["semantic_key"], dependency_ids=body["dependency_ids"])
+                    if name != f"attestations/{aid}.json" or aid != expected or aid in attestations:
+                        raise StorageError("sealed attestation identity mismatch")
+                    attestations[aid] = body
+        except (UnicodeDecodeError, json.JSONDecodeError, SchemaError, TypeError, KeyError) as exc:
+            raise StorageError("invalid sealed closure member") from exc
+        if (not set(snapshot.selected_artifact_ids).issubset(records)
+                or not set(snapshot.selected_finding_ids).issubset(findings)
+                or not set(snapshot.selected_cache_attestation_ids).issubset(attestations)):
+            raise StorageError("sealed revision omits selected closure")
+        for record in records.values():
+            if not set(record.dependency_ids).issubset(records) or not set(record.finding_ids).issubset(findings):
+                raise StorageError("sealed record relationship escapes closure")
+        for finding in findings.values():
+            if not set(finding.dependency_ids).issubset(records):
+                raise StorageError("sealed finding relationship escapes closure")
+        for body in attestations.values():
+            record = records.get(body["artifact_id"])
+            if record is None or body["kind"] != record.kind or tuple(body["dependency_ids"]) != record.dependency_ids:
+                raise StorageError("sealed attestation relationship escapes closure")
+        for edge in edges.values():
+            if edge.parent_artifact_id not in records or edge.child_artifact_id not in records:
+                raise StorageError("sealed edge relationship escapes closure")
+        return values
+
+    def verify_revision(self, revision_id: str) -> Mapping[str, bytes]:
+        """Verify an archive and its immutable repository row together."""
+        revision_id = _text(revision_id, "revision_id")
+        row = self.revision_row(revision_id)
+        filename = row["zip_filename"]
+        if not isinstance(filename, str) or Path(filename).name != filename:
+            raise StorageError("revision row has unsafe ZIP filename")
+        path = self.revisions_dir / filename
+        values = self.verify_zip(path, revision_id=revision_id)
+        raw = path.read_bytes()
+        if _sha(raw) != row["zip_sha256"]:
+            raise StorageError("revision archive SHA-256 differs from immutable revision row")
+        if values["snapshot.json"] != bytes(row["canonical_snapshot_json"]):
+            raise StorageError("revision snapshot differs from immutable revision row")
         return values
 
     def register_revision(self, revision_id: str, zip_filename: str, zip_sha256: str, snapshot: bytes) -> None:
+        revision_id, zip_filename = _text(revision_id, "revision_id"), _text(zip_filename, "zip_filename")
+        if (Path(zip_filename).name != zip_filename or not isinstance(zip_sha256, str)
+                or len(zip_sha256) != 64 or any(char not in "0123456789abcdef" for char in zip_sha256)):
+            raise StorageError("invalid revision row fields")
+        snapshot = self._canonical_bytes(snapshot, "snapshot")
+        path = self.revisions_dir / zip_filename
+        if not path.is_file() or _sha(path.read_bytes()) != zip_sha256:
+            raise StorageError("revision row SHA-256 does not match archive")
+        self.verify_zip(path, revision_id=revision_id)
         def operation(connection: sqlite3.Connection) -> None:
             row = connection.execute("SELECT * FROM revisions WHERE revision_id=?", (revision_id,)).fetchone()
             values = (revision_id, zip_filename, zip_sha256, snapshot)
@@ -405,6 +577,7 @@ class Storage:
 
     def activate(self, revision_id: str) -> None:
         revision_id = _text(revision_id, "revision_id")
+        self.verify_revision(revision_id)
         self._write(lambda c: c.execute("INSERT INTO active_revision(slot, revision_id) VALUES(1,?) ON CONFLICT(slot) DO UPDATE SET revision_id=excluded.revision_id", (revision_id,)))
 
     def active_revision_id(self) -> str | None:
