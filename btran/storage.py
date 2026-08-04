@@ -123,7 +123,15 @@ class Storage:
     def _initialize(self, existed: bool) -> None:
         connection = self._connect()
         try:
-            connection.executescript(_SCHEMA)
+            # Do not use executescript here: sqlite3 executescript() commits
+            # any pending transaction before running its script.  Schema
+            # creation is a writer and must follow the same IMMEDIATE
+            # transaction protocol as all other v2 writes.
+            connection.execute("BEGIN IMMEDIATE")
+            for statement in _SCHEMA.split(";"):
+                statement = statement.strip()
+                if statement:
+                    connection.execute(statement)
             connection.commit()
             result = connection.execute("PRAGMA wal_checkpoint(FULL)").fetchone()
             # SQLite returns (busy, log-pages, checkpointed-pages).  A busy
@@ -131,6 +139,9 @@ class Storage:
             # statement itself committed successfully.
             if result is None or int(result[0]) != 0:
                 raise StorageError("SQLite WAL checkpoint was not successful")
+        except BaseException:
+            connection.rollback()
+            raise
         finally:
             connection.close()
         self._fsync_db()
@@ -380,7 +391,7 @@ class Storage:
         all_members["manifest.json"] = canonical_json_bytes(manifest)
         filename = f"{revision_id}.zip"
         destination = self.revisions_dir / filename
-        temporary = self.revisions_dir / f".{revision_id}.zip.tmp"
+        temporary = self.revisions_dir / f"{revision_id}.zip.tmp"
         try:
             with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_STORED) as archive:
                 member_names = sorted((name for name in all_members if name != "manifest.json"),
@@ -449,7 +460,7 @@ class Storage:
                         raise StorageError("revision ZIP metadata is not deterministic")
                 for name in names[:-1]:
                     parts = name.split("/")
-                    if name not in {"snapshot.json", "provenance.json", "publication.json"} and (
+                    if name != "snapshot.json" and (
                         len(parts) != 2 or parts[0] not in {"records", "findings", "edges", "attestations"}
                         or not parts[1].endswith(".json") or not parts[1][:-5]
                     ):

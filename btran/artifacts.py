@@ -6,7 +6,6 @@ closed immutable inputs selected by an explicit revision snapshot.
 
 from __future__ import annotations
 
-import base64
 import hashlib
 import json
 import os
@@ -1438,10 +1437,10 @@ class V2RevisionStore:
             render_hash = hashlib.sha256(canonical_json_bytes(next(a for a in artifacts if a.artifact_id == render_input_artifact_id).to_dict())).hexdigest()
         else:
             render_hash = None
-        # Publication inputs are retained in a canonical sidecar so the v2 ZIP
-        # remains self-contained while its core closure stays inspectable.
-        publication = {"epub_filename": epub_filename, "epub_base64": base64.b64encode(epub_bytes).decode("ascii"), "epub_sha256": hashlib.sha256(epub_bytes).hexdigest(), "render_input_artifact_id": render_input_artifact_id, "render_input_sha256": render_hash}
-        members={"provenance.json": canonical_json_bytes(dict(provenance)), "publication.json": canonical_json_bytes(publication)}
+        # FC3 keeps the v2 archive limited to the selected closure.  The
+        # legacy provenance/EPUB arguments remain accepted for API
+        # compatibility, but publication data is not an archive member.
+        members={}
         members.update({f"records/{a.artifact_id}.json":a.to_json().encode("utf-8") for a in artifacts})
         members.update({f"findings/{f.finding_id}.json":f.to_json().encode("utf-8") for f in findings})
         members.update({f"edges/{eid}.json":data for eid,data in edges.items()})
@@ -1466,29 +1465,6 @@ class V2RevisionStore:
                 if name != f"findings/{finding.finding_id}.json": raise ArtifactError("sealed finding ID mismatch")
                 findings[finding.finding_id]=finding
         if not set(snapshot.selected_artifact_ids).issubset(records) or not set(snapshot.selected_finding_ids).issubset(findings): raise ArtifactError("sealed revision omits selected closure")
-        # Publication sidecars are optional for old v2 fixtures, but when
-        # present they are part of repository verification, not discarded
-        # arguments.  Validate bytes, render-input binding, and embedded
-        # provenance before exposing the revision.
-        if "provenance.json" in values or "publication.json" in values:
-            if "provenance.json" not in values or "publication.json" not in values:
-                raise ArtifactError("incomplete v2 publication metadata")
-            try:
-                provenance = json.loads(values["provenance.json"].decode("utf-8"))
-                publication = json.loads(values["publication.json"].decode("utf-8"))
-                if not isinstance(provenance, Mapping) or not isinstance(publication, Mapping): raise ValueError
-                required = {"epub_filename", "epub_base64", "epub_sha256", "render_input_artifact_id", "render_input_sha256"}
-                if set(publication) != required or Path(publication["epub_filename"]).name != publication["epub_filename"]: raise ValueError
-                epub_bytes = base64.b64decode(publication["epub_base64"], validate=True)
-                if hashlib.sha256(epub_bytes).hexdigest() != publication["epub_sha256"]: raise ValueError
-                rid = publication["render_input_artifact_id"]
-                rhash = publication["render_input_sha256"]
-                if rid is None:
-                    if rhash is not None: raise ValueError
-                elif rid not in records or rhash != hashlib.sha256(canonical_json_bytes(records[rid].to_dict())).hexdigest(): raise ValueError
-                if epub_bytes: LegacyRevisionStore._verify_embedded_provenance(epub_bytes, provenance)
-            except (ValueError, TypeError, KeyError, json.JSONDecodeError, UnicodeDecodeError, base64.binascii.Error) as exc:
-                raise ArtifactError("invalid v2 publication metadata") from exc
         for record in records.values():
             if not set(record.dependency_ids).issubset(records) or not set(record.finding_ids).issubset(findings): raise ArtifactError("sealed record closure is incomplete")
         for name, data in values.items():

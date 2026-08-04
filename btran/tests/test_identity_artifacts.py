@@ -4,14 +4,19 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
+import os
 import sqlite3
 import zipfile
+from pathlib import Path
 
 import pytest
 
 from btran.artifacts import (
     ArtifactError,
     ArtifactStore,
+    LegacyArtifactStore,
+    LegacyRevisionStore,
     CacheValidator,
     DependencyGraph,
     RevisionStore,
@@ -44,7 +49,7 @@ from btran.identity import (
     structural_anchor_for,
 )
 from btran.schema import Finding, RevisionSnapshot, canonical_json_bytes, tagged_sha256
-from btran.storage import Storage
+from btran.storage import Storage, StorageError
 
 
 def test_source_text_and_raw_byte_page_identity_are_exact():
@@ -351,3 +356,126 @@ def test_existing_matching_revision_revalidates_before_idempotent_return(tmp_pat
     bundle.write_bytes(raw)
     with pytest.raises(ArtifactError):
         revisions.seal_bundle(snapshot, {}, b"")
+
+
+def _rewrite_zip(path: Path, values: dict[str, bytes], order: tuple[str, ...], *, changed_name: str | None = None, changed_metadata: bool = False) -> None:
+    """Rewrite a test archive with FC3 metadata, optionally changing one field."""
+    temporary = path.with_suffix(".rewrite")
+    with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_STORED) as archive:
+        for name in order:
+            info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
+            info.create_system = 3
+            info.create_version = 20
+            info.extract_version = 20
+            info.external_attr = 0o100444 << 16
+            info.extra = b""
+            info.comment = b""
+            info.flag_bits = 0
+            info.compress_type = zipfile.ZIP_STORED
+            if name == changed_name:
+                info.date_time = (1980, 1, 1, 0, 0, 2)
+            if changed_metadata and name == "snapshot.json":
+                info.external_attr ^= 1
+            archive.writestr(info, values[name])
+    os.replace(temporary, path)
+
+
+def test_v2_writer_uses_wal_full_checkpoint_and_fsync(tmp_path, monkeypatch):
+    fsynced: list[str] = []
+    real_fsync = os.fsync
+
+    def record_fsync(fd: int) -> None:
+        try:
+            target = os.readlink(f"/proc/self/fd/{fd}")
+        except OSError:
+            target = ""
+        fsynced.append(target)
+        real_fsync(fd)
+
+    monkeypatch.setattr("btran.storage.os.fsync", record_fsync)
+    store = Storage(tmp_path)
+    finding = Finding(kind="stage_summary", severity="info", stage="test", message="done")
+    store.put_finding(finding.finding_id, finding.to_json().encode())
+    connection = store._connect()
+    assert connection.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+    assert connection.execute("PRAGMA synchronous").fetchone()[0] == 2
+    assert connection.execute("PRAGMA wal_autocheckpoint").fetchone()[0] == 0
+    connection.close()
+    assert any(target.endswith("state-v2.sqlite3") for target in fsynced)
+
+
+def test_empty_v2_workspaces_produce_equal_zip_bytes(tmp_path):
+    snapshot = RevisionSnapshot(revision_id="empty", selected_artifact_ids=())
+    first_root, second_root = tmp_path / "one", tmp_path / "two"
+    first = Storage(first_root).seal_revision("empty", snapshot.to_json().encode(), {})
+    second = Storage(second_root).seal_revision("empty", snapshot.to_json().encode(), {})
+    assert first.read_bytes() == second.read_bytes()
+    assert hashlib.sha256(first.read_bytes()).digest() == hashlib.sha256(second.read_bytes()).digest()
+
+
+@pytest.mark.parametrize("corruption", ("timestamp", "metadata", "order", "member", "manifest", "snapshot"))
+def test_v2_standalone_verification_rejects_archive_corruption(tmp_path, corruption):
+    store = ArtifactStore(tmp_path)
+    artifact = _store_artifact(store)
+    snapshot = RevisionSnapshot(revision_id="revision", selected_artifact_ids=(artifact.artifact_id,))
+    bundle = RevisionStore(tmp_path).seal_bundle(snapshot, {}, b"")
+    with zipfile.ZipFile(bundle) as archive:
+        values = {name: archive.read(name) for name in archive.namelist()}
+    names = tuple(values)
+    if corruption == "timestamp":
+        _rewrite_zip(bundle, values, names, changed_name="snapshot.json")
+    elif corruption == "metadata":
+        _rewrite_zip(bundle, values, names, changed_metadata=True)
+    elif corruption == "order":
+        _rewrite_zip(bundle, values, ("manifest.json",) + names[:-1], changed_name=None)
+    elif corruption == "member":
+        values["provenance.json"] = b"{}"
+        _rewrite_zip(bundle, values, tuple(sorted(names[:-1] + ("provenance.json",), key=lambda name: name.encode())) + ("manifest.json",))
+    elif corruption == "manifest":
+        manifest = json.loads(values["manifest.json"])
+        manifest["members"]["snapshot.json"] = "0" * 64
+        values["manifest.json"] = canonical_json_bytes(manifest)
+        _rewrite_zip(bundle, values, names)
+    else:
+        changed = RevisionSnapshot(revision_id="other", selected_artifact_ids=(artifact.artifact_id,))
+        values["snapshot.json"] = changed.to_json().encode()
+        _rewrite_zip(bundle, values, names)
+    with pytest.raises(StorageError):
+        Storage(tmp_path).verify_zip(bundle, revision_id="revision")
+
+
+def _tree_state(root: Path) -> dict[str, tuple[bytes, int]]:
+    return {
+        str(path.relative_to(root)): (path.read_bytes(), path.stat().st_mtime_ns)
+        for path in root.rglob("*") if path.is_file()
+    }
+
+
+def _legacy_epub(provenance: dict[str, object]) -> bytes:
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_STORED) as archive:
+        archive.writestr("META-INF/btran-provenance.json", canonical_json_bytes(provenance))
+    return output.getvalue()
+
+
+def test_valid_legacy_revision_verification_does_not_mutate_bytes_or_mtimes(tmp_path):
+    legacy = LegacyArtifactStore(tmp_path)
+    artifact = legacy.put("test", {"value": 1}, semantic_key="semantic")
+    snapshot = RevisionSnapshot(revision_id="legacy", selected_artifact_ids=(artifact.artifact_id,))
+    LegacyRevisionStore(tmp_path, legacy).seal_bundle(snapshot, {}, _legacy_epub({}))
+    before = _tree_state(tmp_path)
+    assert RevisionStore(tmp_path).verify_bundle("legacy") == snapshot
+    assert _tree_state(tmp_path) == before
+
+
+def test_corrupt_legacy_revision_verification_does_not_mutate_bytes_or_mtimes(tmp_path):
+    legacy = LegacyArtifactStore(tmp_path)
+    artifact = legacy.put("test", {"value": 1}, semantic_key="semantic")
+    snapshot = RevisionSnapshot(revision_id="legacy", selected_artifact_ids=(artifact.artifact_id,))
+    LegacyRevisionStore(tmp_path, legacy).seal_bundle(snapshot, {}, _legacy_epub({}))
+    snapshot_path = tmp_path / "revisions" / "legacy" / "snapshot.json"
+    snapshot_path.write_bytes(b"not-json")
+    before = _tree_state(tmp_path)
+    with pytest.raises(ArtifactError):
+        RevisionStore(tmp_path).verify_bundle("legacy")
+    assert _tree_state(tmp_path) == before
