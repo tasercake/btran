@@ -261,7 +261,10 @@ class Finding(CanonicalRecord):
                 raise SchemaError("categorized finding needs affected stable IDs")
             if not self.message.strip():
                 raise SchemaError("categorized finding needs a readable message")
-            if not self.evidence:
+            # A category alone is not evidence.  Every actionable finding must
+            # identify the concrete trigger which caused it.
+            trigger = self.evidence.get("trigger") if isinstance(self.evidence, dict) else None
+            if not isinstance(trigger, str) or not trigger.strip():
                 raise SchemaError("categorized finding needs trigger evidence")
         if not isinstance(self.evidence, dict):
             raise SchemaError("finding evidence must be an object")
@@ -924,12 +927,6 @@ class RunReport(CanonicalRecord):
         self.total_stage_duration_ms = expected_total
 
     @classmethod
-    @property
-    def timing(self) -> dict[str, Any] | None:
-        """Short compatibility spelling for the optional timing snapshot."""
-        return self.timing_snapshot
-
-    @classmethod
     def from_dict(cls, data: Mapping[str, Any]):
         data = dict(data)
         historical = "audit_finding_ids" not in data and "audit_status" not in data
@@ -1175,6 +1172,9 @@ class ExtractionSemantics(CanonicalRecord):
             raise SchemaError("reading_order values must be unique")
         if orders != sorted(orders):
             raise SchemaError("blocks must be in declared reading order")
+        segment_ids = [item.segment_id for item in blocks if item.segment_id is not None]
+        if len(set(segment_ids)) != len(segment_ids):
+            raise SchemaError("each segment ID must map to exactly one block")
         self.blocks = tuple(blocks)
         block_ids = {item.block_id for item in blocks}
         illustrations: list[dict[str, Any] | str] = []
@@ -1260,9 +1260,14 @@ class SourceBlock:
 class TermMention:
     term: str
     block_id: str
+    category: str = "other"
     def to_dict(self) -> dict: return asdict(self)
     @classmethod
-    def from_dict(cls, d: dict): return cls(**d)
+    def from_dict(cls, d: dict):
+        values = d.copy()
+        # Legacy extraction omitted categories; those declarations are ordinary.
+        values.setdefault("category", "other")
+        return cls(**values)
     def to_file(self, path: Path) -> None: _write_json(path, self.to_dict())
     @classmethod
     def from_file(cls, path: Path): return cls.from_dict(_read_json(path))

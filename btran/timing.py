@@ -6,6 +6,7 @@ serialized, which keeps nested model/persistence work deterministic.
 """
 from __future__ import annotations
 
+import math
 import time
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
@@ -92,6 +93,17 @@ class TimingReport:
     deterministic_wall_ms: float
     whole_process_wall_ms: float
 
+    def __post_init__(self) -> None:
+        for name in (
+            "model_execution_ms", "deterministic_computation_ms",
+            "durable_persistence_ms", "deterministic_wall_ms", "whole_process_wall_ms",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(f"{name} must be a finite non-negative number")
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be a finite non-negative number")
+
     def to_dict(self) -> dict[str, object]:
         return {
             "clock": self.clock,
@@ -144,6 +156,8 @@ class TimingLedger:
         self._completion_taken = False
 
     def _enter(self, category: str) -> int:
+        if self._completion_taken:
+            raise RuntimeError("timing ledger is finalized")
         now = self._clock()
         if self._depth[category] == 0:
             self._starts[category] = now
@@ -225,6 +239,8 @@ class TimingLedger:
             raise RuntimeError("report snapshot must precede completion")
         if self._completion_taken:
             raise RuntimeError("completion timing already finalized")
+        if any(self._depth.values()):
+            raise RuntimeError("cannot finalize timing with active intervals")
         self._completion_taken = True
         self._completion_ns = self._clock()
         data = self._boundary_ms(self._completion_ns)
@@ -253,21 +269,33 @@ class NoOpTimingLedger(TimingLedger):
 
     def measure(self, category: str) -> _TimingContext:
         _category(category)
+        if self._completion_taken:
+            raise RuntimeError("timing ledger is finalized")
         return _NoOpContext()
 
     def measure_async(self, category: str):
         _category(category)
+        ledger = self
 
         @asynccontextmanager
         async def context() -> AsyncIterator[None]:
+            if ledger._completion_taken:
+                raise RuntimeError("timing ledger is finalized")
             yield
 
         return context()
 
-    model_execution = lambda self: _NoOpContext()
-    durable_persistence = lambda self: _NoOpContext()
-    model_execution_async = lambda self: self.measure_async("model_execution")
-    durable_persistence_async = lambda self: self.measure_async("durable_persistence")
+    def model_execution(self) -> _TimingContext:
+        return self.measure("model_execution")
+
+    def durable_persistence(self) -> _TimingContext:
+        return self.measure("durable_persistence")
+
+    def model_execution_async(self):
+        return self.measure_async("model_execution")
+
+    def durable_persistence_async(self):
+        return self.measure_async("durable_persistence")
 
     def snapshot_before_report_persist(self) -> dict[str, object]:
         if self._snapshot_taken:
