@@ -407,8 +407,10 @@ class Storage:
                     info.flag_bits = 0
                     info.compress_type = zipfile.ZIP_STORED
                     archive.writestr(info, all_members[name])
-                archive.fp.flush()
-                os.fsync(archive.fp.fileno())
+            # ZipFile.close() writes the central directory.  Only fsync the
+            # fully finalized archive, not the still-open ZIP stream.
+            with temporary.open("rb") as handle:
+                os.fsync(handle.fileno())
             # This is standalone validation: no DB row or active pointer is
             # consulted before the immutable candidate is complete.
             self.verify_zip(temporary, revision_id=revision_id)

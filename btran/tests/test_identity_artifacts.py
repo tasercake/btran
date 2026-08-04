@@ -404,6 +404,25 @@ def test_v2_writer_uses_wal_full_checkpoint_and_fsync(tmp_path, monkeypatch):
     assert any(target.endswith("state-v2.sqlite3") for target in fsynced)
 
 
+def test_revision_zip_is_fsynced_after_zip_finalization(tmp_path, monkeypatch):
+    fsynced_archives: list[bool] = []
+    real_fsync = os.fsync
+
+    def record_fsync(fd: int) -> None:
+        try:
+            target = os.readlink(f"/proc/self/fd/{fd}")
+        except OSError:
+            target = ""
+        if target.endswith("revision.zip.tmp"):
+            fsynced_archives.append(zipfile.is_zipfile(target))
+        real_fsync(fd)
+
+    monkeypatch.setattr("btran.storage.os.fsync", record_fsync)
+    snapshot = RevisionSnapshot(revision_id="revision", selected_artifact_ids=())
+    Storage(tmp_path).seal_revision("revision", snapshot.to_json().encode(), {})
+    assert fsynced_archives == [True]
+
+
 def test_empty_v2_workspaces_produce_equal_zip_bytes(tmp_path):
     snapshot = RevisionSnapshot(revision_id="empty", selected_artifact_ids=())
     first_root, second_root = tmp_path / "one", tmp_path / "two"
