@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import zipfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -16,9 +17,12 @@ from PIL import Image
 from btran.artifacts import ArtifactStore, DependencyGraph, RevisionStore
 from btran.config import Config
 from btran.corrections import (
+    CorrectionSet,
     CorrectionStore,
     base_hash_for_artifact,
+    correction_record_for,
     correction_transition,
+    impact_for_correction,
 )
 from btran.orchestrator import run
 from btran.schema import PageExtraction, SourceBlock
@@ -310,6 +314,53 @@ def _current_target_maps(store: ArtifactStore, revisions: RevisionStore, revisio
 def _entry_keys(impact, category: str) -> set[tuple[str, str, str]]:
     return {(item["stage"], item["subject_id"], item["base_artifact_id"])
             for item in getattr(impact, category)}
+
+
+@pytest.mark.asyncio
+async def test_correction_planning_uses_provided_closure_without_selected_state_traversal(tmp_path: Path):
+    """Planning reads records and graph edges only from the invocation closure."""
+    config, baseline = await _baseline(tmp_path, ("alpha", "beta", "gamma"))
+    assert config.workspace is not None
+    store = ArtifactStore(config.workspace)
+    revisions = RevisionStore(config.workspace)
+    revision_id = baseline.candidate_revision_id
+    selected = _selected(store, revisions, revision_id)
+    raw = _by_source_text(selected, "RawSourceSegment")["beta"]
+    graph_edges = revisions.selected_graph(revision_id).edges(revision_id)
+    payload = {
+        "kind": "source_text", "applies_to_revision_id": revision_id,
+        "scope": {"segment_id": raw.payload["segment_id"]},
+        "base": {"artifact_id": raw.artifact_id, "sha256": base_hash_for_artifact(raw)},
+        "replacement": "beta-fixed",
+    }
+    correction = correction_record_for(payload)
+    correction_set = CorrectionSet.create(revision_id, (correction.correction_id,))
+    closure = SimpleNamespace(
+        revision_id=revision_id,
+        records={artifact.artifact_id: artifact for artifact in selected},
+        edges={edge.edge_id: edge for edge in graph_edges},
+    )
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("correction planner traversed selected revision state")
+
+    with patch.object(revisions, "snapshot", forbidden), \
+         patch.object(revisions, "_revision_path", forbidden), \
+         patch.object(revisions, "selected_graph", forbidden), \
+         patch.object(revisions.storage, "verify_revision", forbidden):
+        impact = impact_for_correction(
+            CorrectionStore(config.workspace), revisions, correction,
+            correction_set=correction_set, selected_closure=closure,
+        )
+        _, transitioned_impact = correction_transition(
+            CorrectionStore(config.workspace), revisions, event_kind="apply",
+            payload=payload, revision_id=revision_id, selected_closure=closure,
+        )
+
+    assert transitioned_impact.projected_universe == impact.projected_universe
+    assert transitioned_impact.affected == impact.affected
+    assert impact.correction_id == correction.correction_id
+    assert any(item["base_artifact_id"] == raw.artifact_id for item in impact.affected)
 
 
 @pytest.mark.asyncio

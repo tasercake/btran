@@ -993,9 +993,17 @@ def _archive_selected_artifacts(revisions: RevisionStore, revision_id: str) -> d
 def _sealed_selected_artifacts(
     revisions: RevisionStore, revision_id: str, *, selected_closure: Any = None,
 ) -> dict[str, ArtifactEnvelope]:
-    """Use the invocation closure; archive reading is a legacy compatibility fallback."""
+    """Return records from the one closure loaded for this invocation.
+
+    A supplied closure is authoritative.  In particular, do not use the
+    revision store as a fallback: that would perform a second selected-state
+    traversal and could observe a different immutable revision.  The archive
+    path remains only for callers using the pre-closure compatibility API.
+    """
     selected = _closure_artifact_map(selected_closure)
-    if selected is not None:
+    if selected_closure is not None:
+        if selected is None:
+            raise CorrectionError("selected invocation closure has no record map")
         return selected
     try:
         return _archive_selected_artifacts(revisions, revision_id)
@@ -1231,18 +1239,25 @@ class _ClosureGraph:
 
 
 def _closure_graph(selected_closure: Any, revision_id: str) -> Any:
-    """Return a graph/traversal view carried by a selected closure, if any."""
+    """Return a graph/traversal view carried by the invocation closure only."""
     if selected_closure is None:
         return None
-    for owner in (selected_closure,
-                  *(getattr(selected_closure, name, None) for name in ("graph", "selected_graph", "dependency_graph"))):
+    owners = [selected_closure]
+    if isinstance(selected_closure, Mapping):
+        owners.extend(selected_closure.get(name) for name in ("graph", "selected_graph", "dependency_graph"))
+    else:
+        owners.extend(getattr(selected_closure, name, None)
+                      for name in ("graph", "selected_graph", "dependency_graph"))
+    for owner in owners:
         if owner is None:
             continue
         if all(callable(getattr(owner, method, None)) for method in ("edges", "descendants")):
             return owner
-        edges = getattr(owner, "edges", None)
+        edges = owner.get("edges") if isinstance(owner, Mapping) else getattr(owner, "edges", None)
         if isinstance(edges, Mapping):
             return _ClosureGraph(tuple(edges.values()))
+    # A record-only closure is valid for overlay resolution, but it is not a
+    # valid planning closure.  Never silently broaden it through selected_graph.
     return None
 
 
@@ -1251,7 +1266,11 @@ def _graph_entries_and_descendants(
     *, selected_closure: Any = None,
 ) -> tuple[tuple[dict[str, str], ...], set[str], set[str], dict[str, tuple[dict[str, str], ...]]]:
     """Build fixed base/virtual universe and exact persisted reverse closure."""
-    graph = _closure_graph(selected_closure, revision_id) or revisions.selected_graph(revision_id)
+    graph = _closure_graph(selected_closure, revision_id)
+    if graph is None:
+        if selected_closure is not None:
+            raise CorrectionError("selected invocation closure has no dependency graph")
+        graph = revisions.selected_graph(revision_id)
     try:
         edges = graph.edges(revision_id)
     except ArtifactError as exc:
@@ -1365,7 +1384,11 @@ def impact_for_correction(*args: Any, **kwargs: Any) -> CorrectionImpact:
         revisions, correction.applies_to_revision_id, selected, correction,
         selected_closure=selected_closure,
     )
-    graph = _closure_graph(selected_closure, correction.applies_to_revision_id) or revisions.selected_graph(correction.applies_to_revision_id)
+    graph = _closure_graph(selected_closure, correction.applies_to_revision_id)
+    if graph is None:
+        if selected_closure is not None:
+            raise CorrectionError("selected invocation closure has no dependency graph")
+        graph = revisions.selected_graph(correction.applies_to_revision_id)
     edges = graph.edges(correction.applies_to_revision_id)
     ambiguous_artifacts = _ambiguous_artifacts(edges, correction, descendants)
 
@@ -1424,6 +1447,54 @@ def impact_for_correction(*args: Any, **kwargs: Any) -> CorrectionImpact:
     )
 
 
+def correction_impact_finding(
+    impact: CorrectionImpact, correction: CorrectionRecord | None = None,
+) -> Finding:
+    """Describe the planner's exact selected-state dirty set for audit."""
+    if not isinstance(impact, CorrectionImpact):
+        raise CorrectionError("correction impact finding requires a CorrectionImpact")
+    prior_ids = tuple(sorted({item["base_artifact_id"] for item in impact.projected_universe}))
+    invalidated_ids = tuple(sorted({
+        item["base_artifact_id"]
+        for item in (*impact.affected, *impact.ambiguous)
+    }))
+    scope_ids: set[str] = set()
+    occurrence_ids: tuple[str, ...] = ()
+    if correction is not None:
+        if correction.correction_id != impact.correction_id:
+            raise CorrectionError("correction impact finding correction ID differs from plan")
+        scope = correction.scope
+        scope_ids.update(
+            value for name in ("segment_id", "mapping_id", "concept_id")
+            if isinstance((value := scope.get(name)), str)
+        )
+        occurrence_ids = ((scope["occurrence_id"],)
+                          if isinstance(scope.get("occurrence_id"), str) else ())
+        scope_ids.update(occurrence_ids)
+    subject_refs = tuple(sorted({
+        value for value in (impact.correction_id, impact.correction_set_id, *scope_ids, *invalidated_ids)
+        if isinstance(value, str) and value
+    }))
+    return Finding(
+        kind="correction_impact", severity="warning", stage="corrections",
+        audit_category="correction_impact", subject_refs=subject_refs,
+        dependency_ids=invalidated_ids or prior_ids,
+        evidence={
+            "trigger": "correction_dirty_set_planned",
+            "base_revision_id": impact.base_revision_id,
+            "projection_plan_id": impact.projection_plan_id,
+            "correction_id": impact.correction_id,
+            "correction_set_id": impact.correction_set_id,
+            "occurrence_ids": list(occurrence_ids),
+            "prior_selected_ids": list(prior_ids),
+            "invalidated_selected_ids": list(invalidated_ids),
+            "dirty_set": [dict(item) for item in (*impact.affected, *impact.ambiguous)],
+        },
+        message=(f"Correction {impact.correction_id} invalidates "
+                 f"{len(invalidated_ids)} selected record(s) in its dirty set."),
+    )
+
+
 def _pointer_set_id(root: Path) -> str | None:
     path = root / "active-correction-set.json"
     if not path.exists():
@@ -1449,6 +1520,16 @@ def _active_revision_id(revisions: RevisionStore) -> str:
     return snapshot.revision_id
 
 
+def _invocation_revision_id(selected_closure: Any) -> str:
+    """Read the already validated closure identity without touching storage."""
+    revision_id = (selected_closure.get("revision_id")
+                   if isinstance(selected_closure, Mapping)
+                   else getattr(selected_closure, "revision_id", None))
+    if not isinstance(revision_id, str) or not revision_id:
+        raise CorrectionError("selected invocation closure has no revision ID")
+    return _id(revision_id, "selected closure revision_id")
+
+
 def correction_transition(
     store: CorrectionStore, revisions: RevisionStore, *, event_kind: str,
     payload: Mapping[str, Any] | None = None, correction_id: str | None = None,
@@ -1462,7 +1543,10 @@ def correction_transition(
     """
     if event_kind not in {"apply", "revert", "supersede"}:
         raise CorrectionError("correction transition kind is invalid")
-    active_revision_id = _active_revision_id(revisions)
+    active_revision_id = (
+        _invocation_revision_id(selected_closure)
+        if selected_closure is not None else _active_revision_id(revisions)
+    )
     if revision_id is not None and revision_id != active_revision_id:
         raise CorrectionError("requested correction revision does not match active revision")
     pointer_id = _pointer_set_id(store.root)
@@ -1534,6 +1618,9 @@ def correction_transition(
         store.put_record(record)
     store.put_set(successor)
     store.put_event(event)
+    # Keep correction-time dirty-set evidence inspectable and auditable next
+    # to the immutable projection plan.  This is not a stage result.
+    store.persist_findings((correction_impact_finding(impact, record),))
     store.put_impact(impact)
     _publish_active_set(store.root, successor)
     return successor, impact

@@ -19,6 +19,7 @@ from btran.corrections import (
     base_hash_for_artifact,
     correction_event_for,
     correction_event_id_for,
+    correction_impact_finding,
     correction_record_for,
     correction_transition,
     parse_correction_json,
@@ -513,6 +514,15 @@ def test_apply_revert_and_supersede_publish_atomic_set_and_nonexecuting_impact(t
     assert impact.projection_plan_id and impact.regenerated == ()
     assert impact.correction_id == first.active_correction_ids[0]
     assert impact.correction_set_id == first.set_id
+    impact_finding = correction_impact_finding(impact, correction_record_for(first_payload))
+    stored_impact_finding = store.artifacts.get_finding(impact_finding.finding_id)
+    assert stored_impact_finding.audit_category == "correction_impact"
+    assert stored_impact_finding.evidence["correction_id"] == impact.correction_id
+    assert stored_impact_finding.evidence["prior_selected_ids"]
+    assert set(stored_impact_finding.evidence["invalidated_selected_ids"]).issubset(
+        set(stored_impact_finding.evidence["prior_selected_ids"])
+    )
+    assert stored_impact_finding.evidence["dirty_set"]
     assert store.correction_time_impact(impact.correction_id) == impact
     partition = (*impact.affected, *impact.unaffected, *impact.ambiguous, *impact.protected)
     assert len(partition) == len({(item["stage"], item["subject_id"], item["base_artifact_id"]) for item in partition})
