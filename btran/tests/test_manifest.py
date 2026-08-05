@@ -142,6 +142,7 @@ def test_legacy_manifest_serialization_remains_narrow_migration_format(tmp_path)
 
 def _sealed_effective_page(store, *, semantic_key="page-key", page_id="page-1", page_number=None,
                            segment_id="segment-1", effective_segment_id="effective-segment-1",
+                           page_kind="EffectiveSourcePage", segment_kind="EffectiveSourceSegment",
                            extra_dependency_ids=()):
     segment = EffectiveSegment(
         effective_segment_id=effective_segment_id, segment_id=segment_id,
@@ -153,8 +154,8 @@ def _sealed_effective_page(store, *, semantic_key="page-key", page_id="page-1", 
         effective_segment_ids=(segment.effective_segment_id,), source_langs=("en",),
         display_metadata=metadata,
     )
-    segment_record = store.put("EffectiveSourceSegment", segment.to_dict(), semantic_key=f"{segment_id}-key")
-    page_record = store.put("EffectiveSourcePage", page.to_dict(),
+    segment_record = store.put(segment_kind, segment.to_dict(), semantic_key=f"{segment_id}-key")
+    page_record = store.put(page_kind, page.to_dict(),
                             dependency_ids=(segment_record.artifact_id, *extra_dependency_ids), semantic_key=semantic_key)
     return page_record, segment_record
 
@@ -193,6 +194,28 @@ def test_selected_closure_loads_archive_once_and_preserves_declared_segment_orde
     # Loading validates the archive once; all later views use the in-memory
     # SelectedClosure rather than reopening or rescanning the selected ZIP.
     assert verify_calls == 1
+
+
+def test_selected_closure_accepts_translated_closure_with_source_and_target_pages(tmp_path):
+    store = ArtifactStore(tmp_path)
+    source_page, _ = _sealed_effective_page(store, semantic_key="source-page")
+    target_page, _ = _sealed_effective_page(
+        store, semantic_key="target-page", page_kind="EffectiveTargetPage",
+        segment_kind="EffectiveTargetSegment",
+    )
+    snapshot = RevisionSnapshot(
+        revision_id="translated-with-source-cache",
+        selected_artifact_ids=(source_page.artifact_id, target_page.artifact_id),
+    )
+    RevisionStore(tmp_path).seal_bundle(snapshot, {}, b"")
+
+    closure = load_selected_closure(RevisionStore(tmp_path), snapshot.revision_id)
+
+    assert len(closure.ordered_effective_pages) == 1
+    assert closure.ordered_effective_pages[0].page.page_id == "page-1"
+    assert closure.ordered_effective_pages[0].segments[0].effective_segment_id == "effective-segment-1"
+    assert closure.ordered_effective_pages[0].page.__class__ is EffectivePage
+    assert closure.selected_effective_content.pages == closure.ordered_effective_pages
 
 
 def test_selected_closure_rejects_duplicate_stable_identity(tmp_path):
@@ -327,6 +350,31 @@ def test_legacy_discovery_read_does_not_create_or_mutate_state(tmp_path):
     assert snapshot(workspace) == before_workspace
     assert snapshot(input_dir) == before_input
     assert not (workspace / "state-v2.sqlite3").exists()
+
+
+def test_corrupt_legacy_selected_closure_fails_closed_without_mutating_bytes_or_mtime(tmp_path):
+    store = LegacyArtifactStore(tmp_path)
+    page_record, _ = _sealed_effective_page(store)
+    snapshot = RevisionSnapshot(revision_id="legacy-corrupt", selected_artifact_ids=(page_record.artifact_id,))
+    epub = io.BytesIO()
+    with zipfile.ZipFile(epub, "w") as archive:
+        archive.writestr("META-INF/btran-provenance.json", json.dumps({}, separators=(",", ":")))
+    LegacyRevisionStore(tmp_path, store).seal_bundle(snapshot, {}, epub.getvalue())
+
+    artifact = tmp_path / "revisions" / snapshot.revision_id / "artifacts" / f"{page_record.artifact_id}.json"
+    artifact.write_bytes(artifact.read_bytes() + b"corrupt")
+
+    def file_snapshot(root):
+        return {
+            path.relative_to(root).as_posix(): (path.read_bytes(), path.stat().st_mtime_ns)
+            for path in root.rglob("*") if path.is_file()
+        }
+
+    before = file_snapshot(tmp_path)
+    with pytest.raises(SelectedClosureError):
+        load_selected_closure(RevisionStore(tmp_path), snapshot.revision_id)
+    assert file_snapshot(tmp_path) == before
+    assert not (tmp_path / "state-v2.sqlite3").exists()
 
 
 def test_legacy_selected_closure_read_does_not_create_or_mutate_state(tmp_path, monkeypatch):

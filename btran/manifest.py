@@ -570,9 +570,10 @@ def _build_ordered_pages(records: Mapping[str, ArtifactEnvelope], provenance: Ma
     """Deserialize and validate effective pages and their declared children once."""
     all_records = tuple(records.values())
     has_target = any(record.kind == "EffectiveTargetPage" for record in all_records)
-    has_source = any(record.kind == "EffectiveSourcePage" for record in all_records)
-    if has_target and has_source:
-        raise SelectedClosureError("selected closure mixes source and target pages")
+    # A translated revision retains its source pages and segments as immutable
+    # dependencies of the target materialization.  They are cache/provenance
+    # leaves, not the selected render content.  Prefer target pages whenever
+    # the closure contains them; source-only revisions still use source pages.
     page_kinds = {"EffectiveTargetPage"} if has_target else {"EffectiveSourcePage"}
     pages_by_artifact: dict[str, tuple[EffectivePage, ArtifactEnvelope]] = {}
     effective_segments: dict[str, tuple[EffectiveSegment, ArtifactEnvelope]] = {}
