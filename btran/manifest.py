@@ -539,6 +539,7 @@ _STABLE_ID_FIELDS_BY_KIND: dict[str, tuple[str, ...]] = {
     "ConceptProjection": ("projection_id",),
     "ConceptSelector": ("selector_id",),
     "TranslationArtifact": ("translation_artifact_id",),
+    "DiagnosticTranslationFallback": ("translation_artifact_id",),
     "RawSourceExtraction": ("page_id",),
     "DiagnosticSourceFallback": ("page_id",),
     "OccurrenceTargetMapping": ("mapping_id",),

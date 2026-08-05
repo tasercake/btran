@@ -251,6 +251,40 @@ def test_selected_closure_rejects_duplicate_source_page_cache_leaf_identity(tmp_
         load_selected_closure(RevisionStore(tmp_path), snapshot.revision_id)
 
 
+def test_selected_closure_includes_diagnostic_translation_cache_leaf(tmp_path):
+    store = ArtifactStore(tmp_path)
+    fallback = store.put(
+        "DiagnosticTranslationFallback",
+        {"translation_artifact_id": "translation-1", "segment_id": "segment-1"},
+        semantic_key="fallback",
+    )
+    snapshot = RevisionSnapshot(
+        revision_id="diagnostic-translation-leaf",
+        selected_artifact_ids=(fallback.artifact_id,),
+    )
+    RevisionStore(tmp_path).seal_bundle(snapshot, {}, b"")
+
+    closure = load_selected_closure(RevisionStore(tmp_path), snapshot.revision_id)
+
+    assert closure.translation_segment_cache_leaves == (fallback,)
+    assert closure.translation_segment_cache_leaf_map == {"segment-1": fallback}
+
+
+@pytest.mark.parametrize("kind", ["TranslationArtifact", "DiagnosticTranslationFallback"])
+def test_selected_closure_rejects_duplicate_translation_cache_leaf_identity(tmp_path, kind):
+    store = ArtifactStore(tmp_path)
+    payload = {"translation_artifact_id": "duplicate-translation", "segment_id": "segment-1"}
+    first = store.put(kind, payload, semantic_key="first")
+    duplicate = store.put(kind, {**payload, "variant": 2}, semantic_key="second")
+    snapshot = RevisionSnapshot(
+        revision_id=f"duplicate-{kind}",
+        selected_artifact_ids=tuple(sorted((first.artifact_id, duplicate.artifact_id))),
+    )
+    RevisionStore(tmp_path).seal_bundle(snapshot, {}, b"")
+    with pytest.raises(SelectedClosureError, match="stable identity"):
+        load_selected_closure(RevisionStore(tmp_path), snapshot.revision_id)
+
+
 def test_selected_closure_rejects_missing_declared_page_child(tmp_path):
     store = ArtifactStore(tmp_path)
     page = EffectivePage(
