@@ -379,9 +379,9 @@ class CorrectionStore:
         self.sets_dir = self.root / "corrections" / "sets"
         self.impacts_dir = self.root / "corrections" / "impacts"
         self.plan_links_dir = self.root / "corrections" / "plan-links"
+        # Reading a legacy workspace must be side-effect free.  Immutable
+        # correction writes create their own parent directories in ``_put``.
         self.artifacts = ArtifactStore(self.root)
-        for directory in (self.records_dir, self.events_dir, self.sets_dir, self.impacts_dir, self.plan_links_dir):
-            directory.mkdir(parents=True, exist_ok=True)
 
     @staticmethod
     def _put(path: Path, data: bytes) -> None:
@@ -571,10 +571,17 @@ class CorrectionStore:
         return max(candidates, key=lambda item: (item[0], item[1].projection_plan_id))[1]
 
     def persist_findings(self, findings: Sequence[Finding]) -> tuple[str, ...]:
-        """Persist non-gating selection diagnostics before exposing them."""
-        for finding in findings:
-            self.artifacts.put_finding(finding)
-        return tuple(finding.finding_id for finding in findings)
+        """Persist diagnostics when writable; keep legacy reads in memory."""
+        ids = tuple(finding.finding_id for finding in findings)
+        try:
+            for finding in findings:
+                self.artifacts.put_finding(finding)
+        except (ArtifactError, OSError):
+            # Legacy stores are explicitly read/verify-only.  Resolution still
+            # returns typed findings to its caller, but never creates a DB or
+            # compatibility sidecar while inspecting them.
+            return ids
+        return ids
 
 
 @dataclass(frozen=True)
@@ -611,13 +618,36 @@ class OverlayResolution:
         return tuple(sorted((*self.target_occurrence, *self.target_segment), key=lambda item: (item.kind, item.subject_id, item.correction_id)))
 
 
+_CORRECTION_AUDIT_CATEGORIES = {
+    "correction_conflict": "conflict",
+    "correction_mapping_ambiguous": "actionable_ambiguity",
+    "correction_ambiguity": "actionable_ambiguity",
+    "correction_stale": "validation",
+    "correction_inapplicable": "validation",
+    "correction_set_inapplicable": "validation",
+}
+
+
 def _finding(kind: str, correction: CorrectionRecord, reason: str, *, severity: str = "warning", related: Sequence[str] = ()) -> Finding:
     refs = tuple(sorted(set((correction.correction_id, *related))))
-    return Finding(kind=kind, severity=severity, stage="corrections", subject_refs=refs, evidence={"correction_id": correction.correction_id, "applies_to_revision_id": correction.applies_to_revision_id, "reason": reason}, message=kind.replace("_", " "))
+    category = _CORRECTION_AUDIT_CATEGORIES.get(kind)
+    evidence = {
+        "correction_id": correction.correction_id,
+        "applies_to_revision_id": correction.applies_to_revision_id,
+        "reason": reason,
+        "trigger": reason,
+    }
+    return Finding(kind=kind, severity=severity, stage="corrections", subject_refs=refs,
+                   evidence=evidence, audit_category=category, message=kind.replace("_", " "))
 
 
 def _set_finding(correction_set: CorrectionSet, reason: str, subject_ids: Sequence[str]) -> Finding:
-    return Finding(kind="correction_set_inapplicable", severity="warning", stage="corrections", subject_refs=tuple(sorted(set(subject_ids))), evidence={"correction_set_id": correction_set.set_id, "base_revision_id": correction_set.base_revision_id, "reason": reason}, message="correction set inapplicable")
+    return Finding(kind="correction_set_inapplicable", severity="warning", stage="corrections",
+                   subject_refs=tuple(sorted(set(subject_ids))),
+                   evidence={"correction_set_id": correction_set.set_id,
+                             "base_revision_id": correction_set.base_revision_id,
+                             "reason": reason, "trigger": reason},
+                   audit_category="validation", message="correction set inapplicable")
 
 
 def _base_refs(record: CorrectionRecord) -> tuple[dict[str, str], ...]:
@@ -921,20 +951,67 @@ def resolve_correction_set(
     )
 
 
+def _closure_artifact_map(selected_closure: Any) -> dict[str, ArtifactEnvelope] | None:
+    """Read records from an already verified compact selected closure."""
+    if selected_closure is None:
+        return None
+    candidates: Any = selected_closure if isinstance(selected_closure, Mapping) else None
+    if candidates is None:
+        for name in ("artifact_map", "artifacts", "record_map", "records", "selected_artifacts",
+                     "artifact_by_id", "records_by_id", "artifacts_by_id"):
+            value = getattr(selected_closure, name, None)
+            if isinstance(value, Mapping):
+                candidates = value
+                break
+    if candidates is None:
+        return None
+    return {str(key): value for key, value in candidates.items() if isinstance(value, ArtifactEnvelope)}
+
+
+def _archive_selected_artifacts(revisions: RevisionStore, revision_id: str) -> dict[str, ArtifactEnvelope]:
+    """Read selected records from a legacy directory or verified v2 ZIP."""
+    bundle = revisions._revision_path(revision_id)
+    if bundle.is_dir():
+        revisions.snapshot(revision_id)
+        manifest = json.loads((bundle / "bundle-manifest.json").read_text(encoding="utf-8"))
+        ids = manifest["artifact_ids"]
+        if not isinstance(ids, list) or ids != sorted(set(ids)):
+            raise CorrectionError("selected revision artifact closure is invalid")
+        return {artifact_id: ArtifactEnvelope.from_file(bundle / "artifacts" / f"{artifact_id}.json") for artifact_id in ids}
+    storage = getattr(revisions, "storage", None)
+    if storage is None:
+        raise CorrectionError("selected revision archive is invalid")
+    values = storage.verify_revision(revision_id)
+    selected: dict[str, ArtifactEnvelope] = {}
+    for name, data in values.items():
+        if name.startswith("records/"):
+            envelope = ArtifactEnvelope.from_json(data.decode("utf-8"))
+            selected[envelope.artifact_id] = envelope
+    return selected
+
+
+def _sealed_selected_artifacts(
+    revisions: RevisionStore, revision_id: str, *, selected_closure: Any = None,
+) -> dict[str, ArtifactEnvelope]:
+    """Use the invocation closure; archive reading is a legacy compatibility fallback."""
+    selected = _closure_artifact_map(selected_closure)
+    if selected is not None:
+        return selected
+    try:
+        return _archive_selected_artifacts(revisions, revision_id)
+    except (ArtifactError, OSError, KeyError, TypeError, SchemaError, json.JSONDecodeError, AttributeError) as exc:
+        raise CorrectionError("selected base revision closure is invalid") from exc
+
+
 def resolve_selected_overlays(
     store: CorrectionStore, revisions: RevisionStore, *, base_revision_id: str, correction_set_id: str | None,
+    selected_closure: Any = None,
 ) -> OverlayResolution:
     """Load verified sealed base closure and resolve one explicitly selected set."""
     if correction_set_id is None:
         return OverlayResolution(_id(base_revision_id, "base_revision_id"), None)
     correction_set = store.get_set(correction_set_id)
-    try:
-        revisions.snapshot(base_revision_id)
-        bundle = revisions._revision_path(base_revision_id)  # verified public snapshot above; bundle is immutable.
-        manifest = json.loads((bundle / "bundle-manifest.json").read_text(encoding="utf-8"))
-        selected = {artifact_id: ArtifactEnvelope.from_file(bundle / "artifacts" / f"{artifact_id}.json") for artifact_id in manifest["artifact_ids"]}
-    except (ArtifactError, OSError, KeyError, TypeError, SchemaError, json.JSONDecodeError) as exc:
-        raise CorrectionError("selected base revision closure is invalid") from exc
+    selected = _sealed_selected_artifacts(revisions, base_revision_id, selected_closure=selected_closure)
     # Load all retained immutable records, not only currently active IDs: a
     # successor legitimately points to historical predecessors.  Filename is
     # merely lookup address; each reader rechecks canonical content ID.
@@ -1022,26 +1099,6 @@ def _record_payload(record: CorrectionRecord) -> dict[str, Any]:
     }
 
 
-def _sealed_selected_artifacts(revisions: RevisionStore, revision_id: str) -> dict[str, ArtifactEnvelope]:
-    """Read selected immutable bytes from a verified bundle, never cache state."""
-    try:
-        revisions.snapshot(revision_id)
-        bundle = revisions._revision_path(revision_id)
-        manifest = json.loads((bundle / "bundle-manifest.json").read_text(encoding="utf-8"))
-        ids = manifest["artifact_ids"]
-        if not isinstance(ids, list) or ids != sorted(set(ids)):
-            raise CorrectionError("selected revision artifact closure is invalid")
-        selected = {
-            artifact_id: ArtifactEnvelope.from_file(bundle / "artifacts" / f"{artifact_id}.json")
-            for artifact_id in ids
-        }
-        if set(selected) != set(ids):
-            raise CorrectionError("selected revision artifact closure is invalid")
-        return selected
-    except (ArtifactError, OSError, KeyError, TypeError, SchemaError, json.JSONDecodeError) as exc:
-        raise CorrectionError("selected base revision closure is invalid") from exc
-
-
 def _all_records(store: CorrectionStore) -> list[CorrectionRecord]:
     records: list[CorrectionRecord] = []
     for path in sorted(store.records_dir.glob("*.json")):
@@ -1082,11 +1139,12 @@ def _reject_resolution(resolution: OverlayResolution, expected_active_ids: Seque
 
 def _validate_current_set(
     store: CorrectionStore, revisions: RevisionStore, correction_set: CorrectionSet, *, base_revision_id: str,
+    selected_closure: Any = None,
 ) -> tuple[list[CorrectionRecord], dict[str, ArtifactEnvelope]]:
     """Verify a pointer's event and record closure without persisting findings."""
     if correction_set.base_revision_id != base_revision_id:
         raise CorrectionError("active correction set base revision does not match active revision")
-    selected = _sealed_selected_artifacts(revisions, base_revision_id)
+    selected = _sealed_selected_artifacts(revisions, base_revision_id, selected_closure=selected_closure)
     current_events: list[CorrectionEvent] = []
     for event_id in correction_set.event_ids:
         try:
@@ -1149,11 +1207,51 @@ def _correction_base_artifact_ids(record: CorrectionRecord) -> tuple[str, ...]:
     return tuple(sorted(item["artifact_id"] for item in _base_refs(record)))
 
 
+class _ClosureGraph:
+    """Small traversal view over immutable edge values carried by a closure."""
+
+    def __init__(self, edges: Sequence[Any]):
+        self._edges = tuple(edges)
+
+    def edges(self, revision_id: str) -> tuple[Any, ...]:
+        return self._edges
+
+    def descendants(self, revision_id: str, artifact_id: str) -> tuple[str, ...]:
+        result: set[str] = set()
+        queue = [artifact_id]
+        while queue:
+            current = queue.pop(0)
+            for edge in self._edges:
+                if getattr(edge, "parent_artifact_id", None) == current:
+                    child = edge.child_artifact_id
+                    if child not in result:
+                        result.add(child)
+                        queue.append(child)
+        return tuple(sorted(result))
+
+
+def _closure_graph(selected_closure: Any, revision_id: str) -> Any:
+    """Return a graph/traversal view carried by a selected closure, if any."""
+    if selected_closure is None:
+        return None
+    for owner in (selected_closure,
+                  *(getattr(selected_closure, name, None) for name in ("graph", "selected_graph", "dependency_graph"))):
+        if owner is None:
+            continue
+        if all(callable(getattr(owner, method, None)) for method in ("edges", "descendants")):
+            return owner
+        edges = getattr(owner, "edges", None)
+        if isinstance(edges, Mapping):
+            return _ClosureGraph(tuple(edges.values()))
+    return None
+
+
 def _graph_entries_and_descendants(
     revisions: RevisionStore, revision_id: str, selected: Mapping[str, ArtifactEnvelope], record: CorrectionRecord,
+    *, selected_closure: Any = None,
 ) -> tuple[tuple[dict[str, str], ...], set[str], set[str], dict[str, tuple[dict[str, str], ...]]]:
     """Build fixed base/virtual universe and exact persisted reverse closure."""
-    graph = revisions.selected_graph(revision_id)
+    graph = _closure_graph(selected_closure, revision_id) or revisions.selected_graph(revision_id)
     try:
         edges = graph.edges(revision_id)
     except ArtifactError as exc:
@@ -1227,6 +1325,7 @@ def impact_for_correction(*args: Any, **kwargs: Any) -> CorrectionImpact:
     revisions = kwargs.pop("revisions", None)
     correction = kwargs.pop("correction", None)
     correction_set = kwargs.pop("correction_set", None)
+    selected_closure = kwargs.pop("selected_closure", None)
     if kwargs:
         raise TypeError(f"unexpected impact_for_correction arguments: {sorted(kwargs)}")
     remaining = list(args)
@@ -1256,14 +1355,18 @@ def impact_for_correction(*args: Any, **kwargs: Any) -> CorrectionImpact:
     if correction_set.base_revision_id != correction.applies_to_revision_id:
         raise CorrectionError("correction and impact set base revisions differ")
 
-    selected = _sealed_selected_artifacts(revisions, correction.applies_to_revision_id)
+    selected = _sealed_selected_artifacts(
+        revisions, correction.applies_to_revision_id, selected_closure=selected_closure,
+    )
     for artifact_id in _correction_base_artifact_ids(correction):
         if artifact_id not in selected:
             raise CorrectionError("correction base artifact is not selected in declared revision")
     universe, direct, descendants, by_artifact = _graph_entries_and_descendants(
         revisions, correction.applies_to_revision_id, selected, correction,
+        selected_closure=selected_closure,
     )
-    edges = revisions.selected_graph(correction.applies_to_revision_id).edges(correction.applies_to_revision_id)
+    graph = _closure_graph(selected_closure, correction.applies_to_revision_id) or revisions.selected_graph(correction.applies_to_revision_id)
+    edges = graph.edges(correction.applies_to_revision_id)
     ambiguous_artifacts = _ambiguous_artifacts(edges, correction, descendants)
 
     protected_artifacts: set[str] = set()
@@ -1282,7 +1385,7 @@ def impact_for_correction(*args: Any, **kwargs: Any) -> CorrectionImpact:
                 continue
             for artifact_id in _correction_base_artifact_ids(active):
                 protected_artifacts.add(artifact_id)
-                protected_artifacts.update(revisions.selected_graph(correction.applies_to_revision_id).descendants(
+                protected_artifacts.update(graph.descendants(
                     correction.applies_to_revision_id, artifact_id,
                 ))
 
@@ -1350,6 +1453,7 @@ def correction_transition(
     store: CorrectionStore, revisions: RevisionStore, *, event_kind: str,
     payload: Mapping[str, Any] | None = None, correction_id: str | None = None,
     supersedes_id: str | None = None, revision_id: str | None = None,
+    selected_closure: Any = None,
 ) -> tuple[CorrectionSet, CorrectionImpact]:
     """Validate then atomically publish one apply/revert/supersede successor.
 
@@ -1365,10 +1469,13 @@ def correction_transition(
     if pointer_id is None:
         current = CorrectionSet.create(active_revision_id)
         records: list[CorrectionRecord] = _all_records(store)
-        selected = _sealed_selected_artifacts(revisions, active_revision_id)
+        selected = _sealed_selected_artifacts(revisions, active_revision_id, selected_closure=selected_closure)
     else:
         current = store.get_set(pointer_id)
-        records, selected = _validate_current_set(store, revisions, current, base_revision_id=active_revision_id)
+        records, selected = _validate_current_set(
+            store, revisions, current, base_revision_id=active_revision_id,
+            selected_closure=selected_closure,
+        )
     if current.base_revision_id != active_revision_id:
         raise CorrectionError("active correction set base revision does not match active revision")
     active_ids = set(current.active_correction_ids)
@@ -1416,7 +1523,10 @@ def correction_transition(
         event_activated_correction_ids=None,
     )
     _reject_resolution(resolution, successor.active_correction_ids)
-    impact = impact_for_correction(store, revisions, record, correction_set=successor)
+    impact = impact_for_correction(
+        store, revisions, record, correction_set=successor,
+        selected_closure=selected_closure,
+    )
     event = correction_event_for(record.correction_id, event_kind, successor)
 
     # Immutable prerequisites first; pointer swap is sole mutable publication.

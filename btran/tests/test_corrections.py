@@ -239,6 +239,8 @@ def test_historical_supersession_rejects_scope_mismatch_and_branch_conflict():
     )
     assert not conflict.applicable_correction_ids
     assert {finding.kind for finding in conflict.findings} == {"correction_conflict"}
+    assert all(finding.audit_category == "conflict" for finding in conflict.findings)
+    assert all(finding.evidence.get("trigger") for finding in conflict.findings)
 
 
 def test_stale_supersession_ancestor_makes_all_successors_inapplicable():
@@ -443,6 +445,31 @@ def _sealed_source_revision(tmp_path):
     revisions.seal_bundle(snapshot, provenance, epub.getvalue())
     revisions.activate(revision_id)
     return artifacts, revisions, source, revision_id
+
+
+def test_selected_closure_is_compact_correction_boundary(tmp_path):
+    source = _artifact("source", {"segment_id": "segment", "source_text": "old"})
+    record = correction_record_for(_source("revision", source))
+    event, correction_set = _successor_event_set("revision", (record.correction_id,), record.correction_id, "apply")
+    store = CorrectionStore(tmp_path)
+    store.put_record(record)
+    store.put_set(correction_set)
+    store.put_event(event)
+
+    class NoRevisionTraversal:
+        def snapshot(self, revision_id):
+            raise AssertionError("selected closure must avoid revision traversal")
+
+        def _revision_path(self, revision_id):
+            raise AssertionError("selected closure must avoid archive reads")
+
+    closure = {source.artifact_id: source}
+    result = resolve_selected_overlays(
+        store, NoRevisionTraversal(), base_revision_id="revision",
+        correction_set_id=correction_set.set_id, selected_closure=closure,
+    )
+    assert result.applicable_correction_ids == (record.correction_id,)
+    assert result.source_inputs[0].replacement == "fixed"
 
 
 def test_target_corrections_require_current_translation_leaf_and_span():
