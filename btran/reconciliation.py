@@ -18,6 +18,7 @@ from btran.schema import (
     EffectivePage,
     EffectiveSegment,
     Finding,
+    actionable_uncertainty_finding,
     PageExtraction,
     TerminologyEntry,
     TerminologyMap,
@@ -179,6 +180,12 @@ def _issue_id(kind: str, subjects: Sequence[str], bases: Sequence[str], evidence
 
 
 def _selected_pages(value: Any, store: ArtifactStore) -> tuple[tuple[str, EffectivePage, tuple[tuple[str, EffectiveSegment], ...]], ...]:
+    """Load selected pages once, rebuilding children in declared order.
+
+    Dependency rows are canonicalized as sets by the artifact store.  They are
+    therefore never a valid source of reading order; ``effective_segment_ids``
+    on the selected page is the authority.
+    """
     leaves = getattr(value, "leaves", value)
     if not isinstance(leaves, (tuple, list)):
         raise ValueError("effective pages must be Task-10 leaves or selected page artifact IDs")
@@ -191,15 +198,23 @@ def _selected_pages(value: Any, store: ArtifactStore) -> tuple[tuple[str, Effect
         if envelope.kind != "EffectiveTargetPage":
             raise ValueError("reconciliation requires selected effective target pages")
         page = EffectivePage.from_dict(envelope.payload)
-        segments: list[tuple[str, EffectiveSegment]] = []
-        for segment_id in envelope.dependency_ids:
-            child = store.get(segment_id)
+        children: dict[str, tuple[str, EffectiveSegment]] = {}
+        for dependency_id in envelope.dependency_ids:
+            child = store.get(dependency_id)
             if child.kind not in {"EffectiveTargetSegment", "DiagnosticEffectiveTargetSegment"}:
-                continue
-            segments.append((child.artifact_id, EffectiveSegment.from_dict(child.payload)))
-        if tuple(item[1].effective_segment_id for item in segments) != page.effective_segment_ids:
+                raise ValueError("effective page has an unexpected child artifact")
+            segment = EffectiveSegment.from_dict(child.payload)
+            if segment.effective_segment_id in children:
+                raise ValueError("effective page has duplicate segment identity")
+            children[segment.effective_segment_id] = (child.artifact_id, segment)
+        if set(children) != set(page.effective_segment_ids):
             raise ValueError("effective page segment closure/order is invalid")
-        output.append((envelope.artifact_id, page, tuple(segments)))
+        try:
+            # Lookup by the page's declared IDs, not by dependency/storage order.
+            segments = tuple(children[segment_id] for segment_id in page.effective_segment_ids)
+        except KeyError as exc:
+            raise ValueError("effective page segment closure/order is invalid") from exc
+        output.append((envelope.artifact_id, page, segments))
     if len({page.page_id for _, page, _ in output}) != len(output):
         raise ValueError("effective pages duplicate page identity")
     return tuple(output)
@@ -223,14 +238,30 @@ def _selected_projections(value: Any, store: ArtifactStore) -> tuple[tuple[str, 
     return tuple(sorted(output))
 
 
+def _ordered_unique(values: Sequence[str]) -> tuple[str, ...]:
+    """De-duplicate selected IDs without destroying declared execution order."""
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        if value not in seen:
+            seen.add(value)
+            result.append(value)
+    return tuple(result)
+
+
 def _reconciliation_payload(page_ids: Sequence[str], projection_ids: Sequence[str], issues: Sequence[ReconciliationIssue], status: str, error: Mapping[str, Any] | None) -> dict[str, Any]:
-    return {"effective_page_artifact_ids": list(sorted(set(page_ids))), "projection_artifact_ids": list(sorted(set(projection_ids))), "issues": [item.to_dict() for item in issues], "status": status, "error_evidence": dict(error) if error else None, "algorithm_version": "reconciliation-v1"}
+    return {"effective_page_artifact_ids": list(_ordered_unique(page_ids)), "projection_artifact_ids": list(_ordered_unique(projection_ids)), "issues": [item.to_dict() for item in issues], "status": status, "error_evidence": dict(error) if error else None, "algorithm_version": "reconciliation-v1"}
 
 
 def _put_assessment(store: ArtifactStore, *, reconciliation_id: str, issue: ReconciliationIssue, base_revision_id: str) -> tuple[str, tuple[str, ...]]:
-    signal = "reconciliation_conflict" if issue.kind == "context_conflict" else "missing_term"
+    # Keep the compatibility uncertainty record, but also expose actionable
+    # evidence through the shared audit helper.  The helper deliberately does
+    # not infer actionability from the confidence score.
+    signal = "conflict" if issue.kind == "context_conflict" else "validation"
     assessment = ConfidenceAssessment(subject_id=issue.issue_id, producing_stage="reconciliation", producing_artifact_id=reconciliation_id, score=0, signals=tuple(sorted(("reconciliation_issue", signal))))
-    uncertainty = uncertainty_finding(assessment)
+    uncertainty = actionable_uncertainty_finding(assessment)
+    if uncertainty is None:  # defensive compatibility path for future signals
+        uncertainty = uncertainty_finding(assessment)
     store.put_finding(uncertainty)
     request = review_requests_for(assessment=assessment, reconciliation_issue="reconciliation_conflict" if issue.kind == "context_conflict" else "missing_term", stage="reconciliation", subject_ids=issue.subject_ids, suggested_correction_kind="terminology", base_revision_id=base_revision_id, base_artifact_ids=issue.base_artifact_ids, scope="all_concept_occurrences")
     finding_ids = [uncertainty.finding_id]
@@ -254,8 +285,10 @@ def reconcile_effective(*, effective_pages: Any, projections: Any, store: Artifa
     status = "completed"
     try:
         pages = _selected_pages(effective_pages, store)
+        # The caller's page sequence is the declared content order.  Never
+        # replace it with lexical artifact-ID order.
+        page_ids = tuple(page_id for page_id, _, _ in pages)
         selected = _selected_projections(projections, store)
-        page_ids = tuple(sorted(page_id for page_id, _, _ in pages))
         projection_ids = tuple(item[0] for item in selected)
         texts = [(segment.segment_id, segment.effective_text) for _, _, segments in pages for _, segment in segments]
         observations: list[ReconciliationIssue] = []
@@ -268,9 +301,10 @@ def reconcile_effective(*, effective_pages: Any, projections: Any, store: Artifa
                 continue
             matching = [segment_id for segment_id, text in texts if _term_in_text(target, text, allow_regular_variant=True)]
             if not matching:
-                subjects = tuple(sorted({concept, *(segment_id for segment_id, _ in texts)}))
+                segment_ids = tuple(segment_id for segment_id, _ in texts)
+                subjects = tuple(sorted({concept, *segment_ids}))
                 bases = tuple(sorted((projection_id, projection["membership_id"])))
-                evidence = {"concept_id": concept, "projection_id": projection_id, "target_form": target, "segment_ids": list(subjects[1:])}
+                evidence = {"concept_id": concept, "projection_id": projection_id, "target_form": target, "segment_ids": list(segment_ids)}
                 observations.append(ReconciliationIssue(_issue_id("missing_term", subjects, bases, evidence), "missing_term", subjects, bases, target, (), evidence))
         # Two selected projections assigning different forms to one exact occurrence are a conflict.
         occurrence_forms: dict[str, list[tuple[str, str, str]]] = {}
@@ -293,20 +327,47 @@ def reconcile_effective(*, effective_pages: Any, projections: Any, store: Artifa
         raw = getattr(projections, "projection_artifact_ids", projections)
         if isinstance(raw, (tuple, list)) and all(isinstance(item, str) for item in raw):
             projection_ids = tuple(sorted(set(raw)))
-        finding = Finding(kind="reconciliation_exception", severity="error", stage="reconciliation", subject_refs=projection_ids, evidence=dict(error), message="Reconciliation failed; unchanged projections remain selected.", dependency_ids=projection_ids)
-        store.put_finding(finding); findings.append(finding.finding_id)
+        subjects = projection_ids or page_ids or ("reconciliation",)
+        failure = Finding(
+            kind="reconciliation_exception", severity="error", stage="reconciliation",
+            audit_category="failure", subject_refs=tuple(sorted(set(subjects))),
+            evidence={"trigger": "failure", **dict(error)},
+            message="Reconciliation failed while loading or processing selected content; unchanged projections remain selected.",
+            dependency_ids=tuple(sorted(set(projection_ids))),
+        )
+        store.put_finding(failure); findings.append(failure.finding_id)
+        # The typed artifact is still returned, so continuation is separately
+        # visible as fallback rather than hiding the primary failure.
+        fallback = Finding(
+            kind="reconciliation_fallback", severity="warning", stage="reconciliation",
+            audit_category="fallback", subject_refs=tuple(sorted(set(subjects))),
+            evidence={"trigger": "fallback", "continued_from": failure.finding_id, "selected_projection_ids": list(projection_ids)},
+            message="Reconciliation continued with unchanged selected projections.",
+            dependency_ids=tuple(sorted(set(projection_ids))),
+        )
+        store.put_finding(fallback); findings.append(fallback.finding_id)
 
     payload = _reconciliation_payload(page_ids, projection_ids, issues, status, error)
     reconciliation_id = artifact_id_for(RECONCILIATION_ARTIFACT_KIND, payload, tuple(sorted(set((*page_ids, *projection_ids)))))
     assessment_ids: list[str] = []
     for issue in issues:
-        quality = Finding(kind=issue.kind, severity="warning", stage="reconciliation", subject_refs=issue.subject_ids, evidence=issue.to_dict(), message="Terminology reconciliation observation.", dependency_ids=issue.base_artifact_ids)
+        category = "conflict" if issue.kind == "context_conflict" else "validation"
+        quality = Finding(
+            kind=issue.kind, severity="warning", stage="reconciliation",
+            audit_category=category, subject_refs=issue.subject_ids,
+            evidence={"trigger": category, **issue.to_dict()},
+            message=("Terminology context conflict requires inspection."
+                     if category == "conflict" else
+                     "Selected terminology target was not found in effective content."),
+            dependency_ids=issue.base_artifact_ids,
+        )
         store.put_finding(quality); findings.append(quality.finding_id)
         assessment_id, ids = _put_assessment(store, reconciliation_id=reconciliation_id, issue=issue, base_revision_id=base_revision_id)
         assessment_ids.append(assessment_id); findings.extend(ids)
     if status == "degraded":
         assessment = ConfidenceAssessment(subject_id="reconciliation", producing_stage="reconciliation", producing_artifact_id=reconciliation_id, score=None, signals=("degraded", "fallback"))
-        uncertainty = uncertainty_finding(assessment); store.put_finding(uncertainty); findings.append(uncertainty.finding_id)
+        uncertainty = actionable_uncertainty_finding(assessment) or uncertainty_finding(assessment)
+        store.put_finding(uncertainty); findings.append(uncertainty.finding_id)
         bases = projection_ids or page_ids
         if bases:
             for request in review_requests_for(assessment=assessment, degraded_or_fallback=True, stage="reconciliation", subject_ids=("reconciliation",), suggested_correction_kind="target_segment", base_revision_id=base_revision_id, base_artifact_ids=bases, scope="segment"):
