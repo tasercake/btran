@@ -15,7 +15,7 @@ from ebooklib import epub
 
 from btran.artifacts import ArtifactStore
 from btran.config import validate_timeout_seconds
-from btran.process_cleanup import cleanup_popen
+from btran.process_cleanup import CleanupCause, cleanup_popen
 from btran.schema import EffectivePage, EffectiveSegment, Finding, canonical_json, tagged_sha256
 
 
@@ -206,7 +206,9 @@ def _tail(value: str | bytes | None) -> str:
 
 def _timed_out_cleanup(proc: subprocess.Popen[str]) -> tuple[str, str]:
     """Shared TERM/KILL cleanup includes detached inherited-pipe descendants."""
-    return cleanup_popen(proc, term_grace=_CLEANUP_SECONDS, kill_grace=_CLEANUP_SECONDS)
+    return cleanup_popen(
+        proc, cause=CleanupCause.FAILURE, term_grace=_CLEANUP_SECONDS, kill_grace=_CLEANUP_SECONDS,
+    )
 
 
 def check_epub(
@@ -382,11 +384,21 @@ def _minimal_epub(content: SealedEffectiveContent, path: Path, *, title: str, au
 
 
 def _finding(kind: str, content: SealedEffectiveContent, error: Exception) -> Finding:
+    """Describe a non-blocking rich-output degradation for the final audit."""
     return Finding(
         kind=kind, severity="warning", stage="rendering",
         subject_refs=tuple(sorted(page.effective_page_id for page in content.pages)),
-        evidence={"exception_type": type(error).__name__, "message": _xml_safe(str(error))},
-        message="EPUB rendering degraded; deterministic diagnostic EPUB was produced.",
+        evidence={
+            "trigger": f"{kind}:{type(error).__name__}",
+            "exception_type": type(error).__name__,
+            "message": _xml_safe(str(error)),
+        },
+        audit_category="fallback",
+        message=(
+            "EPUB rich rendering failed; deterministic minimal EPUB fallback was produced."
+            if kind == "render_failed" else
+            "EPUBCheck failed; rich EPUB was retained and the diagnostic fallback was produced."
+        ),
     )
 
 

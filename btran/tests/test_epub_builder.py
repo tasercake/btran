@@ -239,6 +239,8 @@ def test_check_only_failure_persists_finding_and_keeps_rich_epub(tmp_path):
     assert result.rich_epub_retained is True
     finding = store.get_finding(result.finding_ids[0])
     assert finding.kind == "epubcheck_failed"
+    assert finding.audit_category == "fallback"
+    assert finding.evidence["trigger"] == "epubcheck_failed:EpubCheckError"
     assert any("page_" in name for name in xhtml_files(output))
 
 
@@ -255,7 +257,10 @@ def test_rich_failure_persists_finding_and_publishes_deterministic_minimal_epub(
     result = build_epub(content, output, artifact_store=store)
 
     assert result.status == "completed_degraded"
-    assert store.get_finding(result.finding_ids[0]).kind == "render_failed"
+    finding = store.get_finding(result.finding_ids[0])
+    assert finding.kind == "render_failed"
+    assert finding.audit_category == "fallback"
+    assert finding.evidence["trigger"] == "render_failed:RuntimeError"
     with zipfile.ZipFile(output) as archive:
         assert archive.namelist()[0] == "mimetype"
         diagnostic = archive.read("OEBPS/text/diagnostic.xhtml").decode("utf-8")
