@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import inspect
 import json
 import sys
 from pathlib import Path
@@ -15,6 +16,7 @@ from btran.config import WorkspaceResolutionError, load_config, resolve_workspac
 from btran.orchestrator import orchestrator_run
 from btran.orchestrator_contract import OrchestratorCallable, RunResult
 from btran.schema import Finding
+from btran.timing import TimingLedger
 
 
 def _read_pointer(workspace: Path, filename: str, field: str) -> str | None:
@@ -197,6 +199,7 @@ def _correction_main(argv: list[str]) -> None:
 
 def main() -> None:
     """Dispatch immutable correction commands or base-run invocation."""
+    ledger = TimingLedger("cli.main")
     argv = sys.argv[1:]
     if argv and argv[0] in {"correction", "revision"}:
         _correction_main(argv)
@@ -234,7 +237,13 @@ def main() -> None:
 
     runner: OrchestratorCallable = orchestrator_run
     try:
-        result: RunResult = asyncio.run(runner(config, on_page_error=on_page_error))
+        parameters = inspect.signature(runner).parameters
+        accepts_ledger = "timing_ledger" in parameters or any(
+            item.kind is inspect.Parameter.VAR_KEYWORD for item in parameters.values()
+        )
+        invocation = (runner(config, on_page_error=on_page_error, timing_ledger=ledger)
+                      if accepts_ledger else runner(config, on_page_error=on_page_error))
+        result: RunResult = asyncio.run(invocation)
     except KeyboardInterrupt:
         print("\nInterrupted.", file=sys.stderr)
         raise SystemExit(1)
