@@ -48,6 +48,14 @@ MANIFEST_FILENAME = "manifest.json"
 DISCOVERY_FILENAME = "book-discovery.json"
 DISCOVERY_VERSION = "book-discovery-v1"
 SUPPORTED_IMAGE_SUFFIXES = frozenset({".jpg", ".jpeg", ".png", ".webp", ".heic"})
+_SOURCE_PAGE_CACHE_LEAF_KINDS = frozenset({
+    "RawSourceExtraction", "DiagnosticSourceFallback", "EffectiveSourcePage",
+    "DiagnosticEffectiveSourcePage",
+})
+_TRANSLATION_SEGMENT_CACHE_LEAF_KINDS = frozenset({
+    "TranslationArtifact", "DiagnosticTranslationFallback", "EffectiveTargetSegment",
+    "DiagnosticEffectiveTargetSegment",
+})
 
 
 class ManifestValidationError(ValueError):
@@ -280,17 +288,11 @@ class SelectedClosure:
 
     @property
     def source_page_cache_leaves(self) -> tuple[ArtifactEnvelope, ...]:
-        return tuple(record for record in self.records.values() if record.kind in {
-            "RawSourceExtraction", "DiagnosticSourceFallback", "EffectiveSourcePage",
-            "DiagnosticEffectiveSourcePage",
-        })
+        return tuple(record for record in self.records.values() if record.kind in _SOURCE_PAGE_CACHE_LEAF_KINDS)
 
     @property
     def translation_segment_cache_leaves(self) -> tuple[ArtifactEnvelope, ...]:
-        return tuple(record for record in self.records.values() if record.kind in {
-            "TranslationArtifact", "DiagnosticTranslationFallback", "EffectiveTargetSegment",
-            "DiagnosticEffectiveTargetSegment",
-        })
+        return tuple(record for record in self.records.values() if record.kind in _TRANSLATION_SEGMENT_CACHE_LEAF_KINDS)
 
     @property
     def selected_terminology_entries(self) -> tuple[ArtifactEnvelope, ...]:
@@ -320,21 +322,15 @@ class SelectedClosure:
 
     @property
     def source_page_cache_leaf_map(self) -> Mapping[str, ArtifactEnvelope]:
-        return MappingProxyType({
-            stable_id: record
-            for record in self.source_page_cache_leaves
-            for stable_id in (self._payload_id(record, "page_id"),)
-            if stable_id is not None
-        })
+        return _cache_leaf_map(
+            self.records, _SOURCE_PAGE_CACHE_LEAF_KINDS, "page_id", "source page",
+        )
 
     @property
     def translation_segment_cache_leaf_map(self) -> Mapping[str, ArtifactEnvelope]:
-        return MappingProxyType({
-            stable_id: record
-            for record in self.translation_segment_cache_leaves
-            for stable_id in (self._payload_id(record, "segment_id"),)
-            if stable_id is not None
-        })
+        return _cache_leaf_map(
+            self.records, _TRANSLATION_SEGMENT_CACHE_LEAF_KINDS, "segment_id", "translation segment",
+        )
 
     @property
     def selected_terminology_entry_map(self) -> Mapping[str, ArtifactEnvelope]:
@@ -569,6 +565,34 @@ def _validate_stable_identities(records: Mapping[str, ArtifactEnvelope]) -> None
             seen.add(key)
 
 
+def _cache_leaf_map(
+    records: Mapping[str, ArtifactEnvelope],
+    kinds: frozenset[str],
+    field: str,
+    label: str,
+) -> Mapping[str, ArtifactEnvelope]:
+    """Build a cache map without allowing identity collisions to overwrite."""
+    result: dict[str, ArtifactEnvelope] = {}
+    for record in sorted(records.values(), key=lambda item: (item.kind, item.artifact_id)):
+        if record.kind not in kinds:
+            continue
+        stable_id = record.payload.get(field)
+        if not isinstance(stable_id, str) or not stable_id:
+            continue
+        if stable_id in result:
+            raise SelectedClosureError(f"duplicate {label} cache identity: {stable_id}")
+        result[stable_id] = record
+    return MappingProxyType(result)
+
+
+def _validate_cache_leaf_identities(records: Mapping[str, ArtifactEnvelope]) -> None:
+    """Reject same-key leaves across every source/translation cache kind."""
+    _cache_leaf_map(records, _SOURCE_PAGE_CACHE_LEAF_KINDS, "page_id", "source page")
+    _cache_leaf_map(
+        records, _TRANSLATION_SEGMENT_CACHE_LEAF_KINDS, "segment_id", "translation segment",
+    )
+
+
 def _build_ordered_pages(records: Mapping[str, ArtifactEnvelope], provenance: Mapping[str, Any]) -> tuple[Any, ...]:
     """Deserialize and validate effective pages and their declared children once."""
     all_records = tuple(records.values())
@@ -738,6 +762,7 @@ def load_selected_closure(
             raise SelectedClosureError("selected edge relationship escapes closure")
 
     _validate_stable_identities(records)
+    _validate_cache_leaf_identities(records)
     ordered_pages = _build_ordered_pages(records, provenance)
     from btran.orchestrator_contract import SelectedEffectiveContent
     effective_content = SelectedEffectiveContent(ordered_pages, finding_ids=tuple(sorted(findings)))

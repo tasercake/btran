@@ -285,6 +285,54 @@ def test_selected_closure_rejects_duplicate_translation_cache_leaf_identity(tmp_
         load_selected_closure(RevisionStore(tmp_path), snapshot.revision_id)
 
 
+@pytest.mark.parametrize("first_kind,second_kind", [
+    ("RawSourceExtraction", "DiagnosticSourceFallback"),
+    ("RawSourceExtraction", "EffectiveSourcePage"),
+    ("RawSourceExtraction", "DiagnosticEffectiveSourcePage"),
+    ("DiagnosticSourceFallback", "EffectiveSourcePage"),
+    ("DiagnosticSourceFallback", "DiagnosticEffectiveSourcePage"),
+    ("EffectiveSourcePage", "DiagnosticEffectiveSourcePage"),
+])
+def test_selected_closure_rejects_cross_kind_source_page_cache_collision(
+    tmp_path, first_kind, second_kind,
+):
+    store = ArtifactStore(tmp_path)
+    first = store.put(first_kind, {"page_id": "shared-page"}, semantic_key="first")
+    second = store.put(second_kind, {"page_id": "shared-page"}, semantic_key="second")
+    snapshot = RevisionSnapshot(
+        revision_id="cross-kind-source-page",
+        selected_artifact_ids=tuple(sorted((first.artifact_id, second.artifact_id))),
+    )
+    RevisionStore(tmp_path).seal_bundle(snapshot, {}, b"")
+
+    with pytest.raises(SelectedClosureError, match="source page cache identity"):
+        load_selected_closure(RevisionStore(tmp_path), snapshot.revision_id)
+
+
+@pytest.mark.parametrize("first_kind,second_kind", [
+    ("TranslationArtifact", "DiagnosticTranslationFallback"),
+    ("TranslationArtifact", "EffectiveTargetSegment"),
+    ("TranslationArtifact", "DiagnosticEffectiveTargetSegment"),
+    ("DiagnosticTranslationFallback", "EffectiveTargetSegment"),
+    ("DiagnosticTranslationFallback", "DiagnosticEffectiveTargetSegment"),
+    ("EffectiveTargetSegment", "DiagnosticEffectiveTargetSegment"),
+])
+def test_selected_closure_rejects_cross_kind_translation_segment_cache_collision(
+    tmp_path, first_kind, second_kind,
+):
+    store = ArtifactStore(tmp_path)
+    first = store.put(first_kind, {"segment_id": "shared-segment"}, semantic_key="first")
+    second = store.put(second_kind, {"segment_id": "shared-segment"}, semantic_key="second")
+    snapshot = RevisionSnapshot(
+        revision_id="cross-kind-translation-segment",
+        selected_artifact_ids=tuple(sorted((first.artifact_id, second.artifact_id))),
+    )
+    RevisionStore(tmp_path).seal_bundle(snapshot, {}, b"")
+
+    with pytest.raises(SelectedClosureError, match="translation segment cache identity"):
+        load_selected_closure(RevisionStore(tmp_path), snapshot.revision_id)
+
+
 def test_selected_closure_rejects_missing_declared_page_child(tmp_path):
     store = ArtifactStore(tmp_path)
     page = EffectivePage(
