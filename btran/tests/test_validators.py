@@ -85,6 +85,10 @@ def test_validation_setup_failure_with_selected_page_keeps_sorted_fallback_signa
     assert {item.kind for item in findings} >= {
         "validation_exception", "uncertainty", "review_request", "stage_summary",
     }
+    audit_findings = [item for item in findings if item.audit_category is not None]
+    assert audit_findings
+    assert all("validation" not in item.subject_refs for item in audit_findings)
+    assert all(item.subject_refs for item in audit_findings)
 
 
 def test_validation_semantic_key_and_dependency_change_with_selected_reconciliation(tmp_path):
@@ -202,6 +206,8 @@ def test_native_validation_uses_source_equivalent_rules_and_omits_target_rules(t
     target = store.put("EffectiveTargetSegment", segment.to_dict(), semantic_key="target-segment-1")
     page = EffectivePage(effective_page_id="effective-page-1", page_id="page-1", effective_segment_ids=(segment.effective_segment_id,), source_langs=("en",))
     target_page = store.put("EffectiveTargetPage", page.to_dict(), dependency_ids=(target.artifact_id,), semantic_key="target-page-1")
-    reconciliation = reconcile_effective(effective_pages=(target_page.artifact_id,), projections=(), store=store, base_revision_id="revision-1")
-    result = validate_effective(effective_pages=(target_page.artifact_id,), reconciliation=reconciliation, store=store, base_revision_id="revision-1", mode="native")
+    # Native validation is meaningful without translated reconciliation.
+    result = validate_effective(effective_pages=(target_page.artifact_id,), reconciliation=None, store=store, base_revision_id="revision-1", mode="native")
     assert {item.rule for item in result.rule_results} == {"effective_structure", "non_empty_text", "source_language"}
+    assert result.reconciliation_artifact_id is None
+    assert store.get(result.artifact_id).payload["reconciliation_artifact_id"] is None
