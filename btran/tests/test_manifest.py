@@ -1,12 +1,23 @@
 """Task 4 raw-hash BookRecord discovery tests."""
 
+import io
 import json
 import os
+import zipfile
 from pathlib import Path
 
 import pytest
 
-from btran.manifest import DISCOVERY_FILENAME, discover_book, generate_manifest, write_manifest
+from btran.artifacts import ArtifactStore, LegacyArtifactStore, LegacyRevisionStore, RevisionStore
+from btran.manifest import (
+    DISCOVERY_FILENAME,
+    SelectedClosureError,
+    discover_book,
+    generate_manifest,
+    load_selected_closure,
+    write_manifest,
+)
+from btran.schema import EffectivePage, EffectiveSegment, RevisionSnapshot
 
 
 def test_discovery_accepts_supported_undecodable_file(tmp_path):
@@ -71,7 +82,9 @@ def test_missing_page_is_persisted_finding_and_history_remains(tmp_path):
     assert [finding.kind for finding in second.findings] == ["page_missing"]
     snapshot = json.loads((workspace / DISCOVERY_FILENAME).read_text())
     assert snapshot["known_pages"][0]["page_id"] == first.pages[0].page.page_id
-    assert (workspace / "findings" / f"{second.findings[0].finding_id}.json").exists()
+    # New workspaces retain findings in compact v2 SQLite state.
+    from btran.storage import Storage
+    assert Storage(workspace).finding_bytes(second.findings[0].finding_id)
 
 
 def test_missing_input_becomes_nonleaking_invocation_failure(tmp_path):
@@ -124,3 +137,69 @@ def test_legacy_manifest_serialization_remains_narrow_migration_format(tmp_path)
     path = tmp_path / "manifest.json"
     write_manifest(manifest, path)
     assert set(json.loads(path.read_text())) == {"input_dir", "pages", "total_pages"}
+
+
+def _sealed_effective_page(store, *, semantic_key="page-key"):
+    segment = EffectiveSegment(
+        effective_segment_id="effective-segment-1", segment_id="segment-1",
+        source_lang="en", source_text="One", effective_text="One", render_lang="en",
+    )
+    page = EffectivePage(
+        effective_page_id="effective-page-1", page_id="page-1",
+        effective_segment_ids=(segment.effective_segment_id,), source_langs=("en",),
+    )
+    segment_record = store.put("EffectiveSourceSegment", segment.to_dict(), semantic_key="segment-key")
+    page_record = store.put("EffectiveSourcePage", page.to_dict(), dependency_ids=(segment_record.artifact_id,), semantic_key=semantic_key)
+    return page_record
+
+
+def test_selected_closure_loads_archive_once_and_preserves_declared_segment_order(tmp_path):
+    store = ArtifactStore(tmp_path)
+    page_record = _sealed_effective_page(store)
+    snapshot = RevisionSnapshot(revision_id="revision-1", selected_artifact_ids=(page_record.artifact_id,))
+    RevisionStore(tmp_path).seal_bundle(snapshot, {"run": "one"}, b"")
+
+    closure = load_selected_closure(RevisionStore(tmp_path), "revision-1")
+    assert closure.revision_id == "revision-1"
+    assert tuple(closure.records) == tuple(sorted(closure.records))
+    assert closure.ordered_effective_pages[0].segments[0].effective_segment_id == "effective-segment-1"
+    assert closure.provenance == {}
+    assert closure.final_finding_ids == ()
+    with pytest.raises(TypeError):
+        closure.records["new"] = page_record
+
+
+def test_selected_closure_rejects_duplicate_stable_identity(tmp_path):
+    store = ArtifactStore(tmp_path)
+    first = _sealed_effective_page(store, semantic_key="first")
+    # A second page with the same stable page ID has a different canonical
+    # artifact identity and is therefore valid storage but invalid selection.
+    duplicate_payload = EffectivePage(
+        effective_page_id="effective-page-2", page_id="page-1",
+        effective_segment_ids=(), source_langs=("en",),
+    )
+    duplicate = store.put("EffectiveSourcePage", duplicate_payload.to_dict(), semantic_key="second")
+    snapshot = RevisionSnapshot(
+        revision_id="revision-2", selected_artifact_ids=(first.artifact_id, duplicate.artifact_id),
+    )
+    RevisionStore(tmp_path).seal_bundle(snapshot, {}, b"")
+    with pytest.raises(SelectedClosureError, match="stable identity"):
+        load_selected_closure(RevisionStore(tmp_path), "revision-2")
+
+
+def test_legacy_selected_closure_read_does_not_create_or_mutate_state(tmp_path):
+    store = LegacyArtifactStore(tmp_path)
+    page_record = _sealed_effective_page(store)
+    snapshot = RevisionSnapshot(revision_id="legacy-1", selected_artifact_ids=(page_record.artifact_id,))
+    epub = io.BytesIO()
+    with zipfile.ZipFile(epub, "w") as archive:
+        archive.writestr("META-INF/btran-provenance.json", json.dumps({"legacy": True}, separators=(",", ":")))
+    LegacyRevisionStore(tmp_path, store).seal_bundle(snapshot, {"legacy": True}, epub.getvalue())
+    paths = {path: (path.stat().st_size, path.stat().st_mtime_ns) for path in tmp_path.rglob("*") if path.is_file()}
+
+    closure = load_selected_closure(RevisionStore(tmp_path), "legacy-1")
+    assert closure.snapshot.revision_id == "legacy-1"
+    assert closure.ordered_effective_pages
+    after = {path: (path.stat().st_size, path.stat().st_mtime_ns) for path in tmp_path.rglob("*") if path.is_file()}
+    assert after == paths
+    assert not (tmp_path / "state-v2.sqlite3").exists()

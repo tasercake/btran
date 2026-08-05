@@ -6,9 +6,18 @@ import json
 import stat
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from types import MappingProxyType
+from typing import Any, Mapping
 
-from btran.artifacts import ArtifactStore
+from btran.artifacts import (
+    ArtifactEnvelope,
+    ArtifactError,
+    ArtifactStore,
+    DependencyGraphEdge,
+    LegacyReadOnlyArtifactStore,
+    RevisionStore,
+    V2RevisionStore,
+)
 from btran.identity import (
     PagePlacement,
     book_record_for_pages,
@@ -17,7 +26,18 @@ from btran.identity import (
     raw_file_sha256,
     reconcile_book_pages,
 )
-from btran.schema import BookRecord, Finding, Manifest, PageRecord, SchemaError, canonical_json
+from btran.schema import (
+    EffectivePage,
+    EffectiveSegment,
+    BookRecord,
+    Finding,
+    Manifest,
+    PageRecord,
+    RevisionSnapshot,
+    SchemaError,
+    canonical_json,
+    canonical_json_bytes,
+)
 
 
 MANIFEST_FILENAME = "manifest.json"
@@ -81,6 +101,386 @@ class BookDiscovery:
         return self.invocation_failure is None
 
 
+class SelectedClosureError(ManifestValidationError):
+    """A selected revision is not a self-contained, readable closure."""
+
+
+@dataclass(frozen=True)
+class SelectedClosure:
+    """In-memory authority for one selected sealed revision.
+
+    Loading performs the archive validation once.  Every accessor below reads
+    these immutable maps and tuples; it never consults the workspace again.
+    This is important for both deterministic ordering and for legacy workspaces,
+    which are deliberately read-only.
+    """
+
+    revision_id: str
+    snapshot: RevisionSnapshot
+    records: Mapping[str, ArtifactEnvelope]
+    findings: Mapping[str, Finding]
+    edges: Mapping[str, DependencyGraphEdge]
+    attestations: Mapping[str, Mapping[str, Any]]
+    provenance: Mapping[str, Any]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.snapshot, RevisionSnapshot):
+            raise TypeError("selected closure snapshot must be a RevisionSnapshot")
+        if self.snapshot.revision_id != self.revision_id:
+            raise ValueError("selected closure revision ID does not match snapshot")
+        maps = {
+            "records": self.records, "findings": self.findings,
+            "edges": self.edges, "attestations": self.attestations,
+            "provenance": self.provenance,
+        }
+        for name, value in maps.items():
+            if not isinstance(value, Mapping):
+                raise TypeError(f"selected closure {name} must be a mapping")
+            object.__setattr__(self, name, MappingProxyType(dict(value)))
+        # The selected archive is the authority.  Do not silently broaden it
+        # from a mutable index or from historical records.
+        if set(self.records) != set(self.snapshot.selected_artifact_ids) | {
+            dependency_id
+            for record in self.records.values()
+            for dependency_id in record.dependency_ids
+        }:
+            raise ValueError("selected closure record map is not closed")
+        if set(self.findings) != set(self.snapshot.selected_finding_ids) | {
+            finding_id
+            for record in self.records.values()
+            for finding_id in record.finding_ids
+        } | {
+            finding_id
+            for finding in self.findings.values()
+            for finding_id in finding.dependency_ids
+        }:
+            raise ValueError("selected closure finding map is not closed")
+
+    @classmethod
+    def empty(cls) -> "SelectedClosure":
+        """Return the explicit empty closure used before the first revision."""
+        snapshot = RevisionSnapshot(revision_id="unsealed")
+        return cls("unsealed", snapshot, {}, {}, {}, {}, {})
+
+    @property
+    def artifact_map(self) -> Mapping[str, ArtifactEnvelope]:
+        return self.records
+
+    @property
+    def record_map(self) -> Mapping[str, ArtifactEnvelope]:
+        return self.records
+
+    @property
+    def finding_map(self) -> Mapping[str, Finding]:
+        return self.findings
+
+    @property
+    def edge_map(self) -> Mapping[str, DependencyGraphEdge]:
+        return self.edges
+
+    @property
+    def attestation_map(self) -> Mapping[str, Mapping[str, Any]]:
+        return self.attestations
+
+    @property
+    def final_finding_ids(self) -> tuple[str, ...]:
+        return tuple(sorted(self.findings))
+
+    @property
+    def finding_ids(self) -> tuple[str, ...]:
+        return self.final_finding_ids
+
+    def record(self, record_id: str) -> ArtifactEnvelope:
+        try:
+            return self.records[record_id]
+        except KeyError as exc:
+            raise SelectedClosureError(f"selected record is missing: {record_id}") from exc
+
+    def finding(self, finding_id: str) -> Finding:
+        try:
+            return self.findings[finding_id]
+        except KeyError as exc:
+            raise SelectedClosureError(f"selected finding is missing: {finding_id}") from exc
+
+    def edge(self, edge_id: str) -> DependencyGraphEdge:
+        try:
+            return self.edges[edge_id]
+        except KeyError as exc:
+            raise SelectedClosureError(f"selected edge is missing: {edge_id}") from exc
+
+    @staticmethod
+    def _payload_id(record: ArtifactEnvelope, field: str) -> str | None:
+        value = record.payload.get(field)
+        return value if isinstance(value, str) and value else None
+
+    def _typed_records(self, kinds: set[str]) -> tuple[ArtifactEnvelope, ...]:
+        return tuple(record for record in self.records.values() if record.kind in kinds)
+
+    @property
+    def ordered_effective_pages(self) -> tuple[Any, ...]:
+        """Return selected effective pages with declared segment order."""
+        pages: list[tuple[tuple[Any, ...], Any]] = []
+        segment_records = {
+            self._payload_id(record, "effective_segment_id"): record
+            for record in self.records.values()
+            if self._payload_id(record, "effective_segment_id") is not None
+        }
+        all_pages = tuple(self.records.values())
+        has_target_pages = any(record.kind == "EffectiveTargetPage" for record in all_pages)
+        page_kinds = {"EffectiveTargetPage"} if has_target_pages else {"EffectiveSourcePage"}
+        for record in self._typed_records(page_kinds):
+            try:
+                page = EffectivePage.from_dict(record.payload)
+                segments = tuple(
+                    EffectiveSegment.from_dict(segment_records[segment_id].payload)
+                    for segment_id in page.effective_segment_ids
+                )
+            except (KeyError, SchemaError, TypeError, ValueError) as exc:
+                raise SelectedClosureError("selected effective page has invalid children") from exc
+            # Page number is optional.  When present it is the declared page
+            # order; otherwise retain the stable page identity order.
+            number = page.display_metadata.get("page_number")
+            order = (0, number, page.page_id) if isinstance(number, int) and not isinstance(number, bool) else (1, page.page_id)
+            pages.append((order, (page, segments)))
+        pages.sort(key=lambda item: item[0])
+        from btran.orchestrator_contract import OrderedEffectivePage
+        return tuple(OrderedEffectivePage(page, segments) for _, (page, segments) in pages)
+
+    @property
+    def selected_effective_content(self) -> Any:
+        from btran.orchestrator_contract import SelectedEffectiveContent
+        return SelectedEffectiveContent(self.ordered_effective_pages, finding_ids=self.final_finding_ids)
+
+    @property
+    def source_page_cache_leaves(self) -> tuple[ArtifactEnvelope, ...]:
+        return tuple(record for record in self.records.values() if record.kind in {
+            "RawSourceExtraction", "DiagnosticSourceFallback", "EffectiveSourcePage",
+            "DiagnosticEffectiveSourcePage",
+        })
+
+    @property
+    def translation_segment_cache_leaves(self) -> tuple[ArtifactEnvelope, ...]:
+        return tuple(record for record in self.records.values() if record.kind in {
+            "TranslationArtifact", "DiagnosticTranslationFallback", "EffectiveTargetSegment",
+            "DiagnosticEffectiveTargetSegment",
+        })
+
+    @property
+    def selected_terminology_entries(self) -> tuple[ArtifactEnvelope, ...]:
+        return tuple(record for record in self.records.values() if record.kind in {
+            "ConceptProjection", "ConceptSelector", "TerminologyOverlay",
+        })
+
+    @property
+    def selected_correction_targets(self) -> tuple[ArtifactEnvelope, ...]:
+        return tuple(record for record in self.records.values() if record.kind in {
+            "SourceTextOverlay", "TargetSegmentOverlay", "TargetOccurrenceOverlay",
+            "TerminologyOverlay", "CorrectionRecord",
+        })
+
+    # Method spellings keep the contract usable by stages that prefer verbs.
+    def source_page_leaves(self) -> tuple[ArtifactEnvelope, ...]:
+        return self.source_page_cache_leaves
+
+    def translation_segment_leaves(self) -> tuple[ArtifactEnvelope, ...]:
+        return self.translation_segment_cache_leaves
+
+    def terminology_entries(self) -> tuple[ArtifactEnvelope, ...]:
+        return self.selected_terminology_entries
+
+    def correction_targets(self) -> tuple[ArtifactEnvelope, ...]:
+        return self.selected_correction_targets
+
+    @property
+    def source_page_cache_leaf_map(self) -> Mapping[str, ArtifactEnvelope]:
+        return MappingProxyType({
+            stable_id: record
+            for record in self.source_page_cache_leaves
+            for stable_id in (self._payload_id(record, "page_id"),)
+            if stable_id is not None
+        })
+
+    @property
+    def translation_segment_cache_leaf_map(self) -> Mapping[str, ArtifactEnvelope]:
+        return MappingProxyType({
+            stable_id: record
+            for record in self.translation_segment_cache_leaves
+            for stable_id in (self._payload_id(record, "segment_id"),)
+            if stable_id is not None
+        })
+
+    @property
+    def selected_terminology_entry_map(self) -> Mapping[str, ArtifactEnvelope]:
+        return MappingProxyType({record.artifact_id: record for record in self.selected_terminology_entries})
+
+    @property
+    def selected_correction_target_map(self) -> Mapping[str, ArtifactEnvelope]:
+        return MappingProxyType({record.artifact_id: record for record in self.selected_correction_targets})
+
+
+def _canonical_member(data: bytes, name: str) -> Any:
+    try:
+        value = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SelectedClosureError(f"{name} is not UTF-8 canonical JSON") from exc
+    if canonical_json_bytes(value) != data:
+        raise SelectedClosureError(f"{name} is not canonical JSON")
+    return value
+
+
+def _legacy_active_revision_id(revisions: Any) -> str | None:
+    pointer = Path(revisions.root) / "active-revision.json"
+    if not pointer.exists():
+        return None
+    try:
+        body = _canonical_member(pointer.read_bytes(), "active-revision.json")
+        if set(body) != {"revision_id"} or not isinstance(body["revision_id"], str):
+            raise SelectedClosureError("active revision pointer is invalid")
+        return body["revision_id"]
+    except OSError as exc:
+        raise SelectedClosureError("active revision pointer is unreadable") from exc
+
+
+def _revision_members(revisions: Any, revision_id: str) -> tuple[RevisionSnapshot, Mapping[str, bytes], Mapping[str, Any]]:
+    """Validate one revision through its store, then retain its bytes in memory."""
+    try:
+        if isinstance(revisions, V2RevisionStore):
+            values = revisions.storage.verify_revision(revision_id)
+            snapshot = RevisionSnapshot.from_json(values["snapshot.json"].decode("utf-8"))
+            provenance: Mapping[str, Any] = {}
+            return snapshot, values, provenance
+
+        # Legacy verification is intentionally routed through the read-only
+        # adapter.  It does not quarantine invalid files or create directories.
+        revisions.verify_bundle(revision_id)
+        bundle = Path(revisions.revisions_dir) / revision_id
+        snapshot_bytes = (bundle / "snapshot.json").read_bytes()
+        snapshot = RevisionSnapshot.from_json(snapshot_bytes.decode("utf-8"))
+        manifest = _canonical_member((bundle / "bundle-manifest.json").read_bytes(), "bundle-manifest.json")
+        values: dict[str, bytes] = {"snapshot.json": snapshot_bytes}
+        for artifact_id in manifest.get("artifact_ids", ()):
+            values[f"artifacts/{artifact_id}.json"] = (bundle / "artifacts" / f"{artifact_id}.json").read_bytes()
+        for finding_id in manifest.get("finding_ids", ()):
+            values[f"findings/{finding_id}.json"] = (bundle / "findings" / f"{finding_id}.json").read_bytes()
+        for attestation_id in manifest.get("semantic_attestation_ids", ()):
+            values[f"attestations/{attestation_id}.json"] = (bundle / "attestations" / f"{attestation_id}.json").read_bytes()
+        for edge_id in manifest.get("edge_ids", ()):
+            values[f"edges/{edge_id}.json"] = (bundle / "graph" / f"{edge_id}.json").read_bytes()
+        provenance_path = bundle / "provenance.json"
+        provenance = {} if not provenance_path.exists() else _canonical_member(provenance_path.read_bytes(), "provenance.json")
+        if not isinstance(provenance, Mapping):
+            raise SelectedClosureError("revision provenance must be an object")
+        return snapshot, values, provenance
+    except (OSError, UnicodeDecodeError, SchemaError, ArtifactError, KeyError, TypeError, ValueError) as exc:
+        if isinstance(exc, SelectedClosureError):
+            raise
+        raise SelectedClosureError(f"cannot load selected revision {revision_id}") from exc
+
+
+def load_selected_closure(
+    revisions: RevisionStore | Path | str,
+    revision_id: str | None = None,
+) -> SelectedClosure:
+    """Load and validate the selected revision exactly once.
+
+    ``revision_id`` is explicit whenever a revision is selected.  Omitting it
+    reads only the active pointer; it never searches revision history.  A
+    missing active revision is the explicit empty pre-first-run closure.
+    """
+    if isinstance(revisions, (str, Path)):
+        revisions = RevisionStore(revisions)
+    if not isinstance(revisions, (V2RevisionStore,)) and not hasattr(revisions, "verify_bundle"):
+        raise TypeError("revisions must be a RevisionStore or workspace path")
+    if revision_id is None:
+        if isinstance(revisions, V2RevisionStore):
+            revision_id = revisions.storage.active_revision_id()
+        else:
+            revision_id = _legacy_active_revision_id(revisions)
+    if revision_id is None or revision_id == "unsealed":
+        return SelectedClosure.empty()
+
+    snapshot, values, provenance = _revision_members(revisions, revision_id)
+    records: dict[str, ArtifactEnvelope] = {}
+    findings: dict[str, Finding] = {}
+    edges: dict[str, DependencyGraphEdge] = {}
+    attestations: dict[str, Mapping[str, Any]] = {}
+    for name, data in values.items():
+        if name.startswith("records/") or name.startswith("artifacts/"):
+            try:
+                record = ArtifactEnvelope.from_json(data.decode("utf-8"))
+            except (UnicodeDecodeError, SchemaError) as exc:
+                raise SelectedClosureError(f"invalid selected record: {name}") from exc
+            if record.artifact_id in records:
+                raise SelectedClosureError("duplicate selected record identity")
+            records[record.artifact_id] = record
+        elif name.startswith("findings/"):
+            try:
+                finding = Finding.from_json(data.decode("utf-8"))
+            except (UnicodeDecodeError, SchemaError) as exc:
+                raise SelectedClosureError(f"invalid selected finding: {name}") from exc
+            if finding.finding_id in findings:
+                raise SelectedClosureError("duplicate selected finding identity")
+            findings[finding.finding_id] = finding
+        elif name.startswith("edges/") or name.startswith("graph/"):
+            try:
+                edge = DependencyGraphEdge.from_json(data.decode("utf-8"))
+            except (UnicodeDecodeError, SchemaError) as exc:
+                raise SelectedClosureError(f"invalid selected edge: {name}") from exc
+            if edge.edge_id in edges:
+                raise SelectedClosureError("duplicate selected edge identity")
+            edges[edge.edge_id] = edge
+        elif name.startswith("attestations/"):
+            body = _canonical_member(data, name)
+            if not isinstance(body, Mapping) or body.get("attestation_id") in attestations:
+                raise SelectedClosureError("duplicate selected attestation identity")
+            attestations[body["attestation_id"]] = MappingProxyType(dict(body))
+
+    if snapshot.revision_id != revision_id:
+        raise SelectedClosureError("selected revision ID does not match snapshot")
+    if set(records) != set(snapshot.selected_artifact_ids) | {
+        dependency_id for record in records.values() for dependency_id in record.dependency_ids
+    }:
+        raise SelectedClosureError("selected records are not the exact archive closure")
+    if not set(snapshot.selected_finding_ids).issubset(findings):
+        raise SelectedClosureError("selected findings are missing")
+    if not set(snapshot.selected_cache_attestation_ids).issubset(attestations):
+        raise SelectedClosureError("selected attestations are missing")
+    for record in records.values():
+        if not set(record.dependency_ids).issubset(records) or not set(record.finding_ids).issubset(findings):
+            raise SelectedClosureError("selected record relationship escapes closure")
+    for finding in findings.values():
+        if not set(finding.dependency_ids).issubset(records):
+            raise SelectedClosureError("selected finding relationship escapes closure")
+    for body in attestations.values():
+        artifact_id = body.get("artifact_id")
+        if artifact_id not in records:
+            raise SelectedClosureError("selected attestation relationship escapes closure")
+        if body.get("kind") != records[artifact_id].kind or tuple(body.get("dependency_ids", ())) != records[artifact_id].dependency_ids:
+            raise SelectedClosureError("selected attestation does not bind its record")
+    for edge in edges.values():
+        if edge.parent_artifact_id not in records or edge.child_artifact_id not in records:
+            raise SelectedClosureError("selected edge relationship escapes closure")
+
+    # Detect duplicate stable identities within one persisted kind.  Artifact
+    # IDs alone are not enough: two valid envelopes can still claim one page or
+    # one effective segment.
+    seen_stable: set[tuple[str, str, str]] = set()
+    for record in records.values():
+        for field in ("page_id", "segment_id", "effective_page_id", "effective_segment_id", "concept_id", "projection_id", "translation_artifact_id"):
+            stable_id = record.payload.get(field)
+            if isinstance(stable_id, str) and stable_id:
+                key = (record.kind, field, stable_id)
+                if key in seen_stable:
+                    raise SelectedClosureError("duplicate selected stable identity")
+                seen_stable.add(key)
+
+    return SelectedClosure(revision_id, snapshot, records, findings, edges, attestations, provenance)
+
+
+# Compatibility spelling used by callers that treat this as a store method.
+selected_closure = load_selected_closure
+
+
 def _input_failure(path: Path | str, error: BaseException) -> BookDiscovery:
     return BookDiscovery(None, (), (), InvocationFailure.input_access(path, error))
 
@@ -123,10 +523,15 @@ def _persist_discovery(
     historical_pages: tuple[PageRecord, ...],
     findings: tuple[Finding, ...],
 ) -> None:
+    # A legacy workspace is read/verify-only.  In particular, do not let the
+    # discovery compatibility path create a v2 DB or call the legacy adapter's
+    # mutation guard while merely reading old state.
+    store = ArtifactStore(workspace)
+    if isinstance(store, LegacyReadOnlyArtifactStore):
+        return
     workspace.mkdir(parents=True, exist_ok=True)
     # Persist findings independently through Task 3 immutable storage, then
     # retain IDs in the small discovery snapshot for inspectability.
-    store = ArtifactStore(workspace)
     for finding in findings:
         store.put_finding(finding)
     known = {page.page_id: page for page in historical_pages}
