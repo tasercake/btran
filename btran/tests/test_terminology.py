@@ -187,6 +187,8 @@ def test_tier_zero_fallback_reuses_each_selected_concept_and_target_sharing_key(
     ("pi_call", "primary_kind", "primary_category"),
     [
         (lambda _: '{"entries": []}', "terminology_consolidation_invalid", "validation"),
+        (lambda _: None, "terminology_consolidation_failed", "failure"),
+        (lambda _: "", "terminology_consolidation_failed", "failure"),
         (lambda _: (_ for _ in ()).throw(RuntimeError("offline")), "terminology_consolidation_failed", "failure"),
     ],
 )

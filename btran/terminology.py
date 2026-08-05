@@ -930,6 +930,13 @@ def consolidate_candidate_table(table: CandidateTable, *, source_lang: str, targ
             response = pi_call(prompt)
     except BaseException:
         return ConsolidationResult(tuple(), tuple(_candidate_fallback_entries(table)), True, (), (), "failure")
+    # A completed call with no usable response is an operational/model
+    # failure, not a validation rejection.  There is no response payload to
+    # validate; callers may still record the separate selected-tier-0 fallback.
+    if response is None or (
+        isinstance(response, (str, bytes)) and not response.strip()
+    ):
+        return ConsolidationResult(tuple(), tuple(_candidate_fallback_entries(table)), True, (), (), "failure")
     try:
         entries = _parse_entries(response)
         valid, offending, missing = _validate_sparse_entries(entries, table)
