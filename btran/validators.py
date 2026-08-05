@@ -7,12 +7,14 @@ from dataclasses import dataclass
 from typing import Any
 
 from btran.artifacts import ArtifactStore, artifact_id_for, validation_semantic_key
+from btran.orchestrator_contract import SelectedEffectiveContent
 from btran.reconciliation import ReconciliationArtifact
 from btran.schema import (
     ConfidenceAssessment,
     EffectivePage,
     EffectiveSegment,
     Finding,
+    actionable_uncertainty_finding,
     PageExtraction,
     PageResult,
     SourceBlock,
@@ -20,7 +22,6 @@ from btran.schema import (
     TranslatedBlock,
     review_requests_for,
     stage_summary_finding,
-    uncertainty_finding,
 )
 
 VALID_BLOCK_TYPES = frozenset({"heading", "paragraph", "caption", "footnote", "table", "list_item", "pull_quote", "illustration", "quote", "page_number"})
@@ -136,7 +137,7 @@ class ValidationRuleResult:
 @dataclass(frozen=True)
 class ValidationArtifact:
     artifact_id: str
-    reconciliation_artifact_id: str
+    reconciliation_artifact_id: str | None
     effective_page_artifact_ids: tuple[str, ...]
     rule_results: tuple[ValidationRuleResult, ...]
     finding_ids: tuple[str, ...]
@@ -147,20 +148,79 @@ class ValidationArtifact:
 
 
 def _selected_effective_pages(value: Any, store: ArtifactStore) -> tuple[tuple[str, EffectivePage, tuple[tuple[str, EffectiveSegment], ...]], ...]:
+    """Adapt selected content to the legacy rule input without reloading it.
+
+    ``SelectedEffectiveContent`` is already an immutable, validated view from
+    the one selected-closure traversal.  Its page/segment order is semantic;
+    never consult the store to revalidate or reconstruct that closure.  The
+    artifact-ID path below remains for migration callers that have not yet
+    adopted the view contract.
+    """
+    if isinstance(value, SelectedEffectiveContent):
+        # The content view carries decoded records, but logical identities are
+        # not ArtifactStore addresses.  Persisted page/segment IDs must come
+        # from the selected-closure contract; never substitute
+        # ``effective_page_id`` or ``effective_segment_id`` and never reload
+        # the selected state to discover them.
+        page_artifact_ids = getattr(value, "page_artifact_ids", None)
+        if page_artifact_ids is None:
+            page_artifact_ids = getattr(value, "effective_page_artifact_ids", None)
+        selected_segment_artifact_ids = getattr(value, "segment_artifact_ids", None)
+        if selected_segment_artifact_ids is None:
+            selected_segment_artifact_ids = getattr(value, "effective_segment_artifact_ids", None)
+        if isinstance(page_artifact_ids, (tuple, list)) and isinstance(selected_segment_artifact_ids, (tuple, list)):
+            page_artifact_ids = tuple(page_artifact_ids)
+            selected_segment_artifact_ids = tuple(selected_segment_artifact_ids)
+            expected_segments = sum(len(ordered.segments) for ordered in value.pages)
+            if (len(page_artifact_ids) != len(value.pages)
+                    or len(selected_segment_artifact_ids) != expected_segments
+                    or any(not isinstance(item, str) or not item for item in (*page_artifact_ids, *selected_segment_artifact_ids))):
+                raise ValueError("selected closure artifact IDs are invalid")
+            offset = 0
+            output = []
+            for ordered, page_artifact_id in zip(value.pages, page_artifact_ids):
+                count = len(ordered.segments)
+                segment_artifact_ids = selected_segment_artifact_ids[offset:offset + count]
+                offset += count
+                output.append((
+                    page_artifact_id,
+                    ordered.page,
+                    tuple(zip(segment_artifact_ids, ordered.segments)),
+                ))
+            return tuple(output)
+        raise ValueError("selected closure must supply persisted page and segment artifact IDs")
+
     leaves = getattr(value, "leaves", value)
-    if not isinstance(leaves, (tuple, list)): raise ValueError("effective pages must be Task-10 leaves or selected page artifact IDs")
+    if not isinstance(leaves, (tuple, list)):
+        raise ValueError("effective pages must be selected page artifact IDs")
     output = []
+    seen_page_ids: set[str] = set()
     for item in leaves:
         artifact_id = item.page_artifact_id if hasattr(item, "page_artifact_id") else item
+        if not isinstance(artifact_id, str):
+            raise ValueError("effective page artifact ID is invalid")
         envelope = store.get(artifact_id)
-        if envelope.kind != "EffectiveTargetPage": raise ValueError("validation requires selected effective target pages")
-        page = EffectivePage.from_dict(envelope.payload); segments = []
+        if envelope.kind != "EffectiveTargetPage":
+            raise ValueError("validation requires selected effective target pages")
+        page = EffectivePage.from_dict(envelope.payload)
+        if page.page_id in seen_page_ids:
+            raise ValueError("effective pages duplicate page identity")
+        seen_page_ids.add(page.page_id)
+        children = {}
         for child_id in envelope.dependency_ids:
             child = store.get(child_id)
             if child.kind in {"EffectiveTargetSegment", "DiagnosticEffectiveTargetSegment"}:
-                segments.append((child.artifact_id, EffectiveSegment.from_dict(child.payload)))
-        if tuple(item[1].effective_segment_id for item in segments) != page.effective_segment_ids: raise ValueError("effective page segment closure/order is invalid")
-        output.append((envelope.artifact_id, page, tuple(segments)))
+                segment = EffectiveSegment.from_dict(child.payload)
+                if segment.effective_segment_id in children:
+                    raise ValueError("effective page contains duplicate segment identity")
+                children[segment.effective_segment_id] = (child.artifact_id, segment)
+        try:
+            segments = tuple(children[segment_id] for segment_id in page.effective_segment_ids)
+        except KeyError as exc:
+            raise ValueError("effective page segment closure/order is invalid") from exc
+        if set(children) != set(page.effective_segment_ids):
+            raise ValueError("effective page has extra segment children")
+        output.append((envelope.artifact_id, page, segments))
     return tuple(output)
 
 
@@ -191,79 +251,194 @@ def _rule_language(pages: tuple[tuple[str, EffectivePage, tuple[tuple[str, Effec
     return tuple(errors)
 
 
-def _rule_reconciliation(_: tuple[tuple[str, EffectivePage, tuple[tuple[str, EffectiveSegment], ...]], ...], reconciliation: ReconciliationArtifact, mode: str) -> tuple[str, ...]:
+def _rule_reconciliation(_: tuple[tuple[str, EffectivePage, tuple[tuple[str, EffectiveSegment], ...]], ...], reconciliation: ReconciliationArtifact | None, mode: str) -> tuple[str, ...]:
     if mode == "native": return ()
     return tuple(f"reconciliation {issue.kind}: {', '.join(issue.subject_ids)}" for issue in reconciliation.issues)
 
 
-def _rules(mode: str) -> dict[str, Callable[[Any, ReconciliationArtifact, str], Sequence[str]]]:
+def _rules(mode: str) -> dict[str, Callable[[Any, ReconciliationArtifact | None, str], Sequence[str]]]:
     values = {"effective_structure": _rule_structure, "non_empty_text": _rule_non_empty, "source_language" if mode == "native" else "translation_language": _rule_language}
     if mode != "native": values["reconciliation_terms"] = _rule_reconciliation
     return values
 
 
-def _validation_payload(reconciliation_id: str, page_ids: Sequence[str], results: Sequence[ValidationRuleResult], status: str, error: Mapping[str, Any] | None) -> dict[str, Any]:
-    return {"reconciliation_artifact_id": reconciliation_id, "effective_page_artifact_ids": list(sorted(set(page_ids))), "rule_results": [result.to_dict() for result in results], "status": status, "error_evidence": dict(error) if error else None, "rules_version": "validation-v1"}
+def _validation_payload(reconciliation_id: str | None, page_ids: Sequence[str], results: Sequence[ValidationRuleResult], status: str, error: Mapping[str, Any] | None) -> dict[str, Any]:
+    # Page order is semantic input.  Do not replace it with artifact-address
+    # order merely because dependency IDs are stored canonically sorted.
+    ordered_page_ids = tuple(dict.fromkeys(page_ids))
+    return {"reconciliation_artifact_id": reconciliation_id, "effective_page_artifact_ids": list(ordered_page_ids), "rule_results": [result.to_dict() for result in results], "status": status, "error_evidence": dict(error) if error else None, "rules_version": "validation-v1"}
 
 
 def _put_validation_assessment(store: ArtifactStore, *, validation_id: str, subject: str, review_subject_ids: Sequence[str], base_ids: Sequence[str], base_revision_id: str, signal: str, validation_error: bool) -> tuple[str, tuple[str, ...]]:
     degraded = not validation_error
     signals = tuple(sorted({"fallback", signal})) if degraded else (signal,)
     assessment = ConfidenceAssessment(subject_id=subject, producing_stage="validation", producing_artifact_id=validation_id, score=None if degraded else 0, signals=signals)
-    uncertainty = uncertainty_finding(assessment); store.put_finding(uncertainty)
+    finding_ids: list[str] = []
+    # Routine confidence is intentionally not persisted as per-object
+    # uncertainty.  Only the FC1 actionable helper can create an audit finding.
+    actionable = actionable_uncertainty_finding(assessment)
+    if actionable is not None:
+        store.put_finding(actionable)
+        finding_ids.append(actionable.finding_id)
     requests = review_requests_for(assessment=assessment, degraded_or_fallback=degraded, validation_error=validation_error, stage="validation", subject_ids=tuple(sorted(set(review_subject_ids))), suggested_correction_kind="target_segment", base_revision_id=base_revision_id, base_artifact_ids=tuple(sorted(set(base_ids))), scope="segment")
-    finding_ids = [uncertainty.finding_id]
-    for finding in requests: store.put_finding(finding); finding_ids.append(finding.finding_id)
+    for finding in requests:
+        store.put_finding(finding)
+        finding_ids.append(finding.finding_id)
     artifact = store.put(VALIDATION_ASSESSMENT_KIND, assessment.to_dict(), dependency_ids=(validation_id,), finding_ids=tuple(sorted(finding_ids)), semantic_key=f"confidence:{validation_id}:{subject}")
     return artifact.artifact_id, tuple(sorted(finding_ids))
 
 
-def validate_effective(*, effective_pages: Any, reconciliation: ReconciliationArtifact, store: ArtifactStore, base_revision_id: str, mode: str, rules: Mapping[str, Callable[[Any, ReconciliationArtifact, str], Sequence[str]]] | None = None) -> ValidationArtifact:
+def _error_category(rule: str, error: str) -> tuple[str, str]:
+    """Map validator observations to FC7 without guessing from prose.
+
+    Validator rule errors are validation findings.  Only an explicitly named
+    ambiguous mapping is allowed to retain the more specific audit category;
+    words such as ``conflict`` in ordinary rule text are not evidence of a
+    reconciliation conflict.
+    """
+    text = error.casefold()
+    if re.search(r"(?:^|[\s:_-])ambiguous[\s_-]+mapping(?:$|[\s:,_-])", text):
+        return "actionable_ambiguity", "explicit ambiguous mapping"
+    return "validation", "validator rule error"
+
+
+def _affected_ids(page_ids: Sequence[str], subjects: Sequence[str], reconciliation_id: str | None) -> tuple[str, ...]:
+    values = tuple(sorted(set(item for item in subjects if isinstance(item, str) and item)))
+    if values:
+        return values
+    if page_ids:
+        return tuple(sorted(set(page_ids)))
+    if reconciliation_id is not None:
+        return (reconciliation_id,)
+    # A setup failure can occur before any selected leaf or reconciliation is
+    # available.  Keep its subject a deterministic content identity rather
+    # than the stage name, which is not an affected stable object.
+    return (artifact_id_for("ValidationInput", {"effective_page_artifact_ids": []}),)
+
+
+def _classified_finding(*, kind: str, category: str, trigger: str, subjects: Sequence[str], evidence: Mapping[str, Any], message: str, dependency_ids: Sequence[str]) -> Finding:
+    return Finding(
+        kind=kind, severity="error" if category == "failure" else "warning", stage="validation",
+        audit_category=category, subject_refs=tuple(sorted(set(subjects))),
+        evidence={**dict(evidence), "trigger": trigger}, message=message,
+        dependency_ids=tuple(sorted(set(dependency_ids))),
+    )
+
+
+def validate_effective(*, effective_pages: Any, reconciliation: ReconciliationArtifact | None, store: ArtifactStore, base_revision_id: str, mode: str, rules: Mapping[str, Callable[[Any, ReconciliationArtifact | None, str], Sequence[str]]] | None = None) -> ValidationArtifact:
     """Run independently-contained rules over selected effective content.
 
-    ``reconciliation`` is a required typed semantic input. All exceptions turn
-    into persisted diagnostics and a degraded artifact; no exception gates render.
+    Native validation has no reconciliation input: source structure, text, and
+    language rules remain active, while translated validation requires its
+    selected reconciliation artifact. All exceptions become diagnostics.
     """
-    page_ids: tuple[str, ...] = (); results: list[ValidationRuleResult] = []; findings: list[str] = []; assessment_ids: list[str] = []; error: Mapping[str, Any] | None = None; status = "completed"
+    page_ids: tuple[str, ...] = (); results: list[ValidationRuleResult] = []; findings: list[str] = []; assessment_ids: list[str] = []; error: Mapping[str, Any] | None = None; status = "completed"; selected_reconciliation: ReconciliationArtifact | None = None
     try:
-        if not isinstance(reconciliation, ReconciliationArtifact): raise ValueError("validation requires explicit ReconciliationArtifact")
         if mode not in {"native", "translated"}: raise ValueError("validation mode is invalid")
+        if mode == "translated" and not isinstance(reconciliation, ReconciliationArtifact):
+            raise ValueError("translated validation requires explicit ReconciliationArtifact")
+        # Native output cannot depend on translated reconciliation. Ignore any
+        # legacy caller value so it cannot enter findings, dependencies, or keys.
+        selected_reconciliation = reconciliation if mode == "translated" else None
         pages = _selected_effective_pages(effective_pages, store)
-        page_ids = tuple(sorted(item[0] for item in pages))
+        # Preserve the selected page sequence.  Canonical dependency/index order
+        # is not a declared content order.
+        page_ids = tuple(item[0] for item in pages)
         active_rules = dict(_rules(mode) if rules is None else rules)
         if not active_rules or any(not isinstance(name, str) or not name or not callable(rule) for name, rule in active_rules.items()): raise ValueError("validation rules are invalid")
         for name in sorted(active_rules):
             try:
-                errors = tuple(str(item) for item in active_rules[name](pages, reconciliation, mode))
+                errors = tuple(str(item) for item in active_rules[name](pages, selected_reconciliation, mode))
                 results.append(ValidationRuleResult(name, errors))
             except Exception as exc:
                 status = "degraded"; detail = {"exception_type": type(exc).__name__, "message": str(exc)}
                 results.append(ValidationRuleResult(name, (), detail))
-                finding = Finding(kind="validator_exception", severity="error", stage="validation", subject_refs=(name,), evidence={"rule": name, **detail}, message="Validator rule failed; remaining rules continued.", dependency_ids=(reconciliation.artifact_id,))
+                reconciliation_id = selected_reconciliation.artifact_id if selected_reconciliation is not None else None
+                subjects = _affected_ids(page_ids, (), reconciliation_id)
+                finding = _classified_finding(
+                    kind="validator_exception", category="failure", trigger="validator_exception",
+                    subjects=subjects, evidence={"rule": name, **detail},
+                    message="Validator rule failed; remaining rules continued.",
+                    dependency_ids=((reconciliation_id,) if reconciliation_id is not None else ()),
+                )
                 store.put_finding(finding); findings.append(finding.finding_id)
+                # The stage continues with diagnostic/minimal output, which is a
+                # separate fallback condition from the primary failure.
+                fallback = _classified_finding(
+                    kind="validation_fallback", category="fallback", trigger="continued_diagnostic_output",
+                    subjects=subjects, evidence={"rule": name, "failure_finding_id": finding.finding_id},
+                    message="Diagnostic validation output continued after a validator failure.",
+                    dependency_ids=((reconciliation_id,) if reconciliation_id is not None else ()),
+                )
+                store.put_finding(fallback); findings.append(fallback.finding_id)
     except Exception as exc:
         status = "degraded"; error = {"exception_type": type(exc).__name__, "message": str(exc)}
-        reconciliation_id = reconciliation.artifact_id if isinstance(reconciliation, ReconciliationArtifact) else "unavailable-reconciliation-artifact"
-        finding = Finding(kind="validation_exception", severity="error", stage="validation", subject_refs=(reconciliation_id,), evidence=dict(error), message="Validation setup/aggregation failed; diagnostic content remains renderable.", dependency_ids=())
+        reconciliation_id = selected_reconciliation.artifact_id if selected_reconciliation is not None else None
+        subjects = _affected_ids(page_ids, (), reconciliation_id)
+        dependency_ids = (reconciliation_id,) if reconciliation_id is not None else ()
+        finding = _classified_finding(
+            kind="validation_exception", category="failure", trigger="validation_exception",
+            subjects=subjects, evidence=dict(error),
+            message="Validation setup/aggregation failed; diagnostic content remains renderable.",
+            dependency_ids=dependency_ids,
+        )
         store.put_finding(finding); findings.append(finding.finding_id)
-    reconciliation_id = reconciliation.artifact_id if isinstance(reconciliation, ReconciliationArtifact) else "unavailable-reconciliation-artifact"
+        fallback = _classified_finding(
+            kind="validation_fallback", category="fallback", trigger="continued_diagnostic_output",
+            subjects=subjects, evidence={"failure_finding_id": finding.finding_id},
+            message="Diagnostic validation output continued after validation failure.",
+            dependency_ids=dependency_ids,
+        )
+        store.put_finding(fallback); findings.append(fallback.finding_id)
+    reconciliation_id = selected_reconciliation.artifact_id if selected_reconciliation is not None else None
     payload = _validation_payload(reconciliation_id, page_ids, results, status, error)
-    dependencies = tuple(sorted(set((*page_ids, reconciliation_id)))) if reconciliation_id != "unavailable-reconciliation-artifact" else page_ids
+    dependencies = tuple(sorted(set((*page_ids, reconciliation_id)))) if reconciliation_id is not None else page_ids
     validation_id = artifact_id_for(VALIDATION_ARTIFACT_KIND, payload, dependencies)
     review_subject_ids = tuple(sorted({segment.segment_id for _, _, segments in locals().get("pages", ()) for _, segment in segments}))
     for result in results:
-        if result.errors or result.exception:
-            subjects = review_subject_ids or (result.rule,)
-            finding = Finding(kind="validation_error" if result.errors else "validator_exception", severity="warning" if result.errors else "error", stage="validation", subject_refs=subjects, evidence=result.to_dict(), message="Validation observation retained as informational content.", dependency_ids=(reconciliation_id,) if reconciliation_id != "unavailable-reconciliation-artifact" else ())
-            store.put_finding(finding); findings.append(finding.finding_id)
-            assessment_id, ids = _put_validation_assessment(store, validation_id=validation_id, subject=result.rule, review_subject_ids=subjects, base_ids=page_ids or dependencies, base_revision_id=base_revision_id, signal="validation_error" if result.errors else "validator_exception", validation_error=bool(result.errors))
+        if result.errors:
+            subjects = _affected_ids(page_ids, review_subject_ids, reconciliation_id)
+            # Keep one finding per observed error so mixed reconciliation
+            # outcomes retain their exact classifications.
+            for error_text in result.errors:
+                category, trigger = _error_category(result.rule, error_text)
+                finding = _classified_finding(
+                    kind="validation_error", category=category, trigger=trigger,
+                    subjects=subjects, evidence={"rule": result.rule, "error": error_text},
+                    message="Validation observation retained as informational content.",
+                    dependency_ids=((reconciliation_id,) if reconciliation_id is not None else ()),
+                )
+                store.put_finding(finding); findings.append(finding.finding_id)
+            # Preserve the compatibility review-request finding, while the
+            # actionable uncertainty helper supplies the audit classification.
+            assessment_id, ids = _put_validation_assessment(
+                store, validation_id=validation_id, subject=subjects[0],
+                review_subject_ids=subjects, base_ids=page_ids or dependencies,
+                base_revision_id=base_revision_id, signal="validation_error",
+                validation_error=True,
+            )
+            assessment_ids.append(assessment_id); findings.extend(ids)
+        elif result.exception:
+            subjects = _affected_ids(page_ids, review_subject_ids, reconciliation_id)
+            assessment_id, ids = _put_validation_assessment(
+                store, validation_id=validation_id, subject=subjects[0],
+                review_subject_ids=subjects, base_ids=page_ids or dependencies,
+                base_revision_id=base_revision_id, signal="fallback",
+                validation_error=False,
+            )
             assessment_ids.append(assessment_id); findings.extend(ids)
     if error is not None:
         bases = page_ids or dependencies
         if bases:
-            assessment_id, ids = _put_validation_assessment(store, validation_id=validation_id, subject="validation", review_subject_ids=("validation",), base_ids=bases, base_revision_id=base_revision_id, signal="degraded", validation_error=False)
+            setup_subjects = _affected_ids(page_ids, (), reconciliation_id)
+            assessment_id, ids = _put_validation_assessment(
+                store, validation_id=validation_id, subject=setup_subjects[0],
+                review_subject_ids=setup_subjects, base_ids=bases, base_revision_id=base_revision_id,
+                signal="degraded", validation_error=False,
+            )
             assessment_ids.append(assessment_id); findings.extend(ids)
-    summary = stage_summary_finding("validation", status, {"pages": len(page_ids), "rules": len(results), "errors": sum(bool(item.errors) for item in results), "rule_exceptions": sum(item.exception is not None for item in results), "setup_exceptions": int(error is not None)}, subject_refs=tuple(sorted({*page_ids, reconciliation_id})))
+    summary_subjects = tuple(sorted({*page_ids, *(([reconciliation_id]) if reconciliation_id is not None else ())}))
+    summary = stage_summary_finding("validation", status, {"pages": len(page_ids), "rules": len(results), "errors": sum(bool(item.errors) for item in results), "rule_exceptions": sum(item.exception is not None for item in results), "setup_exceptions": int(error is not None)}, subject_refs=summary_subjects)
     store.put_finding(summary); findings.append(summary.finding_id)
     # Reuse must key on selected reconciliation artifact, never only on page
     # content.  Projection IDs are retained in that selected reconciliation
@@ -271,10 +446,16 @@ def validate_effective(*, effective_pages: Any, reconciliation: ReconciliationAr
     target_langs = tuple(sorted({segment.render_lang for _, _, segments in locals().get("pages", ())
                                 for _, segment in segments if segment.render_lang}))
     target_lang = None if mode == "native" else (target_langs[0] if len(target_langs) == 1 else None)
+    # The native key still needs a deterministic authority component for the
+    # existing semantic-key API, but it is not a reconciliation artifact and
+    # is never persisted or traversed.
+    semantic_reconciliation_id = reconciliation_id or artifact_id_for(
+        "NativeValidationInput", {"effective_page_artifact_ids": list(page_ids)}, page_ids,
+    )
     semantic_key = validation_semantic_key(
         rules_version="validation-v1", mode=mode, target_lang=target_lang,
-        effective_page_ids=page_ids, reconciliation_artifact_id=reconciliation_id,
-        projection_ids=reconciliation.projection_artifact_ids if isinstance(reconciliation, ReconciliationArtifact) else (),
+        effective_page_ids=page_ids, reconciliation_artifact_id=semantic_reconciliation_id,
+        projection_ids=selected_reconciliation.projection_artifact_ids if selected_reconciliation is not None else (),
     )
     envelope = store.put(VALIDATION_ARTIFACT_KIND, payload, dependency_ids=dependencies,
                          finding_ids=tuple(sorted(set(findings))), semantic_key=semantic_key)

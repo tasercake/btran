@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from btran.artifacts import ArtifactStore
+from btran.orchestrator_contract import OrderedEffectivePage, SelectedEffectiveContent
 from btran.reconciliation import reconcile_effective
 from btran.schema import EffectivePage, EffectiveSegment
 from btran.validators import (
@@ -84,6 +85,10 @@ def test_validation_setup_failure_with_selected_page_keeps_sorted_fallback_signa
     assert {item.kind for item in findings} >= {
         "validation_exception", "uncertainty", "review_request", "stage_summary",
     }
+    audit_findings = [item for item in findings if item.audit_category is not None]
+    assert audit_findings
+    assert all("validation" not in item.subject_refs for item in audit_findings)
+    assert all(item.subject_refs for item in audit_findings)
 
 
 def test_validation_semantic_key_and_dependency_change_with_selected_reconciliation(tmp_path):
@@ -109,12 +114,131 @@ def test_validation_semantic_key_and_dependency_change_with_selected_reconciliat
     assert store.get(first_validation.artifact_id).semantic_key != store.get(second_validation.artifact_id).semantic_key
 
 
+def test_validation_preserves_selected_page_and_declared_segment_order(tmp_path):
+    store = ArtifactStore(tmp_path / "store")
+    page_ids = []
+    for page_name in ("page-a", "page-b"):
+        segment = EffectiveSegment(
+            effective_segment_id=f"{page_name}-segment", segment_id=f"{page_name}-source",
+            source_lang="en", source_text=page_name, effective_text=page_name,
+            render_lang="en", mode="native",
+        )
+        target = store.put("EffectiveTargetSegment", segment.to_dict(), semantic_key=f"target-{page_name}")
+        page = EffectivePage(
+            effective_page_id=f"effective-{page_name}", page_id=page_name,
+            effective_segment_ids=(segment.effective_segment_id,), source_langs=("en",),
+        )
+        target_page = store.put("EffectiveTargetPage", page.to_dict(), dependency_ids=(target.artifact_id,), semantic_key=f"page-{page_name}")
+        page_ids.append(target_page.artifact_id)
+    reconciliation = reconcile_effective(effective_pages=tuple(reversed(page_ids)), projections=(), store=store, base_revision_id="revision-1")
+    observed = []
+
+    def ordered(pages, *_):
+        observed.extend(page.page_id for _, page, segments in pages for _, segment in segments)
+        return ()
+
+    result = validate_effective(
+        effective_pages=tuple(reversed(page_ids)), reconciliation=reconciliation,
+        store=store, base_revision_id="revision-1", mode="native", rules={"ordered": ordered},
+    )
+    assert observed == ["page-b", "page-a"]
+    assert result.effective_page_artifact_ids == tuple(reversed(page_ids))
+    payload = store.get(result.artifact_id).payload
+    assert payload["effective_page_artifact_ids"] == list(reversed(page_ids))
+
+
+def test_validation_findings_use_fc7_categories_and_keep_continuation(tmp_path):
+    store, page_id, reconciliation = _inputs(tmp_path)
+
+    def errors(*_):
+        return ("missing_term", "context_conflict for selected mapping", "ambiguous mapping")
+
+    def broken(*_):
+        raise RuntimeError("validator broke")
+
+    result = validate_effective(
+        effective_pages=(page_id,), reconciliation=reconciliation, store=store,
+        base_revision_id="revision-1", mode="translated",
+        rules={"errors": errors, "broken": broken},
+    )
+    findings = [store.get_finding(item) for item in result.finding_ids]
+    categories = {item.audit_category for item in findings if item.audit_category is not None}
+    assert {"validation", "actionable_ambiguity", "failure", "fallback"} <= categories
+    assert not any(
+        item.audit_category == "conflict"
+        for item in findings
+    )
+    assert all(item.requires_action is False for item in findings)
+    assert any(item.kind == "stage_summary" and item.audit_category is None for item in findings)
+
+
+def test_validation_consumes_selected_effective_content_without_store_reads(tmp_path, monkeypatch):
+    store, page_id, reconciliation = _inputs(tmp_path)
+    page_envelope = store.get(page_id)
+    segment_envelope = store.get(page_envelope.dependency_ids[0])
+    selected = SelectedEffectiveContent((OrderedEffectivePage(
+        EffectivePage.from_dict(page_envelope.payload),
+        (EffectiveSegment.from_dict(segment_envelope.payload),),
+    ),))
+    # The selected content view keeps logical records separate from the
+    # persisted closure addresses used by validation artifacts.
+    object.__setattr__(selected, "page_artifact_ids", (page_envelope.artifact_id,))
+    object.__setattr__(selected, "segment_artifact_ids", (segment_envelope.artifact_id,))
+    observed = []
+
+    def ordered(pages, *_):
+        observed.extend((page_id, segment.segment_id) for page_id, _, segments in pages for _, segment in segments)
+        return ()
+
+    def fail_reload(_):
+        raise AssertionError("selected closure must not be reloaded from ArtifactStore")
+
+    monkeypatch.setattr(store, "get", fail_reload)
+    result = validate_effective(
+        effective_pages=selected, reconciliation=reconciliation, store=store,
+        base_revision_id="revision-1", mode="translated", rules={"ordered": ordered},
+    )
+
+    assert result.status == "completed"
+    assert observed == [(page_id, "segment-1")]
+    assert result.effective_page_artifact_ids == (page_id,)
+
+
+def test_selected_content_native_validation_persists_store_record_ids(tmp_path, monkeypatch):
+    store, page_id, reconciliation = _inputs(tmp_path)
+    page_envelope = store.get(page_id)
+    segment_envelope = store.get(page_envelope.dependency_ids[0])
+    selected = SelectedEffectiveContent((OrderedEffectivePage(
+        EffectivePage.from_dict(page_envelope.payload),
+        (EffectiveSegment.from_dict(segment_envelope.payload),),
+    ),))
+    object.__setattr__(selected, "page_artifact_ids", (page_envelope.artifact_id,))
+    object.__setattr__(selected, "segment_artifact_ids", (segment_envelope.artifact_id,))
+
+    monkeypatch.setattr(store, "get", lambda _: (_ for _ in ()).throw(
+        AssertionError("selected closure must not be reloaded from ArtifactStore")))
+    result = validate_effective(
+        effective_pages=selected, reconciliation=reconciliation, store=store,
+        base_revision_id="revision-1", mode="native",
+    )
+
+    monkeypatch.undo()
+    envelope = store.get(result.artifact_id)
+    assert result.status == "completed"
+    assert result.effective_page_artifact_ids == (page_id,)
+    assert envelope.dependency_ids == (page_id,)
+    closure_ids = {item.artifact_id for item in store.closure((result.artifact_id,))[0]}
+    assert {result.artifact_id, page_id, segment_envelope.artifact_id} <= closure_ids
+
+
 def test_native_validation_uses_source_equivalent_rules_and_omits_target_rules(tmp_path):
     store = ArtifactStore(tmp_path / "store")
     segment = EffectiveSegment(effective_segment_id="effective-segment-1", segment_id="segment-1", source_lang="en", source_text="The cat sleeps.", effective_text="The cat sleeps.", render_lang="en", mode="native")
     target = store.put("EffectiveTargetSegment", segment.to_dict(), semantic_key="target-segment-1")
     page = EffectivePage(effective_page_id="effective-page-1", page_id="page-1", effective_segment_ids=(segment.effective_segment_id,), source_langs=("en",))
     target_page = store.put("EffectiveTargetPage", page.to_dict(), dependency_ids=(target.artifact_id,), semantic_key="target-page-1")
-    reconciliation = reconcile_effective(effective_pages=(target_page.artifact_id,), projections=(), store=store, base_revision_id="revision-1")
-    result = validate_effective(effective_pages=(target_page.artifact_id,), reconciliation=reconciliation, store=store, base_revision_id="revision-1", mode="native")
+    # Native validation is meaningful without translated reconciliation.
+    result = validate_effective(effective_pages=(target_page.artifact_id,), reconciliation=None, store=store, base_revision_id="revision-1", mode="native")
     assert {item.rule for item in result.rule_results} == {"effective_structure", "non_empty_text", "source_language"}
+    assert result.reconciliation_artifact_id is None
+    assert store.get(result.artifact_id).payload["reconciliation_artifact_id"] is None
