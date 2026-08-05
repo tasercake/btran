@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import stat
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Mapping
@@ -117,6 +117,87 @@ class SelectedClosureError(ManifestValidationError):
     """A selected revision is not a self-contained, readable closure."""
 
 
+class _FrozenDict(dict):
+    """A dict-compatible recursively immutable JSON object."""
+
+    def _immutable(self, *args: Any, **kwargs: Any) -> None:
+        raise TypeError("selected closure data is immutable")
+
+    __setitem__ = __delitem__ = clear = pop = popitem = setdefault = update = _immutable
+
+    def __ior__(self, other: Any):
+        self._immutable(other)
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> "_FrozenDict":
+        return self
+
+
+class _FrozenList(list):
+    """A list-compatible recursively immutable JSON array."""
+
+    def _immutable(self, *args: Any, **kwargs: Any) -> None:
+        raise TypeError("selected closure data is immutable")
+
+    __setitem__ = __delitem__ = append = clear = extend = insert = pop = remove = reverse = sort = _immutable
+
+    def __iadd__(self, other: Any):
+        self._immutable(other)
+
+    def __imul__(self, other: Any):
+        self._immutable(other)
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> "_FrozenList":
+        return self
+
+
+def _deep_immutable(value: Any) -> Any:
+    """Freeze JSON-shaped data while preserving dict/list accessor behavior."""
+    if isinstance(value, Mapping):
+        return _FrozenDict({key: _deep_immutable(item) for key, item in value.items()})
+    if isinstance(value, list):
+        return _FrozenList(_deep_immutable(item) for item in value)
+    if isinstance(value, tuple):
+        return tuple(_deep_immutable(item) for item in value)
+    if isinstance(value, (set, frozenset)):
+        return frozenset(_deep_immutable(item) for item in value)
+    return value
+
+
+class _ImmutableArtifactEnvelope(ArtifactEnvelope):
+    """Read-only defensive view of a validated artifact envelope."""
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if getattr(self, "_selected_closure_sealed", False):
+            raise TypeError("selected closure data is immutable")
+        object.__setattr__(self, name, value)
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, ArtifactEnvelope):
+            return NotImplemented
+        return all(getattr(self, name) == getattr(other, name) for name in (
+            "schema_version", "artifact_id", "kind", "payload", "dependency_ids",
+            "finding_ids", "semantic_key",
+        ))
+
+
+def _immutable_artifact(record: ArtifactEnvelope) -> ArtifactEnvelope:
+    """Copy a validated record into a read-only view without validating again."""
+    view = object.__new__(_ImmutableArtifactEnvelope)
+    for item in fields(record):
+        object.__setattr__(view, item.name, _deep_immutable(getattr(record, item.name)))
+    object.__setattr__(view, "_selected_closure_sealed", True)
+    return view
+
+
+def _freeze_record_data(record: Any) -> None:
+    """Freeze mutable nested fields of an already parsed schema record."""
+    for item in fields(record):
+        value = getattr(record, item.name)
+        frozen = _deep_immutable(value)
+        if frozen is not value:
+            object.__setattr__(record, item.name, frozen)
+
+
 def _expected_selected_closure_ids(
     snapshot: RevisionSnapshot,
     records: Mapping[str, ArtifactEnvelope],
@@ -193,6 +274,10 @@ class SelectedClosure:
             raise TypeError("selected closure snapshot must be a RevisionSnapshot")
         if self.snapshot.revision_id != self.revision_id:
             raise ValueError("selected closure revision ID does not match snapshot")
+        for ordered_page in self._ordered_pages:
+            _freeze_record_data(ordered_page.page)
+            for segment in ordered_page.segments:
+                _freeze_record_data(segment)
         maps = {
             "records": self.records, "findings": self.findings,
             "edges": self.edges, "attestations": self.attestations,
@@ -201,6 +286,16 @@ class SelectedClosure:
         for name, value in maps.items():
             if not isinstance(value, Mapping):
                 raise TypeError(f"selected closure {name} must be a mapping")
+            if name == "records":
+                value = {
+                    key: item if isinstance(item, _ImmutableArtifactEnvelope) else _immutable_artifact(item)
+                    for key, item in value.items()
+                }
+            elif name == "findings":
+                for item in value.values():
+                    _freeze_record_data(item)
+            elif name in {"attestations", "provenance"}:
+                value = _deep_immutable(value)
             object.__setattr__(self, name, MappingProxyType(dict(value)))
         # The selected archive is the authority.  Do not silently broaden it
         # from a mutable index or from historical records.  Finding

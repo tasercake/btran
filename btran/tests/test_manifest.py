@@ -183,6 +183,8 @@ def test_selected_closure_loads_archive_once_and_preserves_declared_segment_orde
     assert closure.ordered_effective_pages[0].segments[0].effective_segment_id == "effective-segment-1"
     assert closure.ordered_effective_segments[0].effective_segment_id == "effective-segment-1"
     assert closure.selected_effective_content.pages == closure.ordered_effective_pages
+    with pytest.raises(TypeError):
+        closure.ordered_effective_pages[0].page.display_metadata["page_number"] = 2
     assert closure.provenance == {}
     assert closure.final_finding_ids == ()
     with pytest.raises(TypeError):
@@ -194,6 +196,35 @@ def test_selected_closure_loads_archive_once_and_preserves_declared_segment_orde
     # Loading validates the archive once; all later views use the in-memory
     # SelectedClosure rather than reopening or rescanning the selected ZIP.
     assert verify_calls == 1
+
+
+def test_selected_closure_freezes_nested_record_data(tmp_path):
+    store = ArtifactStore(tmp_path)
+    record = store.put(
+        "NestedPayload",
+        {"outer": {"items": [{"value": "before"}]}},
+        semantic_key="nested-payload",
+    )
+    snapshot = RevisionSnapshot(
+        revision_id="deep-immutable",
+        selected_artifact_ids=(record.artifact_id,),
+    )
+    RevisionStore(tmp_path).seal_bundle(
+        snapshot, {"outer": {"items": ["before"]}}, b"",
+    )
+
+    closure = load_selected_closure(RevisionStore(tmp_path), snapshot.revision_id)
+    selected = closure.record(record.artifact_id)
+
+    with pytest.raises(TypeError):
+        selected.payload["outer"]["items"][0]["value"] = "after"
+    with pytest.raises(TypeError):
+        selected.payload["outer"]["items"].append({"value": "after"})
+    with pytest.raises(TypeError):
+        selected.payload = {}
+    with pytest.raises(TypeError):
+        selected.kind = "mutated"
+    assert selected.payload["outer"]["items"][0]["value"] == "before"
 
 
 def test_selected_closure_accepts_translated_closure_with_source_and_target_pages(tmp_path):
