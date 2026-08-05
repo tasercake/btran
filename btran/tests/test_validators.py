@@ -180,6 +180,10 @@ def test_validation_consumes_selected_effective_content_without_store_reads(tmp_
         EffectivePage.from_dict(page_envelope.payload),
         (EffectiveSegment.from_dict(segment_envelope.payload),),
     ),))
+    # The selected content view keeps logical records separate from the
+    # persisted closure addresses used by validation artifacts.
+    object.__setattr__(selected, "page_artifact_ids", (page_envelope.artifact_id,))
+    object.__setattr__(selected, "segment_artifact_ids", (segment_envelope.artifact_id,))
     observed = []
 
     def ordered(pages, *_):
@@ -196,8 +200,35 @@ def test_validation_consumes_selected_effective_content_without_store_reads(tmp_
     )
 
     assert result.status == "completed"
-    assert observed == [("effective-page-1", "segment-1")]
-    assert result.effective_page_artifact_ids == ("effective-page-1",)
+    assert observed == [(page_id, "segment-1")]
+    assert result.effective_page_artifact_ids == (page_id,)
+
+
+def test_selected_content_native_validation_persists_store_record_ids(tmp_path, monkeypatch):
+    store, page_id, reconciliation = _inputs(tmp_path)
+    page_envelope = store.get(page_id)
+    segment_envelope = store.get(page_envelope.dependency_ids[0])
+    selected = SelectedEffectiveContent((OrderedEffectivePage(
+        EffectivePage.from_dict(page_envelope.payload),
+        (EffectiveSegment.from_dict(segment_envelope.payload),),
+    ),))
+    object.__setattr__(selected, "page_artifact_ids", (page_envelope.artifact_id,))
+    object.__setattr__(selected, "segment_artifact_ids", (segment_envelope.artifact_id,))
+
+    monkeypatch.setattr(store, "get", lambda _: (_ for _ in ()).throw(
+        AssertionError("selected closure must not be reloaded from ArtifactStore")))
+    result = validate_effective(
+        effective_pages=selected, reconciliation=reconciliation, store=store,
+        base_revision_id="revision-1", mode="native",
+    )
+
+    monkeypatch.undo()
+    envelope = store.get(result.artifact_id)
+    assert result.status == "completed"
+    assert result.effective_page_artifact_ids == (page_id,)
+    assert envelope.dependency_ids == (page_id,)
+    closure_ids = {item.artifact_id for item in store.closure((result.artifact_id,))[0]}
+    assert {result.artifact_id, page_id, segment_envelope.artifact_id} <= closure_ids
 
 
 def test_native_validation_uses_source_equivalent_rules_and_omits_target_rules(tmp_path):

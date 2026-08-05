@@ -157,14 +157,38 @@ def _selected_effective_pages(value: Any, store: ArtifactStore) -> tuple[tuple[s
     adopted the view contract.
     """
     if isinstance(value, SelectedEffectiveContent):
-        return tuple(
-            (
-                ordered.page.effective_page_id,
-                ordered.page,
-                tuple((segment.effective_segment_id, segment) for segment in ordered.segments),
-            )
-            for ordered in value.pages
-        )
+        # The content view carries decoded records, but logical identities are
+        # not ArtifactStore addresses.  Persisted page/segment IDs must come
+        # from the selected-closure contract; never substitute
+        # ``effective_page_id`` or ``effective_segment_id`` and never reload
+        # the selected state to discover them.
+        page_artifact_ids = getattr(value, "page_artifact_ids", None)
+        if page_artifact_ids is None:
+            page_artifact_ids = getattr(value, "effective_page_artifact_ids", None)
+        selected_segment_artifact_ids = getattr(value, "segment_artifact_ids", None)
+        if selected_segment_artifact_ids is None:
+            selected_segment_artifact_ids = getattr(value, "effective_segment_artifact_ids", None)
+        if isinstance(page_artifact_ids, (tuple, list)) and isinstance(selected_segment_artifact_ids, (tuple, list)):
+            page_artifact_ids = tuple(page_artifact_ids)
+            selected_segment_artifact_ids = tuple(selected_segment_artifact_ids)
+            expected_segments = sum(len(ordered.segments) for ordered in value.pages)
+            if (len(page_artifact_ids) != len(value.pages)
+                    or len(selected_segment_artifact_ids) != expected_segments
+                    or any(not isinstance(item, str) or not item for item in (*page_artifact_ids, *selected_segment_artifact_ids))):
+                raise ValueError("selected closure artifact IDs are invalid")
+            offset = 0
+            output = []
+            for ordered, page_artifact_id in zip(value.pages, page_artifact_ids):
+                count = len(ordered.segments)
+                segment_artifact_ids = selected_segment_artifact_ids[offset:offset + count]
+                offset += count
+                output.append((
+                    page_artifact_id,
+                    ordered.page,
+                    tuple(zip(segment_artifact_ids, ordered.segments)),
+                ))
+            return tuple(output)
+        raise ValueError("selected closure must supply persisted page and segment artifact IDs")
 
     leaves = getattr(value, "leaves", value)
     if not isinstance(leaves, (tuple, list)):
