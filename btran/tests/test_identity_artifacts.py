@@ -4,13 +4,19 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
+import os
+import sqlite3
 import zipfile
+from pathlib import Path
 
 import pytest
 
 from btran.artifacts import (
     ArtifactError,
     ArtifactStore,
+    LegacyArtifactStore,
+    LegacyRevisionStore,
     CacheValidator,
     DependencyGraph,
     RevisionStore,
@@ -43,6 +49,7 @@ from btran.identity import (
     structural_anchor_for,
 )
 from btran.schema import Finding, RevisionSnapshot, canonical_json_bytes, tagged_sha256
+from btran.storage import Storage, StorageError
 
 
 def test_source_text_and_raw_byte_page_identity_are_exact():
@@ -194,64 +201,131 @@ def _store_artifact(store, *, payload=None, semantic_key="semantic"):
     return store.put("test", payload or {"value": 1}, finding_ids=(finding.finding_id,), semantic_key=semantic_key)
 
 
-def test_artifact_store_is_content_addressed_closed_and_quarantines_bad_cache(tmp_path):
+def test_v2_put_returns_persisted_envelope_for_existing_immutable_identity(tmp_path):
+    store = ArtifactStore(tmp_path)
+    first_finding = Finding(kind="stage_summary", severity="info", stage="test", message="first")
+    second_finding = Finding(kind="stage_summary", severity="info", stage="test", message="second")
+    store.put_finding(first_finding)
+    store.put_finding(second_finding)
+
+    first = store.put("test", {"value": 1}, finding_ids=(first_finding.finding_id,), semantic_key="semantic")
+    returned = store.put("test", {"value": 1}, finding_ids=(second_finding.finding_id,), semantic_key="semantic")
+
+    assert returned == first == store.get(first.artifact_id)
+    assert store.storage.findings_for(first.artifact_id) == (first_finding.finding_id,)
+
+
+def test_v2_put_same_record_under_new_key_publishes_exact_new_attestation(tmp_path):
+    store = ArtifactStore(tmp_path)
+    first = store.put("test", {"value": 1}, semantic_key="old-key")
+    second = store.put("test", {"value": 1}, semantic_key="new-key")
+
+    assert second == first
+    new_attestation = store.attestation_id_for(first.artifact_id, "test", "new-key")
+    old_attestation = store.attestation_id_for(first.artifact_id, "test", "old-key")
+    assert new_attestation != old_attestation
+    assert store.has_semantic_attestation(first.artifact_id, "test", "new-key")
+    assert store.get_semantic_attestation(new_attestation)["semantic_key"] == "new-key"
+    assert store.indexed_ids("test", "new-key") == (first.artifact_id,)
+
+
+def test_v2_store_uses_full_durability_schema_and_exact_relations(tmp_path):
     store = ArtifactStore(tmp_path)
     artifact = _store_artifact(store)
+    assert (tmp_path / "state-v2.sqlite3").is_file()
+    connection = __import__("sqlite3").connect(tmp_path / "state-v2.sqlite3")
+    assert connection.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+    assert connection.execute("PRAGMA synchronous").fetchone()[0] == 2
+    tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    assert {"records", "findings", "record_dependencies", "record_findings", "edges", "attestations", "semantic_index", "revisions", "active_revision"} <= tables
     assert store.get(artifact.artifact_id) == artifact
-    assert store.closure((artifact.artifact_id,))[0] == (artifact,)
-
-    # Malformed cache copy must fail closed, move only mutable cache data, and
-    # leave a durable informational diagnostic.
-    (tmp_path / "artifacts" / f"{artifact.artifact_id}.json").write_text("not-json")
-    with pytest.raises(Exception):
-        store.get(artifact.artifact_id)
-    assert not (tmp_path / "artifacts" / f"{artifact.artifact_id}.json").exists()
-    assert list((tmp_path / "quarantine").glob("artifact-*.json"))
-    assert any(Finding.from_file(path).kind == "cache_artifact_invalid" for path in (tmp_path / "findings").glob("*.json"))
 
 
-def test_missing_or_malformed_finding_invalidates_its_parent_cache_artifact(tmp_path):
+def test_v2_compact_layout_has_no_loose_compatibility_state(tmp_path):
     store = ArtifactStore(tmp_path)
     artifact = _store_artifact(store)
-    finding_id = artifact.finding_ids[0]
-    (tmp_path / "findings" / f"{finding_id}.json").unlink()
-    with pytest.raises(Exception):
-        store.get(artifact.artifact_id)
-    assert not (tmp_path / "artifacts" / f"{artifact.artifact_id}.json").exists()
+    snapshot = RevisionSnapshot(revision_id="compact", selected_artifact_ids=(artifact.artifact_id,))
+    bundle = RevisionStore(tmp_path).seal_bundle(snapshot, {"run": "compact"}, b"")
+
+    assert bundle == tmp_path / "revisions" / "compact.zip"
+    assert not (tmp_path / "artifacts").exists()
+    assert not (tmp_path / "findings").exists()
+    assert not (tmp_path / "attestations").exists()
+    assert not (tmp_path / "revisions" / "compact").exists()
+    assert not any(path.is_symlink() for path in tmp_path.rglob("*"))
+    with zipfile.ZipFile(bundle) as archive:
+        snapshot_body = json.loads(archive.read("snapshot.json"))
+        manifest = json.loads(archive.read("manifest.json"))
+    assert "selected_edge_ids" not in snapshot_body
+    assert manifest["edge_ids"] == []
 
 
-def test_corrupt_dependency_is_quarantined_during_parent_closure_validation(tmp_path):
+def test_v2_sealed_zip_is_deterministic_self_contained_and_active_pointer_is_db(tmp_path):
     store = ArtifactStore(tmp_path)
-    child = _store_artifact(store, payload={"value": "child"})
-    parent = store.put("parent", {"value": "parent"}, dependency_ids=(child.artifact_id,), semantic_key="parent")
-    (tmp_path / "artifacts" / f"{child.artifact_id}.json").write_text("not-json")
+    artifact = _store_artifact(store)
+    snapshot = RevisionSnapshot(revision_id="revision", selected_artifact_ids=(artifact.artifact_id,), selected_finding_ids=artifact.finding_ids)
+    revisions = RevisionStore(tmp_path)
+    bundle = revisions.seal_bundle(snapshot, {}, b"")
+    first = bundle.read_bytes()
+    assert revisions.seal_bundle(snapshot, {}, b"").read_bytes() == first
+    with zipfile.ZipFile(bundle) as archive:
+        names = archive.namelist()
+        assert names[-1] == "manifest.json" and names[:-1] == sorted(names[:-1])
+        for info in archive.infolist():
+            assert info.date_time == (1980, 1, 1, 0, 0, 0)
+            assert info.create_system == 3 and info.create_version == 20 and info.extract_version == 20
+            assert info.external_attr == (0o100444 << 16) and info.compress_type == zipfile.ZIP_STORED
+    assert revisions.snapshot("revision") == snapshot
+    # V2 sealing publishes the revision and active pointer in one durable
+    # transaction; callers must not need a separate activation step.
+    assert revisions.active_snapshot() == snapshot
 
-    with pytest.raises(Exception):
-        store.get(parent.artifact_id)
 
-    assert not (tmp_path / "artifacts" / f"{child.artifact_id}.json").exists()
-    assert list((tmp_path / "quarantine").glob(f"artifact-{child.artifact_id}-*.json"))
-    # Parent closure became invalid too, so no stale parent can be reused.
-    assert not (tmp_path / "artifacts" / f"{parent.artifact_id}.json").exists()
-
-
-def test_cache_validator_empty_or_invalid_selected_attestation_is_a_miss(tmp_path):
+def test_v2_exact_key_attestation_and_index_are_inspectable(tmp_path):
     store = ArtifactStore(tmp_path)
-    artifact = _store_artifact(store, semantic_key="key")
+    first = _store_artifact(store, payload={"value": 1}, semantic_key="same")
+    second = _store_artifact(store, payload={"value": 2}, semantic_key="same")
+    assert store.indexed_ids("test", "same") == tuple(sorted((first.artifact_id, second.artifact_id)))
     validator = CacheValidator(store)
-    key_constructor = lambda *, value: value
-    empty = RevisionSnapshot(revision_id="empty", selected_artifact_ids=(artifact.artifact_id,))
-    assert validator.select(empty, requested_artifact_id=artifact.artifact_id,
-                            kind="test", key_constructor=key_constructor, value="key") is None
+    snapshot = RevisionSnapshot(revision_id="selected", selected_artifact_ids=(second.artifact_id,), selected_cache_attestation_ids=(store.attestation_id_for(second.artifact_id, "test", "same"),))
+    assert validator.select(snapshot, requested_artifact_id=second.artifact_id, kind="test", key_constructor=lambda *, value: value, value="same") == second
+    assert validator.select(snapshot, requested_artifact_id=first.artifact_id, kind="test", key_constructor=lambda *, value: value, value="same") is None
 
-    attestation_id = store.attestation_id_for(artifact.artifact_id, "test", "key")
-    selected = RevisionSnapshot(
-        revision_id="selected", selected_artifact_ids=(artifact.artifact_id,),
-        selected_cache_attestation_ids=(attestation_id,),
+
+def test_cache_reuse_does_not_require_semantic_index_membership(tmp_path, monkeypatch):
+    store = ArtifactStore(tmp_path)
+    selected = _store_artifact(store, payload={"value": 1}, semantic_key="same")
+    snapshot = RevisionSnapshot(
+        revision_id="selected", selected_artifact_ids=(selected.artifact_id,),
+        selected_cache_attestation_ids=(store.attestation_id_for(selected.artifact_id, "test", "same"),),
     )
-    store._attestation_path(attestation_id).write_text("not-json")
-    assert validator.select(selected, requested_artifact_id=artifact.artifact_id,
-                            kind="test", key_constructor=key_constructor, value="key") is None
+    monkeypatch.setattr(store, "indexed_ids", lambda kind, key: ())
+    assert CacheValidator(store).select(
+        snapshot, requested_artifact_id=selected.artifact_id, kind="test",
+        key_constructor=lambda *, value: value, value="same",
+    ) == selected
+
+
+def test_legacy_workspace_is_not_migrated_or_mutated_on_read(tmp_path):
+    legacy = tmp_path / "artifacts"; legacy.mkdir(); marker = legacy / "old.json"; marker.write_text("not-json")
+    before = (marker.stat().st_size, marker.stat().st_mtime_ns)
+    with pytest.raises(Exception): ArtifactStore(tmp_path).get("old")
+    assert not (tmp_path / "state-v2.sqlite3").exists()
+    assert marker.exists() and (marker.stat().st_size, marker.stat().st_mtime_ns) == before
+
+
+def test_dotted_legacy_revision_directory_is_read_only(tmp_path):
+    revision = tmp_path / "revisions" / "legacy.v1"
+    revision.mkdir(parents=True)
+    marker = revision / "snapshot.json"
+    marker.write_text("not-json")
+    before = (marker.read_bytes(), marker.stat().st_mtime_ns)
+
+    with pytest.raises(Exception):
+        ArtifactStore(tmp_path).get("missing")
+
+    assert not (tmp_path / "state-v2.sqlite3").exists()
+    assert (marker.read_bytes(), marker.stat().st_mtime_ns) == before
 
 
 def test_every_semantic_key_constructor_mutates_declared_inputs_and_rejects_metadata():
@@ -295,58 +369,308 @@ def test_snapshot_only_selection_and_same_key_ambiguity_never_use_index_order(tm
     first = _store_artifact(store, payload={"value": 1}, semantic_key="same")
     second = _store_artifact(store, payload={"value": 2}, semantic_key="same")
     validator = CacheValidator(store)
-    selected = RevisionSnapshot(
-        revision_id="selected", selected_artifact_ids=(second.artifact_id,),
-        selected_cache_attestation_ids=(store.attestation_id_for(second.artifact_id, "test", "same"),),
-    )
+    selected = RevisionSnapshot(revision_id="selected", selected_artifact_ids=(second.artifact_id,), selected_cache_attestation_ids=(store.attestation_id_for(second.artifact_id, "test", "same"),))
     key_constructor = lambda *, value: value
     assert validator.select(selected, requested_artifact_id=second.artifact_id, kind="test", key_constructor=key_constructor, value="same") == second
     assert validator.select(selected, requested_artifact_id=first.artifact_id, kind="test", key_constructor=key_constructor, value="same") is None
-    assert validator.select(selected, requested_artifact_id=None, kind="test", key_constructor=key_constructor, value="same") is None
-    assert any(Finding.from_file(path).kind == "cache_key_ambiguous" for path in (tmp_path / "findings").glob("*.json"))
+    finding = validator.ambiguity("test", "same")
+    assert finding is not None and set(finding.subject_refs) == {first.artifact_id, second.artifact_id}
 
 
 def test_sealed_revision_is_self_contained_and_graph_is_selected_revision_only(tmp_path):
     store = ArtifactStore(tmp_path)
     first = _store_artifact(store, payload={"value": 1})
-    second_finding = Finding(kind="stage_summary", severity="info", stage="test", message="dependent")
-    store.put_finding(second_finding)
-    second = store.put("render", {"value": 2}, dependency_ids=(first.artifact_id,), finding_ids=(second_finding.finding_id,), semantic_key="render")
+    second = store.put("render", {"value": 2}, dependency_ids=(first.artifact_id,), semantic_key="render")
     graph = DependencyGraph(tmp_path)
     edge = graph.edge(stable_subject_id="segment", parent_artifact_id=first.artifact_id, child_artifact_id=second.artifact_id, stage="render", edge_kind="input")
     graph.put(edge)
     snapshot = RevisionSnapshot(revision_id="revision", selected_artifact_ids=(second.artifact_id,))
-    provenance = {"revision_id": "revision", "render_input": second.artifact_id}
-    epub = io.BytesIO()
-    with zipfile.ZipFile(epub, "w") as archive:
-        archive.writestr("META-INF/btran-provenance.json", canonical_json_bytes(provenance))
     revisions = RevisionStore(tmp_path, store, graph)
-    bundle = revisions.seal_bundle(snapshot, provenance, epub.getvalue(), render_input_artifact_id=second.artifact_id, edge_ids=(edge.edge_id,), expected_embedded_provenance=provenance)
-    assert (bundle / "artifacts" / f"{first.artifact_id}.json").exists()
-    assert (bundle / "artifacts" / f"{second.artifact_id}.json").exists()
-    assert (bundle / "findings" / f"{second_finding.finding_id}.json").exists()
-    revisions.activate("revision")
-    assert revisions.active_snapshot() == snapshot
-
-    # Global graph cache can change/corrupt after sealing. Selected traversal
-    # must exclusively read immutable copied graph bytes in sealed bundle.
-    (tmp_path / "graph" / "edges" / f"{edge.edge_id}.json").write_text("not-json")
+    bundle = revisions.seal_bundle(snapshot, {}, b"", edge_ids=(edge.edge_id,))
+    with zipfile.ZipFile(bundle) as archive:
+        assert f"records/{first.artifact_id}.json" in archive.namelist()
+        assert f"records/{second.artifact_id}.json" in archive.namelist()
+        assert f"edges/{edge.edge_id}.json" in archive.namelist()
     assert revisions.selected_graph("revision").forward("revision", first.artifact_id) == (edge,)
 
 
-def test_existing_matching_bundle_revalidates_before_idempotent_return(tmp_path):
+def test_standalone_verification_rejects_closure_relationship_mutation(tmp_path):
     store = ArtifactStore(tmp_path)
     artifact = _store_artifact(store)
     snapshot = RevisionSnapshot(revision_id="revision", selected_artifact_ids=(artifact.artifact_id,))
-    graph = DependencyGraph(tmp_path)
-    revisions = RevisionStore(tmp_path, store, graph)
-    provenance = {"revision_id": "revision", "render_input": artifact.artifact_id}
-    epub = io.BytesIO()
-    with zipfile.ZipFile(epub, "w") as archive:
-        archive.writestr("META-INF/btran-provenance.json", canonical_json_bytes(provenance))
-    bundle = revisions.seal_bundle(snapshot, provenance, epub.getvalue(), render_input_artifact_id=artifact.artifact_id, expected_embedded_provenance=provenance)
-    with (bundle / "book.epub").open("ab") as handle:
-        handle.write(b"corrupt")
+    bundle = RevisionStore(tmp_path).seal_bundle(snapshot, {}, b"")
+    values = Storage(tmp_path).verify_revision("revision")
+    raw = bytearray(bundle.read_bytes())
+    # The repository row must detect archive bytes before any mutable index is
+    # consulted.  This also covers the immutable SHA comparison boundary.
+    connection = sqlite3.connect(tmp_path / "state-v2.sqlite3")
+    connection.execute("UPDATE revisions SET zip_sha256=? WHERE revision_id=?", ("0" * 64, "revision"))
+    connection.commit(); connection.close()
+    with pytest.raises(ArtifactError, match="SHA"):
+        RevisionStore(tmp_path).verify_bundle("revision")
+    assert values["snapshot.json"]
 
-    with pytest.raises(ArtifactError, match="EPUB hash"):
-        revisions.seal_bundle(snapshot, provenance, epub.getvalue(), render_input_artifact_id=artifact.artifact_id, expected_embedded_provenance=provenance)
+
+def test_resealing_revision_id_with_changed_snapshot_does_not_reuse_old_zip(tmp_path):
+    store = ArtifactStore(tmp_path)
+    first = _store_artifact(store, payload={"value": 1})
+    second = _store_artifact(store, payload={"value": 2})
+    revisions = RevisionStore(tmp_path)
+    revisions.seal_bundle(RevisionSnapshot(revision_id="revision", selected_artifact_ids=(first.artifact_id,)), {}, b"")
+    with pytest.raises(ArtifactError, match="conflicting ZIP"):
+        revisions.seal_bundle(RevisionSnapshot(revision_id="revision", selected_artifact_ids=(second.artifact_id,)), {}, b"")
+
+
+def test_existing_matching_revision_revalidates_before_idempotent_return(tmp_path):
+    store = ArtifactStore(tmp_path)
+    artifact = _store_artifact(store)
+    snapshot = RevisionSnapshot(revision_id="revision", selected_artifact_ids=(artifact.artifact_id,))
+    revisions = RevisionStore(tmp_path)
+    bundle = revisions.seal_bundle(snapshot, {}, b"")
+    raw = bytearray(bundle.read_bytes())
+    raw[-1] ^= 1
+    bundle.write_bytes(raw)
+    with pytest.raises(ArtifactError):
+        revisions.seal_bundle(snapshot, {}, b"")
+
+
+def _rewrite_zip(path: Path, values: dict[str, bytes], order: tuple[str, ...], *, changed_name: str | None = None, changed_metadata: bool = False, changed_internal_attr: bool = False) -> None:
+    """Rewrite a test archive with FC3 metadata, optionally changing one field."""
+    temporary = path.with_suffix(".rewrite")
+    with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_STORED) as archive:
+        for name in order:
+            info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
+            info.create_system = 3
+            info.create_version = 20
+            info.extract_version = 20
+            info.external_attr = 0o100444 << 16
+            info.extra = b""
+            info.comment = b""
+            info.flag_bits = 0
+            info.compress_type = zipfile.ZIP_STORED
+            if name == changed_name:
+                info.date_time = (1980, 1, 1, 0, 0, 2)
+            if changed_metadata and name == "snapshot.json":
+                info.external_attr ^= 1
+            if changed_internal_attr and name == "snapshot.json":
+                info.internal_attr = 1
+            archive.writestr(info, values[name])
+    os.replace(temporary, path)
+
+
+@pytest.mark.parametrize("revision_id", ("../bad", "/absolute/bad"))
+def test_revision_id_cannot_escape_revisions_directory(tmp_path, revision_id):
+    storage = Storage(tmp_path)
+    snapshot = RevisionSnapshot(revision_id="safe", selected_artifact_ids=())
+
+    with pytest.raises(StorageError, match="safe archive filename"):
+        storage.seal_revision(revision_id, snapshot.to_json().encode(), {})
+
+    assert not (tmp_path / "bad.zip").exists()
+    assert not (tmp_path / "revisions" / "bad.zip").exists()
+
+
+def test_register_revision_requires_supplied_snapshot_to_match_archive(tmp_path):
+    source_root = tmp_path / "source"
+    source_bundle = Storage(source_root).seal_revision(
+        "revision", RevisionSnapshot(revision_id="revision").to_json().encode(), {}
+    )
+    target = Storage(tmp_path / "target")
+    target_bundle = target.revisions_dir / "revision.zip"
+    target_bundle.write_bytes(source_bundle.read_bytes())
+    snapshot = RevisionSnapshot(revision_id="other")
+
+    with pytest.raises(StorageError, match="differs from verified archive"):
+        target.register_revision(
+            "revision", "revision.zip", hashlib.sha256(target_bundle.read_bytes()).hexdigest(),
+            snapshot.to_json().encode(),
+        )
+    with pytest.raises(StorageError, match="missing revision"):
+        target.revision_row("revision")
+
+
+def test_v2_writer_uses_wal_full_checkpoint_and_fsync(tmp_path, monkeypatch):
+    fsynced: list[str] = []
+    real_fsync = os.fsync
+
+    def record_fsync(fd: int) -> None:
+        try:
+            target = os.readlink(f"/proc/self/fd/{fd}")
+        except OSError:
+            target = ""
+        fsynced.append(target)
+        real_fsync(fd)
+
+    monkeypatch.setattr("btran.storage.os.fsync", record_fsync)
+    store = Storage(tmp_path)
+    finding = Finding(kind="stage_summary", severity="info", stage="test", message="done")
+    store.put_finding(finding.finding_id, finding.to_json().encode())
+    connection = store._connect()
+    assert connection.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+    assert connection.execute("PRAGMA synchronous").fetchone()[0] == 2
+    assert connection.execute("PRAGMA wal_autocheckpoint").fetchone()[0] == 0
+    connection.close()
+    assert any(target.endswith("state-v2.sqlite3") for target in fsynced)
+
+
+def test_revision_zip_is_fsynced_after_zip_finalization(tmp_path, monkeypatch):
+    fsynced_archives: list[bool] = []
+    real_fsync = os.fsync
+
+    def record_fsync(fd: int) -> None:
+        try:
+            target = os.readlink(f"/proc/self/fd/{fd}")
+        except OSError:
+            target = ""
+        if target.endswith("revision.zip.tmp"):
+            fsynced_archives.append(zipfile.is_zipfile(target))
+        real_fsync(fd)
+
+    monkeypatch.setattr("btran.storage.os.fsync", record_fsync)
+    snapshot = RevisionSnapshot(revision_id="revision", selected_artifact_ids=())
+    Storage(tmp_path).seal_revision("revision", snapshot.to_json().encode(), {})
+    assert fsynced_archives == [True]
+
+
+def test_empty_v2_workspaces_produce_equal_zip_bytes(tmp_path):
+    snapshot = RevisionSnapshot(revision_id="empty", selected_artifact_ids=())
+    first_root, second_root = tmp_path / "one", tmp_path / "two"
+    first = Storage(first_root).seal_revision("empty", snapshot.to_json().encode(), {})
+    second = Storage(second_root).seal_revision("empty", snapshot.to_json().encode(), {})
+    assert first.read_bytes() == second.read_bytes()
+    assert hashlib.sha256(first.read_bytes()).digest() == hashlib.sha256(second.read_bytes()).digest()
+
+
+@pytest.mark.parametrize("corruption", ("timestamp", "metadata", "internal_attr", "order", "member", "manifest", "snapshot"))
+def test_v2_standalone_verification_rejects_archive_corruption(tmp_path, corruption):
+    store = ArtifactStore(tmp_path)
+    artifact = _store_artifact(store)
+    snapshot = RevisionSnapshot(revision_id="revision", selected_artifact_ids=(artifact.artifact_id,))
+    bundle = RevisionStore(tmp_path).seal_bundle(snapshot, {}, b"")
+    with zipfile.ZipFile(bundle) as archive:
+        values = {name: archive.read(name) for name in archive.namelist()}
+    names = tuple(values)
+    if corruption == "timestamp":
+        _rewrite_zip(bundle, values, names, changed_name="snapshot.json")
+    elif corruption == "metadata":
+        _rewrite_zip(bundle, values, names, changed_metadata=True)
+    elif corruption == "internal_attr":
+        _rewrite_zip(bundle, values, names, changed_internal_attr=True)
+    elif corruption == "order":
+        _rewrite_zip(bundle, values, ("manifest.json",) + names[:-1], changed_name=None)
+    elif corruption == "member":
+        values["provenance.json"] = b"{}"
+        _rewrite_zip(bundle, values, tuple(sorted(names[:-1] + ("provenance.json",), key=lambda name: name.encode())) + ("manifest.json",))
+    elif corruption == "manifest":
+        manifest = json.loads(values["manifest.json"])
+        manifest["members"]["snapshot.json"] = "0" * 64
+        values["manifest.json"] = canonical_json_bytes(manifest)
+        _rewrite_zip(bundle, values, names)
+    else:
+        changed = RevisionSnapshot(revision_id="other", selected_artifact_ids=(artifact.artifact_id,))
+        values["snapshot.json"] = changed.to_json().encode()
+        _rewrite_zip(bundle, values, names)
+    with pytest.raises(StorageError):
+        Storage(tmp_path).verify_zip(bundle, revision_id="revision")
+
+
+def test_v2_standalone_verification_rejects_extra_selected_relationship_edge(tmp_path):
+    store = ArtifactStore(tmp_path)
+    first = _store_artifact(store, payload={"value": 1})
+    second = store.put("render", {"value": 2}, dependency_ids=(first.artifact_id,), semantic_key="render")
+    graph = DependencyGraph(tmp_path)
+    selected_edge = graph.edge(
+        stable_subject_id="segment", parent_artifact_id=first.artifact_id,
+        child_artifact_id=second.artifact_id, stage="render", edge_kind="input",
+    )
+    extra_edge = graph.edge(
+        stable_subject_id="other-segment", parent_artifact_id=first.artifact_id,
+        child_artifact_id=second.artifact_id, stage="render", edge_kind="input",
+    )
+    graph.put(selected_edge)
+    graph.put(extra_edge)
+    snapshot = RevisionSnapshot(revision_id="revision", selected_artifact_ids=(second.artifact_id,))
+    bundle = RevisionStore(tmp_path).seal_bundle(snapshot, {}, b"", edge_ids=(selected_edge.edge_id,))
+    with zipfile.ZipFile(bundle) as archive:
+        values = {name: archive.read(name) for name in archive.namelist()}
+    extra_name = f"edges/{extra_edge.edge_id}.json"
+    values[extra_name] = extra_edge.to_json().encode("utf-8")
+    manifest = json.loads(values["manifest.json"])
+    manifest["members"][extra_name] = hashlib.sha256(values[extra_name]).hexdigest()
+    values["manifest.json"] = canonical_json_bytes(manifest)
+    order = tuple(sorted((name for name in values if name != "manifest.json"), key=lambda name: name.encode())) + ("manifest.json",)
+    _rewrite_zip(bundle, values, order)
+    with pytest.raises(StorageError, match="edges differ from selected snapshot closure"):
+        Storage(tmp_path).verify_zip(bundle, revision_id="revision")
+
+
+def test_v2_standalone_verification_rejects_unrelated_valid_closure_members(tmp_path):
+    store = ArtifactStore(tmp_path)
+    selected = _store_artifact(store, payload={"value": "selected"})
+    selected_snapshot = RevisionSnapshot(revision_id="revision", selected_artifact_ids=(selected.artifact_id,))
+    bundle = RevisionStore(tmp_path).seal_bundle(selected_snapshot, {}, b"")
+
+    unrelated_finding = Finding(kind="unrelated", severity="info", stage="other", message="not selected")
+    store.put_finding(unrelated_finding)
+    unrelated = store.put("unrelated", {"value": "unselected"}, finding_ids=(unrelated_finding.finding_id,), semantic_key="unrelated")
+    graph = DependencyGraph(tmp_path)
+    unrelated_edge = graph.edge(stable_subject_id="unrelated", parent_artifact_id=selected.artifact_id,
+                                child_artifact_id=unrelated.artifact_id, stage="other", edge_kind="unrelated")
+    graph.put(unrelated_edge)
+    unrelated_attestation_id = store.attestation_id_for(unrelated.artifact_id, unrelated.kind, unrelated.semantic_key)
+
+    with zipfile.ZipFile(bundle) as archive:
+        values = {name: archive.read(name) for name in archive.namelist()}
+    extras = {
+        f"records/{unrelated.artifact_id}.json": unrelated.to_json().encode(),
+        f"findings/{unrelated_finding.finding_id}.json": unrelated_finding.to_json().encode(),
+        f"edges/{unrelated_edge.edge_id}.json": unrelated_edge.to_json().encode(),
+        f"attestations/{unrelated_attestation_id}.json": canonical_json_bytes(store.get_semantic_attestation(unrelated_attestation_id)),
+    }
+    manifest = json.loads(values["manifest.json"])
+    for name, data in extras.items():
+        values[name] = data
+        manifest["members"][name] = hashlib.sha256(data).hexdigest()
+    values["manifest.json"] = canonical_json_bytes(manifest)
+    order = tuple(sorted((name for name in values if name != "manifest.json"), key=lambda name: name.encode())) + ("manifest.json",)
+    _rewrite_zip(bundle, values, order)
+
+    with pytest.raises(StorageError, match="outside selected closure"):
+        Storage(tmp_path).verify_zip(bundle, revision_id="revision")
+
+
+def _tree_state(root: Path) -> dict[str, tuple[bytes, int]]:
+    return {
+        str(path.relative_to(root)): (path.read_bytes(), path.stat().st_mtime_ns)
+        for path in root.rglob("*") if path.is_file()
+    }
+
+
+def _legacy_epub(provenance: dict[str, object]) -> bytes:
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_STORED) as archive:
+        archive.writestr("META-INF/btran-provenance.json", canonical_json_bytes(provenance))
+    return output.getvalue()
+
+
+def test_valid_legacy_revision_verification_does_not_mutate_bytes_or_mtimes(tmp_path):
+    legacy = LegacyArtifactStore(tmp_path)
+    artifact = legacy.put("test", {"value": 1}, semantic_key="semantic")
+    snapshot = RevisionSnapshot(revision_id="legacy", selected_artifact_ids=(artifact.artifact_id,))
+    LegacyRevisionStore(tmp_path, legacy).seal_bundle(snapshot, {}, _legacy_epub({}))
+    before = _tree_state(tmp_path)
+    assert RevisionStore(tmp_path).verify_bundle("legacy") == snapshot
+    assert _tree_state(tmp_path) == before
+
+
+def test_corrupt_legacy_revision_verification_does_not_mutate_bytes_or_mtimes(tmp_path):
+    legacy = LegacyArtifactStore(tmp_path)
+    artifact = legacy.put("test", {"value": 1}, semantic_key="semantic")
+    snapshot = RevisionSnapshot(revision_id="legacy", selected_artifact_ids=(artifact.artifact_id,))
+    LegacyRevisionStore(tmp_path, legacy).seal_bundle(snapshot, {}, _legacy_epub({}))
+    snapshot_path = tmp_path / "revisions" / "legacy" / "snapshot.json"
+    snapshot_path.write_bytes(b"not-json")
+    before = _tree_state(tmp_path)
+    with pytest.raises(ArtifactError):
+        RevisionStore(tmp_path).verify_bundle("legacy")
+    assert _tree_state(tmp_path) == before

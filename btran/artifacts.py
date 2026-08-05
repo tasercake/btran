@@ -313,7 +313,7 @@ def _read_json(path: Path) -> Mapping[str, Any]:
     return value
 
 
-class ArtifactStore:
+class LegacyArtifactStore:
     """Filesystem content-addressed artifact/finding cache.
 
     Artifact files are immutable.  Index files are only same-key discovery sets;
@@ -620,7 +620,7 @@ class ArtifactStore:
 class CacheValidator:
     """Fail-closed cache reuse from a named artifact in a named snapshot."""
 
-    def __init__(self, store: ArtifactStore):
+    def __init__(self, store: LegacyArtifactStore):
         self.store = store
 
     def select(
@@ -629,8 +629,9 @@ class CacheValidator:
     ) -> ArtifactEnvelope | None:
         """Return only requested selected artifact after recomputing its key.
 
-        Caller supplies current semantic inputs, not a claimed key.  The exact
-        selected envelope must also remain a member of its matching index set.
+        Caller supplies current semantic inputs, not a claimed key.  Indexes
+        are discovery metadata only; selected closure, key, and attestation
+        authorize reuse.
         """
         if not isinstance(snapshot, RevisionSnapshot):
             raise ArtifactError("snapshot must be RevisionSnapshot")
@@ -648,12 +649,10 @@ class CacheValidator:
             return None
         if requested_artifact_id not in snapshot.selected_artifact_ids:
             return None
-        # Index is discovery data, but exact membership plus immutable
-        # key->canonical-closure attestation are both required.  The envelope's
-        # first-published key is deliberately not authoritative: one identical
-        # artifact can be independently attested by multiple model/prompt keys.
-        if requested_artifact_id not in self.store.indexed_ids(kind, requested_semantic_key):
-            return None
+        # The envelope's first-published key is deliberately not authoritative:
+        # one identical artifact can be independently attested by multiple
+        # model/prompt keys.  Indexes are only candidate discovery and must not
+        # be required for an explicitly selected artifact.
         try:
             envelope = self.store.get(requested_artifact_id)
             if envelope.kind != kind:
@@ -697,7 +696,7 @@ class CacheValidator:
         return finding
 
 
-class DependencyGraph:
+class LegacyDependencyGraph:
     """Immutable graph edges and selected-revision-only traversal."""
 
     def __init__(self, root: Path | str):
@@ -857,15 +856,15 @@ class SealedDependencyGraph:
         return tuple(sorted(result))
 
 
-class RevisionStore:
+class LegacyRevisionStore:
     """Sealed self-contained revision bundles and explicit active pointer."""
 
-    def __init__(self, root: Path | str, artifact_store: ArtifactStore | None = None, graph: DependencyGraph | None = None):
+    def __init__(self, root: Path | str, artifact_store: LegacyArtifactStore | None = None, graph: LegacyDependencyGraph | None = None):
         self.root = Path(root)
         self.revisions_dir = self.root / "revisions"
         self.revisions_dir.mkdir(parents=True, exist_ok=True)
-        self.artifacts = artifact_store or ArtifactStore(self.root)
-        self.graph = graph or DependencyGraph(self.root)
+        self.artifacts = artifact_store or LegacyArtifactStore(self.root)
+        self.graph = graph or LegacyDependencyGraph(self.root)
 
     def _revision_path(self, revision_id: str) -> Path:
         return self.revisions_dir / revision_id
@@ -1065,7 +1064,7 @@ class RevisionStore:
                 required = {"attestation_id", "artifact_id", "kind", "semantic_key", "dependency_ids"}
                 if set(body) != required or body["attestation_id"] != attestation_id:
                     raise ArtifactError("bundle semantic attestation is invalid")
-                expected = ArtifactStore.semantic_attestation_id_for(
+                expected = LegacyArtifactStore.semantic_attestation_id_for(
                     artifact_id=body["artifact_id"], kind=body["kind"],
                     semantic_key=body["semantic_key"], dependency_ids=body["dependency_ids"],
                 )
@@ -1135,3 +1134,499 @@ class RevisionStore:
 # Short compatibility aliases for callers that prefer noun-first naming.
 canonical_artifact_id = artifact_id_for
 canonical_edge_id = dependency_edge_id_for
+
+# --- v2 compact SQLite/ZIP adapters -------------------------------------------------
+# Legacy classes above remain available internally so an old workspace is never
+# migrated, rewritten, or quarantined merely by being read.
+from btran.storage import Storage, StorageError
+
+
+def _legacy_workspace(root: Path) -> bool:
+    if (root / "state-v2.sqlite3").exists():
+        return False
+    return any((root / name).exists() for name in ("artifacts", "findings", "index", "attestations", "graph", "active-revision.json")) or any(
+        path.is_dir() and not path.name.startswith(".") for path in (root / "revisions").glob("*")
+    ) if (root / "revisions").exists() else any((root / name).exists() for name in ("artifacts", "findings", "index", "attestations", "graph", "active-revision.json"))
+
+
+class V2ArtifactStore:
+    """ArtifactStore implementation backed only by ``state-v2.sqlite3``."""
+
+    def __init__(self, root: Path | str):
+        self.root = Path(root)
+        self.storage = Storage(self.root)
+        # V2 has no loose compatibility view: records, findings, and
+        # attestations are stored only in SQLite and sealed ZIP revisions.
+        self.artifacts_dir = self.root / "artifacts"
+        self.findings_dir = self.root / "findings"
+        self.index_dir = self.root / "index"
+        self.attestations_dir = self.root / "attestations"
+        self.quarantine_dir = self.root / "quarantine"
+
+    @staticmethod
+    def semantic_attestation_id_for(*, artifact_id: str, kind: str, semantic_key: str, dependency_ids: Sequence[str]) -> str:
+        return tagged_sha256("artifact-semantic-attestation-v1", canonical_json_bytes({
+            "artifact_id": _text(artifact_id, "artifact_id"), "kind": _text(kind, "kind"),
+            "semantic_key": _text(semantic_key, "semantic_key"), "dependency_ids": list(_ids(dependency_ids, "dependency_ids")),
+        }))
+
+    def _attestation_body(self, envelope: ArtifactEnvelope) -> dict[str, Any]:
+        aid = self.semantic_attestation_id_for(artifact_id=envelope.artifact_id, kind=envelope.kind,
+                                               semantic_key=envelope.semantic_key, dependency_ids=envelope.dependency_ids)
+        return {"attestation_id": aid, "artifact_id": envelope.artifact_id, "kind": envelope.kind,
+                "semantic_key": envelope.semantic_key, "dependency_ids": list(envelope.dependency_ids)}
+
+    def put_finding(self, finding: Finding) -> str:
+        if not isinstance(finding, Finding):
+            raise ArtifactError("finding must be a Finding")
+        self.storage.put_finding(finding.finding_id, finding.to_json().encode("utf-8"))
+        return finding.finding_id
+
+    def get_finding(self, finding_id: str) -> Finding:
+        try:
+            finding = Finding.from_json(self.storage.finding_bytes(finding_id).decode("utf-8"))
+            if finding.finding_id != finding_id:
+                raise ArtifactError("finding path and body IDs differ")
+            return finding
+        except (StorageError, SchemaError, UnicodeDecodeError) as exc:
+            raise ArtifactError(f"invalid or missing finding {finding_id}") from exc
+
+    def put(self, kind: str, payload: Mapping[str, Any], *, dependency_ids: Sequence[str] = (),
+            finding_ids: Sequence[str] = (), semantic_key: str) -> ArtifactEnvelope:
+        dependencies, findings = _ids(dependency_ids, "dependency_ids"), _ids(finding_ids, "finding_ids")
+        for finding_id in findings:
+            self.get_finding(finding_id)
+        envelope = ArtifactEnvelope(artifact_id=artifact_id_for(kind, payload, dependencies), kind=_text(kind, "kind"),
+                                    payload=dict(payload), dependency_ids=dependencies, finding_ids=findings,
+                                    semantic_key=_text(semantic_key, "semantic_key"))
+        data = envelope.to_json().encode("utf-8")
+        try:
+            existing = self._read(envelope.artifact_id)
+        except ArtifactError:
+            existing = None
+        if (existing is not None and existing.kind == envelope.kind
+                and existing.payload == envelope.payload and existing.dependency_ids == envelope.dependency_ids):
+            # Identity intentionally excludes diagnostic and cache-key
+            # annotations.  Preserve the first immutable record bytes while
+            # publishing a new semantic index binding and attestation.  The
+            # persisted envelope is authoritative: return it rather than a
+            # caller-shaped envelope whose finding IDs may not be persisted.
+            self.storage.index_record(envelope.artifact_id, envelope.semantic_key)
+            persisted = existing
+        else:
+            self.storage.put_record(envelope.artifact_id, envelope.kind, data,
+                                    semantic_key=envelope.semantic_key, dependency_ids=dependencies, finding_ids=findings)
+            persisted = envelope
+        # The record envelope is immutable and may retain its first key.  The
+        # attestation, however, binds the exact key for this invocation.  Do
+        # not derive it from ``persisted`` when an identical record is put
+        # under a new semantic key: that would index the new key but publish
+        # only the old-key proof.
+        attestation = self._attestation_body(envelope)
+        self.storage.put_attestation(attestation["attestation_id"], canonical_json_bytes(attestation))
+        return persisted
+
+    def _read(self, artifact_id: str) -> ArtifactEnvelope:
+        try:
+            envelope = ArtifactEnvelope.from_json(self.storage.record_bytes(artifact_id).decode("utf-8"))
+            if envelope.artifact_id != artifact_id or artifact_id_for(envelope.kind, envelope.payload, envelope.dependency_ids) != artifact_id:
+                raise ArtifactError("artifact content hash mismatch")
+            return envelope
+        except (StorageError, SchemaError, UnicodeDecodeError) as exc:
+            raise ArtifactError(f"invalid or missing artifact {artifact_id}") from exc
+
+    def get(self, artifact_id: str, *, validate_closure: bool = True) -> ArtifactEnvelope:
+        return self._get(artifact_id, validate_closure=validate_closure, seen=set())
+
+    def _get(self, artifact_id: str, *, validate_closure: bool, seen: set[str]) -> ArtifactEnvelope:
+        envelope = self._read(artifact_id)
+        if validate_closure and artifact_id not in seen:
+            seen.add(artifact_id)
+            for finding_id in envelope.finding_ids:
+                finding = self.get_finding(finding_id)
+                for dependency_id in finding.dependency_ids:
+                    self._get(dependency_id, validate_closure=True, seen=seen)
+            for dependency_id in envelope.dependency_ids:
+                self._get(dependency_id, validate_closure=True, seen=seen)
+        return envelope
+
+    def _attestation(self, attestation_id: str) -> Mapping[str, Any]:
+        try:
+            body = json.loads(self.storage.attestation_bytes(attestation_id).decode("utf-8"))
+            if not isinstance(body, Mapping) or canonical_json_bytes(body) != self.storage.attestation_bytes(attestation_id):
+                raise ArtifactError("invalid semantic attestation")
+            required = {"attestation_id", "artifact_id", "kind", "semantic_key", "dependency_ids"}
+            if set(body) != required or body["attestation_id"] != attestation_id:
+                raise ArtifactError("invalid semantic attestation")
+            expected = self.semantic_attestation_id_for(artifact_id=body["artifact_id"], kind=body["kind"],
+                                                        semantic_key=body["semantic_key"], dependency_ids=body["dependency_ids"])
+            if expected != attestation_id:
+                raise ArtifactError("semantic attestation hash mismatch")
+            return body
+        except (StorageError, UnicodeDecodeError, json.JSONDecodeError, TypeError, KeyError) as exc:
+            raise ArtifactError(f"invalid or missing semantic attestation {attestation_id}") from exc
+
+    def get_semantic_attestation(self, attestation_id: str) -> Mapping[str, Any]:
+        return self._attestation(attestation_id)
+
+    def attestation_id_for(self, artifact_id: str, kind: str, semantic_key: str) -> str:
+        envelope = self.get(artifact_id)
+        if envelope.kind != kind:
+            raise ArtifactError("attestation kind does not match artifact")
+        return self.semantic_attestation_id_for(artifact_id=artifact_id, kind=kind, semantic_key=semantic_key,
+                                                dependency_ids=envelope.dependency_ids)
+
+    def has_semantic_attestation(self, artifact_id: str, kind: str, semantic_key: str) -> bool:
+        try:
+            aid = self.attestation_id_for(artifact_id, kind, semantic_key)
+            body = self.get_semantic_attestation(aid)
+            return body["artifact_id"] == artifact_id and body["kind"] == kind and body["semantic_key"] == semantic_key
+        except (ArtifactError, KeyError):
+            return False
+
+    def attestation_ids_for(self, artifact_ids: Sequence[str]) -> tuple[str, ...]:
+        selected = set(_ids(artifact_ids, "artifact_ids"))
+        connection = self.storage._connect()
+        try:
+            ids = tuple(row[0] for row in connection.execute("SELECT attestation_id FROM attestations ORDER BY attestation_id"))
+        finally:
+            connection.close()
+        result = []
+        for aid in ids:
+            try:
+                if self.get_semantic_attestation(aid)["artifact_id"] in selected:
+                    result.append(aid)
+            except ArtifactError:
+                continue
+        return tuple(result)
+
+    def indexed_ids(self, kind: str, semantic_key: str) -> tuple[str, ...]:
+        result = []
+        for aid in self.storage.indexed_ids(semantic_key):
+            try:
+                if self.storage.record_meta(aid)["kind"] == kind:
+                    result.append(aid)
+            except StorageError:
+                continue
+        return tuple(result)
+
+    def closure(self, artifact_ids: Sequence[str], *, finding_ids: Sequence[str] = ()) -> tuple[tuple[ArtifactEnvelope, ...], tuple[Finding, ...]]:
+        artifacts: dict[str, ArtifactEnvelope] = {}
+        findings: dict[str, Finding] = {}
+        def visit_finding(fid: str) -> None:
+            if fid in findings: return
+            finding = self.get_finding(fid); findings[fid] = finding
+            for dep in finding.dependency_ids: visit(dep)
+        def visit(aid: str) -> None:
+            if aid in artifacts: return
+            artifact = self.get(aid, validate_closure=False); artifacts[aid] = artifact
+            for fid in artifact.finding_ids: visit_finding(fid)
+            for dep in artifact.dependency_ids: visit(dep)
+        def visit_root(aid: str) -> None: visit(aid)
+        for aid in _ids(artifact_ids, "artifact_ids"): visit_root(aid)
+        for fid in _ids(finding_ids, "finding_ids"): visit_finding(fid)
+        return tuple(artifacts[k] for k in sorted(artifacts)), tuple(findings[k] for k in sorted(findings))
+
+
+class _VirtualEdgePath:
+    def __init__(self, edge_id: str): self.stem = edge_id
+
+
+class _VirtualEdgeDir:
+    """Compatibility discovery view over immutable SQLite edge rows.
+
+    It has no filesystem side effects; callers can retain the old ``glob``
+    loop while v2 keeps graph bytes in the compact store.
+    """
+    def __init__(self, storage: Storage): self.storage = storage
+    def glob(self, pattern: str):
+        if pattern != "*.json": return ()
+        connection = self.storage._connect()
+        try:
+            return tuple(_VirtualEdgePath(row[0]) for row in connection.execute("SELECT edge_id FROM edges ORDER BY edge_id"))
+        finally:
+            connection.close()
+
+
+class V2DependencyGraph:
+    def __init__(self, root: Path | str, storage: Storage | None = None):
+        self.root = Path(root); self.storage = storage or Storage(self.root)
+        self.edges_dir = _VirtualEdgeDir(self.storage)
+    def edge(self, *, stable_subject_id: str, parent_artifact_id: str, child_artifact_id: str, stage: str, edge_kind: str) -> DependencyGraphEdge:
+        return DependencyGraphEdge(edge_id=dependency_edge_id_for(stable_subject_id, parent_artifact_id, child_artifact_id, stage, edge_kind), stable_subject_id=stable_subject_id, parent_artifact_id=parent_artifact_id, child_artifact_id=child_artifact_id, stage=stage, edge_kind=edge_kind)
+    def put(self, edge: DependencyGraphEdge) -> str:
+        if not isinstance(edge, DependencyGraphEdge): raise ArtifactError("edge must be DependencyGraphEdge")
+        expected = dependency_edge_id_for(edge.stable_subject_id, edge.parent_artifact_id, edge.child_artifact_id, edge.stage, edge.edge_kind)
+        if edge.edge_id != expected: raise ArtifactError("edge_id does not match canonical edge")
+        self.storage.put_edge(edge.edge_id, edge.to_json().encode("utf-8")); return edge.edge_id
+    def get(self, edge_id: str) -> DependencyGraphEdge:
+        try:
+            edge = DependencyGraphEdge.from_json(self.storage.edge_bytes(edge_id).decode("utf-8"))
+            if edge.edge_id != edge_id or dependency_edge_id_for(edge.stable_subject_id, edge.parent_artifact_id, edge.child_artifact_id, edge.stage, edge.edge_kind) != edge_id: raise ArtifactError("graph edge hash mismatch")
+            return edge
+        except (StorageError, SchemaError, UnicodeDecodeError) as exc: raise ArtifactError(f"invalid or missing graph edge {edge_id}") from exc
+    def bind_revision(self, revision_id: str, edge_ids: Sequence[str], *, allowed_artifact_ids: Sequence[str]) -> None:
+        allowed=set(_ids(allowed_artifact_ids,"allowed_artifact_ids"))
+        for eid in _ids(edge_ids,"edge_ids"):
+            edge=self.get(eid)
+            if edge.parent_artifact_id not in allowed or edge.child_artifact_id not in allowed: raise ArtifactError("selected graph edge endpoint is outside revision closure")
+    def edge_ids(self, revision_id: str) -> tuple[str,...]:
+        # Revision archives, not global SQLite history, are graph selection authority.
+        return ()
+    def edges(self, revision_id: str) -> tuple[DependencyGraphEdge,...]: return ()
+    def forward(self, revision_id: str, node_id: str) -> tuple[DependencyGraphEdge,...]: return ()
+    def reverse(self, revision_id: str, node_id: str) -> tuple[DependencyGraphEdge,...]: return ()
+    traverse_forward=forward; traverse_reverse=reverse
+    def descendants(self, revision_id: str, artifact_id: str) -> tuple[str,...]: return ()
+    def ancestors(self, revision_id: str, artifact_id: str) -> tuple[str,...]: return ()
+
+
+class V2SealedDependencyGraph:
+    def __init__(self, revision: Path, revision_id: str, storage: Storage):
+        self.revision = revision; self.revision_id = revision_id; self.storage = storage
+    def _values(self):
+        return self.storage.verify_zip(self.revision, revision_id=self.revision_id)
+    def _require(self, revision_id: str) -> Mapping[str, bytes]:
+        if revision_id != self.revision_id: raise ArtifactError("sealed graph belongs to a different revision")
+        return self._values()
+    def edge_ids(self, revision_id: str) -> tuple[str, ...]:
+        values=self._require(revision_id)
+        return tuple(sorted(name[6:-5] for name in values if name.startswith("edges/") and name.endswith(".json")))
+    def get(self, edge_id: str) -> DependencyGraphEdge:
+        try: edge=DependencyGraphEdge.from_json(self._values()[f"edges/{edge_id}.json"].decode("utf-8"))
+        except (KeyError, SchemaError, UnicodeDecodeError) as exc: raise ArtifactError("invalid sealed graph edge") from exc
+        if edge.edge_id != edge_id or dependency_edge_id_for(edge.stable_subject_id, edge.parent_artifact_id, edge.child_artifact_id, edge.stage, edge.edge_kind) != edge_id: raise ArtifactError("sealed graph edge hash mismatch")
+        return edge
+    def edges(self, revision_id: str) -> tuple[DependencyGraphEdge, ...]: return tuple(self.get(eid) for eid in self.edge_ids(revision_id))
+    def forward(self, revision_id: str, node_id: str) -> tuple[DependencyGraphEdge, ...]: return tuple(e for e in self.edges(revision_id) if e.parent_artifact_id == node_id or e.stable_subject_id == node_id)
+    def reverse(self, revision_id: str, node_id: str) -> tuple[DependencyGraphEdge, ...]: return tuple(e for e in self.edges(revision_id) if e.child_artifact_id == node_id or e.stable_subject_id == node_id)
+    traverse_forward=forward; traverse_reverse=reverse
+    def descendants(self, revision_id: str, artifact_id: str) -> tuple[str, ...]: return self._walk(revision_id, artifact_id, True)
+    def ancestors(self, revision_id: str, artifact_id: str) -> tuple[str, ...]: return self._walk(revision_id, artifact_id, False)
+    def _walk(self, revision_id: str, artifact_id: str, forward: bool) -> tuple[str, ...]:
+        result=set(); queue=deque([artifact_id]); edges=self.edges(revision_id)
+        while queue:
+            node=queue.popleft()
+            for edge in edges:
+                source,target=(edge.parent_artifact_id,edge.child_artifact_id) if forward else (edge.child_artifact_id,edge.parent_artifact_id)
+                if source == node and target not in result: result.add(target); queue.append(target)
+        return tuple(sorted(result))
+
+
+class V2RevisionStore:
+    def __init__(self, root: Path | str, artifact_store: V2ArtifactStore | None = None, graph: V2DependencyGraph | None = None):
+        self.root = Path(root)
+        self.storage = Storage(self.root)
+        self.revisions_dir = self.storage.revisions_dir
+        self.artifacts = artifact_store or V2ArtifactStore(self.root)
+        self.graph = graph or V2DependencyGraph(self.root, self.storage)
+
+    def _archive_path(self, revision_id: str) -> Path:
+        return self.revisions_dir / f"{revision_id}.zip"
+
+    def _revision_path(self, revision_id: str) -> Path:
+        return self._archive_path(revision_id)
+
+    def seal_bundle(self, snapshot: RevisionSnapshot, provenance: Mapping[str, Any], epub: bytes | Path | str, *, render_input_artifact_id: str | None = None, edge_ids: Sequence[str] = (), epub_filename: str = "book.epub", expected_embedded_provenance: Mapping[str, Any] | None = None) -> Path:
+        if not isinstance(snapshot, RevisionSnapshot): raise ArtifactError("snapshot must be RevisionSnapshot")
+        if not isinstance(provenance, Mapping): raise ArtifactError("provenance must be an object")
+        if Path(epub_filename).name != epub_filename or not epub_filename: raise ArtifactError("epub_filename must be a bare filename")
+        artifacts, findings = self.artifacts.closure(snapshot.selected_artifact_ids, finding_ids=snapshot.selected_finding_ids)
+        artifact_ids={a.artifact_id for a in artifacts}; finding_ids={f.finding_id for f in findings}
+        attestations={aid:self.artifacts.get_semantic_attestation(aid) for aid in snapshot.selected_cache_attestation_ids}
+        for body in attestations.values():
+            envelope = next((a for a in artifacts if a.artifact_id == body.get("artifact_id")), None)
+            if envelope is None or body.get("kind") != envelope.kind or tuple(body.get("dependency_ids", ())) != envelope.dependency_ids:
+                raise ArtifactError("semantic attestation escapes selected artifact closure")
+        edge_ids = _ids(edge_ids, "edge_ids")
+        edges={}
+        for eid in edge_ids:
+            edge=self.graph.get(eid)
+            if edge.parent_artifact_id not in artifact_ids or edge.child_artifact_id not in artifact_ids: raise ArtifactError("bundle graph edge escapes selected closure")
+            edges[eid]=edge.to_json().encode("utf-8")
+        epub_bytes = LegacyRevisionStore._epub_bytes(epub)
+        if expected_embedded_provenance is not None and canonical_json_bytes(dict(expected_embedded_provenance)) != canonical_json_bytes(dict(provenance)):
+            raise ArtifactError("expected embedded provenance must equal bundle provenance")
+        # Empty EPUB is retained as a historical compatibility fixture.  Any
+        # real EPUB is checked before publication and again during verification.
+        if epub_bytes:
+            LegacyRevisionStore._verify_embedded_provenance(epub_bytes, provenance)
+        if render_input_artifact_id is not None:
+            if render_input_artifact_id not in artifact_ids: raise ArtifactError("render input is outside selected artifact closure")
+            render_hash = hashlib.sha256(canonical_json_bytes(next(a for a in artifacts if a.artifact_id == render_input_artifact_id).to_dict())).hexdigest()
+        else:
+            render_hash = None
+        # FC3 keeps the v2 archive limited to the selected closure.  EPUB and
+        # provenance are validated inputs, not loose compatibility outputs.
+        members = {}
+        members.update({f"records/{a.artifact_id}.json":a.to_json().encode("utf-8") for a in artifacts})
+        members.update({f"findings/{f.finding_id}.json":f.to_json().encode("utf-8") for f in findings})
+        members.update({f"edges/{eid}.json":data for eid,data in edges.items()})
+        members.update({f"attestations/{aid}.json":canonical_json_bytes(body) for aid,body in attestations.items()})
+        try:
+            return self.storage.seal_revision(
+                snapshot.revision_id, snapshot.to_json().encode("utf-8"), members,
+                activate=True, edge_ids=edge_ids,
+            )
+        except StorageError as exc: raise ArtifactError(str(exc)) from exc
+    def verify_bundle(self, revision_id: str) -> RevisionSnapshot:
+        path=self._archive_path(revision_id)
+        try:
+            values=self.storage.verify_revision(revision_id)
+            snapshot = RevisionSnapshot.from_json(values["snapshot.json"].decode("utf-8"))
+        except (StorageError, SchemaError, UnicodeDecodeError, ArtifactError) as exc: raise ArtifactError(f"invalid or missing sealed revision {revision_id}: {exc}") from exc
+        records={}; findings={}
+        for name,data in values.items():
+            if name.startswith("records/"):
+                try: record=ArtifactEnvelope.from_json(data.decode("utf-8"))
+                except (SchemaError,UnicodeDecodeError) as exc: raise ArtifactError("invalid sealed record") from exc
+                if name != f"records/{record.artifact_id}.json" or artifact_id_for(record.kind,record.payload,record.dependency_ids)!=record.artifact_id: raise ArtifactError("sealed record hash mismatch")
+                records[record.artifact_id]=record
+            elif name.startswith("findings/"):
+                try: finding=Finding.from_json(data.decode("utf-8"))
+                except (SchemaError,UnicodeDecodeError) as exc: raise ArtifactError("invalid sealed finding") from exc
+                if name != f"findings/{finding.finding_id}.json": raise ArtifactError("sealed finding ID mismatch")
+                findings[finding.finding_id]=finding
+        if not set(snapshot.selected_artifact_ids).issubset(records) or not set(snapshot.selected_finding_ids).issubset(findings): raise ArtifactError("sealed revision omits selected closure")
+        for record in records.values():
+            if not set(record.dependency_ids).issubset(records) or not set(record.finding_ids).issubset(findings): raise ArtifactError("sealed record closure is incomplete")
+        for name, data in values.items():
+            if name.startswith("attestations/"):
+                try: body=json.loads(data.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError) as exc: raise ArtifactError("invalid sealed attestation") from exc
+                required={"attestation_id", "artifact_id", "kind", "semantic_key", "dependency_ids"}
+                if not isinstance(body, Mapping) or set(body) != required or name != f"attestations/{body.get('attestation_id')}.json": raise ArtifactError("invalid sealed attestation")
+                try: expected=V2ArtifactStore.semantic_attestation_id_for(artifact_id=body["artifact_id"], kind=body["kind"], semantic_key=body["semantic_key"], dependency_ids=body["dependency_ids"])
+                except (ArtifactError, TypeError) as exc: raise ArtifactError("invalid sealed attestation") from exc
+                envelope=records.get(body["artifact_id"])
+                if expected != body["attestation_id"] or envelope is None or envelope.kind != body["kind"] or tuple(body["dependency_ids"]) != envelope.dependency_ids: raise ArtifactError("sealed attestation closure mismatch")
+            elif name.startswith("edges/"):
+                try: edge=DependencyGraphEdge.from_json(data.decode("utf-8"))
+                except (SchemaError, UnicodeDecodeError) as exc: raise ArtifactError("invalid sealed edge") from exc
+                if name != f"edges/{edge.edge_id}.json" or dependency_edge_id_for(edge.stable_subject_id, edge.parent_artifact_id, edge.child_artifact_id, edge.stage, edge.edge_kind) != edge.edge_id or edge.parent_artifact_id not in records or edge.child_artifact_id not in records: raise ArtifactError("sealed edge closure mismatch")
+        return snapshot
+    def snapshot(self, revision_id: str) -> RevisionSnapshot: return self.verify_bundle(revision_id)
+    def activate(self, revision_id: str) -> None:
+        self.verify_bundle(revision_id); self.storage.activate(revision_id)
+    def active_snapshot(self) -> RevisionSnapshot | None:
+        rid=self.storage.active_revision_id(); return None if rid is None else self.snapshot(rid)
+    def selected_graph(self, revision_id: str):
+        self.snapshot(revision_id); return V2SealedDependencyGraph(self._archive_path(revision_id), revision_id, self.storage)
+
+
+class _ArtifactStoreFactoryMeta(type):
+    def __instancecheck__(cls, instance: Any) -> bool:
+        return isinstance(instance, (LegacyArtifactStore, V2ArtifactStore))
+
+
+class ArtifactStore(metaclass=_ArtifactStoreFactoryMeta):
+    def __new__(cls, root: Path | str, *args: Any, **kwargs: Any):
+        root=Path(root)
+        if kwargs.pop("legacy", False) or _legacy_workspace(root): return LegacyReadOnlyArtifactStore(root)
+        return V2ArtifactStore(root)
+
+    semantic_attestation_id_for = staticmethod(V2ArtifactStore.semantic_attestation_id_for)
+
+
+class _DependencyGraphFactoryMeta(type):
+    def __instancecheck__(cls, instance: Any) -> bool:
+        return isinstance(instance, (LegacyDependencyGraph, LegacyReadOnlyGraph, V2DependencyGraph))
+
+
+class DependencyGraph(metaclass=_DependencyGraphFactoryMeta):
+    def __new__(cls, root: Path | str, *args: Any, **kwargs: Any):
+        root=Path(root)
+        if kwargs.pop("legacy", False) or _legacy_workspace(root): return LegacyReadOnlyGraph(root)
+        return V2DependencyGraph(root, *args, **kwargs)
+
+
+class _RevisionStoreFactoryMeta(type):
+    def __instancecheck__(cls, instance: Any) -> bool:
+        return isinstance(instance, (LegacyRevisionStore, LegacyReadOnlyRevisionStore, V2RevisionStore))
+
+
+class RevisionStore(metaclass=_RevisionStoreFactoryMeta):
+    def __new__(cls, root: Path | str, *args: Any, **kwargs: Any):
+        root=Path(root)
+        if kwargs.pop("legacy", False) or _legacy_workspace(root): return LegacyReadOnlyRevisionStore(root, *args, **kwargs)
+        return V2RevisionStore(root, *args, **kwargs)
+
+
+# Short compatibility aliases for callers that prefer noun-first naming.
+canonical_artifact_id = artifact_id_for
+canonical_edge_id = dependency_edge_id_for
+
+class LegacyReadOnlyArtifactStore(LegacyArtifactStore):
+    """Read-only adapter for pre-v2 loose state."""
+    def __init__(self, root: Path | str):
+        self.root = Path(root)
+        self.artifacts_dir = self.root / "artifacts"
+        self.findings_dir = self.root / "findings"
+        self.index_dir = self.root / "index"
+        self.attestations_dir = self.root / "attestations"
+        self.quarantine_dir = self.root / "quarantine"
+    def _quarantine_invalid(self, *args: Any, **kwargs: Any) -> None:
+        return None
+    def _quarantine_attestation(self, *args: Any, **kwargs: Any) -> None:
+        return None
+    def put_finding(self, finding: Finding) -> str:
+        raise ArtifactError("legacy workspace is read-only")
+    def put(self, *args: Any, **kwargs: Any) -> ArtifactEnvelope:
+        raise ArtifactError("legacy workspace is read-only")
+
+
+class LegacyReadOnlyGraph:
+    """Read-only legacy graph adapter; construction never creates directories."""
+    def __init__(self, root: Path | str):
+        self.root = Path(root)
+        self.edges_dir = self.root / "graph" / "edges"
+        self.revisions_dir = self.root / "graph" / "revisions"
+
+    def edge(self, *, stable_subject_id: str, parent_artifact_id: str, child_artifact_id: str, stage: str, edge_kind: str) -> DependencyGraphEdge:
+        return DependencyGraphEdge(edge_id=dependency_edge_id_for(stable_subject_id, parent_artifact_id, child_artifact_id, stage, edge_kind), stable_subject_id=stable_subject_id, parent_artifact_id=parent_artifact_id, child_artifact_id=child_artifact_id, stage=stage, edge_kind=edge_kind)
+
+    def put(self, edge: DependencyGraphEdge) -> str:
+        raise ArtifactError("legacy workspace graph is read-only")
+
+    def get(self, edge_id: str) -> DependencyGraphEdge:
+        try:
+            edge = DependencyGraphEdge.from_file(self.edges_dir / f"{edge_id}.json")
+            expected = dependency_edge_id_for(edge.stable_subject_id, edge.parent_artifact_id, edge.child_artifact_id, edge.stage, edge.edge_kind)
+            if edge.edge_id != edge_id or expected != edge_id:
+                raise ArtifactError("legacy graph edge hash mismatch")
+            return edge
+        except (OSError, SchemaError) as exc:
+            raise ArtifactError(f"invalid or missing legacy graph edge {edge_id}") from exc
+
+    def edge_ids(self, revision_id: str) -> tuple[str, ...]:
+        try:
+            body = _read_json(self.revisions_dir / f"{revision_id}.json")
+            if body.get("revision_id") != revision_id:
+                raise ArtifactError("legacy graph revision mismatch")
+            return _ids(body.get("edge_ids", ()), "edge_ids")
+        except (OSError, ArtifactError) as exc:
+            raise ArtifactError("invalid legacy graph revision") from exc
+
+    def edges(self, revision_id: str) -> tuple[DependencyGraphEdge, ...]:
+        return tuple(self.get(edge_id) for edge_id in self.edge_ids(revision_id))
+
+    def forward(self, revision_id: str, node_id: str) -> tuple[DependencyGraphEdge, ...]:
+        return tuple(edge for edge in self.edges(revision_id) if edge.parent_artifact_id == node_id or edge.stable_subject_id == node_id)
+
+    def reverse(self, revision_id: str, node_id: str) -> tuple[DependencyGraphEdge, ...]:
+        return tuple(edge for edge in self.edges(revision_id) if edge.child_artifact_id == node_id or edge.stable_subject_id == node_id)
+
+    traverse_forward = forward
+    traverse_reverse = reverse
+
+
+class LegacyReadOnlyRevisionStore(LegacyRevisionStore):
+    def __init__(self, root: Path | str, artifact_store: Any = None, graph: Any = None):
+        self.root = Path(root)
+        self.revisions_dir = self.root / "revisions"
+        self.artifacts = artifact_store or LegacyReadOnlyArtifactStore(self.root)
+        self.graph = graph or LegacyReadOnlyGraph(self.root)
+    def seal_bundle(self, *args: Any, **kwargs: Any) -> Path:
+        raise ArtifactError("legacy workspace is read-only")
+    def activate(self, revision_id: str) -> None:
+        raise ArtifactError("legacy workspace is read-only")
