@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from btran.artifacts import ArtifactStore
+from btran.orchestrator_contract import OrderedEffectivePage, SelectedEffectiveContent
 from btran.reconciliation import reconcile_effective
 from btran.schema import EffectivePage, EffectiveSegment
 from btran.validators import (
@@ -158,9 +159,41 @@ def test_validation_findings_use_fc7_categories_and_keep_continuation(tmp_path):
     )
     findings = [store.get_finding(item) for item in result.finding_ids]
     categories = {item.audit_category for item in findings if item.audit_category is not None}
-    assert {"validation", "conflict", "actionable_ambiguity", "failure", "fallback"} <= categories
+    assert {"validation", "actionable_ambiguity", "failure", "fallback"} <= categories
+    assert not any(
+        item.audit_category == "conflict"
+        for item in findings
+    )
     assert all(item.requires_action is False for item in findings)
     assert any(item.kind == "stage_summary" and item.audit_category is None for item in findings)
+
+
+def test_validation_consumes_selected_effective_content_without_store_reads(tmp_path, monkeypatch):
+    store, page_id, reconciliation = _inputs(tmp_path)
+    page_envelope = store.get(page_id)
+    segment_envelope = store.get(page_envelope.dependency_ids[0])
+    selected = SelectedEffectiveContent((OrderedEffectivePage(
+        EffectivePage.from_dict(page_envelope.payload),
+        (EffectiveSegment.from_dict(segment_envelope.payload),),
+    ),))
+    observed = []
+
+    def ordered(pages, *_):
+        observed.extend((page_id, segment.segment_id) for page_id, _, segments in pages for _, segment in segments)
+        return ()
+
+    def fail_reload(_):
+        raise AssertionError("selected closure must not be reloaded from ArtifactStore")
+
+    monkeypatch.setattr(store, "get", fail_reload)
+    result = validate_effective(
+        effective_pages=selected, reconciliation=reconciliation, store=store,
+        base_revision_id="revision-1", mode="translated", rules={"ordered": ordered},
+    )
+
+    assert result.status == "completed"
+    assert observed == [("effective-page-1", "segment-1")]
+    assert result.effective_page_artifact_ids == ("effective-page-1",)
 
 
 def test_native_validation_uses_source_equivalent_rules_and_omits_target_rules(tmp_path):

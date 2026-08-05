@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from btran.artifacts import ArtifactStore, artifact_id_for, validation_semantic_key
+from btran.orchestrator_contract import SelectedEffectiveContent
 from btran.reconciliation import ReconciliationArtifact
 from btran.schema import (
     ConfidenceAssessment,
@@ -147,20 +148,25 @@ class ValidationArtifact:
 
 
 def _selected_effective_pages(value: Any, store: ArtifactStore) -> tuple[tuple[str, EffectivePage, tuple[tuple[str, EffectiveSegment], ...]], ...]:
-    """Load selected pages once, restoring the page's declared child order.
+    """Adapt selected content to the legacy rule input without reloading it.
 
-    ArtifactStore dependency IDs are canonical sets and therefore sorted for
-    storage.  They are not an execution order.  The page record is the
-    authority for segment order; the selected input is the authority for page
-    order.
+    ``SelectedEffectiveContent`` is already an immutable, validated view from
+    the one selected-closure traversal.  Its page/segment order is semantic;
+    never consult the store to revalidate or reconstruct that closure.  The
+    artifact-ID path below remains for migration callers that have not yet
+    adopted the view contract.
     """
+    if isinstance(value, SelectedEffectiveContent):
+        return tuple(
+            (
+                ordered.page.effective_page_id,
+                ordered.page,
+                tuple((segment.effective_segment_id, segment) for segment in ordered.segments),
+            )
+            for ordered in value.pages
+        )
+
     leaves = getattr(value, "leaves", value)
-    if hasattr(value, "pages"):
-        # SelectedEffectiveContent carries semantic pages rather than artifact
-        # addresses.  The normal execution path supplies archive addresses, but
-        # reject this shape here rather than silently deriving an address from
-        # storage order.
-        raise ValueError("validation requires selected effective page artifact IDs")
     if not isinstance(leaves, (tuple, list)):
         raise ValueError("effective pages must be selected page artifact IDs")
     output = []
@@ -259,13 +265,16 @@ def _put_validation_assessment(store: ArtifactStore, *, validation_id: str, subj
 
 
 def _error_category(rule: str, error: str) -> tuple[str, str]:
-    """Map one validator observation to its FC7 audit classification."""
+    """Map validator observations to FC7 without guessing from prose.
+
+    Validator rule errors are validation findings.  Only an explicitly named
+    ambiguous mapping is allowed to retain the more specific audit category;
+    words such as ``conflict`` in ordinary rule text are not evidence of a
+    reconciliation conflict.
+    """
     text = error.casefold()
-    if "ambiguous" in text or "ambiguity" in text:
+    if re.search(r"(?:^|[\s:_-])ambiguous[\s_-]+mapping(?:$|[\s:,_-])", text):
         return "actionable_ambiguity", "explicit ambiguous mapping"
-    if "context_conflict" in text or "conflict" in text:
-        return "conflict", "reconciliation context conflict"
-    # Missing terminology is a validation defect, not an inferred conflict.
     return "validation", "validator rule error"
 
 
