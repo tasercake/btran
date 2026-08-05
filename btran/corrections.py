@@ -990,6 +990,33 @@ def _archive_selected_artifacts(revisions: RevisionStore, revision_id: str) -> d
     return selected
 
 
+def _selected_closure_revision_id(selected_closure: Any) -> str:
+    """Return the identity proved by a supplied closure.
+
+    A closure is an authority boundary, not just a record map.  Require its
+    revision identity before using any records or graph edges so a caller
+    cannot pair the requested/base revision with another sealed authority.
+    """
+    revision_id = (selected_closure.get("revision_id")
+                   if isinstance(selected_closure, Mapping)
+                   else getattr(selected_closure, "revision_id", None))
+    try:
+        return _id(revision_id, "selected closure revision_id")
+    except CorrectionError as exc:
+        raise CorrectionError("selected invocation closure has no valid revision ID") from exc
+
+
+def _verify_selected_closure_revision(selected_closure: Any, expected_revision_id: str) -> None:
+    if selected_closure is None:
+        return
+    expected = _id(expected_revision_id, "expected selected revision_id")
+    actual = _selected_closure_revision_id(selected_closure)
+    if actual != expected:
+        raise CorrectionError(
+            "selected invocation closure revision does not match requested/base revision"
+        )
+
+
 def _sealed_selected_artifacts(
     revisions: RevisionStore, revision_id: str, *, selected_closure: Any = None,
 ) -> dict[str, ArtifactEnvelope]:
@@ -1000,6 +1027,7 @@ def _sealed_selected_artifacts(
     traversal and could observe a different immutable revision.  The archive
     path remains only for callers using the pre-closure compatibility API.
     """
+    _verify_selected_closure_revision(selected_closure, revision_id)
     selected = _closure_artifact_map(selected_closure)
     if selected_closure is not None:
         if selected is None:
@@ -1016,8 +1044,10 @@ def resolve_selected_overlays(
     selected_closure: Any = None,
 ) -> OverlayResolution:
     """Load verified sealed base closure and resolve one explicitly selected set."""
+    requested_revision_id = _id(base_revision_id, "base_revision_id")
+    _verify_selected_closure_revision(selected_closure, requested_revision_id)
     if correction_set_id is None:
-        return OverlayResolution(_id(base_revision_id, "base_revision_id"), None)
+        return OverlayResolution(requested_revision_id, None)
     correction_set = store.get_set(correction_set_id)
     selected = _sealed_selected_artifacts(revisions, base_revision_id, selected_closure=selected_closure)
     # Load all retained immutable records, not only currently active IDs: a
@@ -1468,8 +1498,15 @@ def correction_impact_finding(
             value for name in ("segment_id", "mapping_id", "concept_id")
             if isinstance((value := scope.get(name)), str)
         )
-        occurrence_ids = ((scope["occurrence_id"],)
-                          if isinstance(scope.get("occurrence_id"), str) else ())
+        direct_occurrence_ids = ((scope["occurrence_id"],)
+                                  if isinstance(scope.get("occurrence_id"), str) else ())
+        selector = scope.get("selector")
+        selector_occurrence_ids = (
+            tuple(item for item in selector.get("ids", ()) if isinstance(item, str))
+            if isinstance(selector, Mapping) and selector.get("kind") == "occurrence_ids"
+            else ()
+        )
+        occurrence_ids = tuple(sorted(set((*direct_occurrence_ids, *selector_occurrence_ids))))
         scope_ids.update(occurrence_ids)
     subject_refs = tuple(sorted({
         value for value in (impact.correction_id, impact.correction_set_id, *scope_ids, *invalidated_ids)

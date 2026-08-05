@@ -464,13 +464,20 @@ def test_selected_closure_is_compact_correction_boundary(tmp_path):
         def _revision_path(self, revision_id):
             raise AssertionError("selected closure must avoid archive reads")
 
-    closure = {source.artifact_id: source}
+    closure = {"revision_id": "revision", source.artifact_id: source}
     result = resolve_selected_overlays(
         store, NoRevisionTraversal(), base_revision_id="revision",
         correction_set_id=correction_set.set_id, selected_closure=closure,
     )
     assert result.applicable_correction_ids == (record.correction_id,)
     assert result.source_inputs[0].replacement == "fixed"
+
+    wrong_revision_closure = {"revision_id": "another-revision", source.artifact_id: source}
+    with pytest.raises(CorrectionError, match="does not match"):
+        resolve_selected_overlays(
+            store, NoRevisionTraversal(), base_revision_id="revision",
+            correction_set_id=correction_set.set_id, selected_closure=wrong_revision_closure,
+        )
 
 
 def test_target_corrections_require_current_translation_leaf_and_span():
@@ -502,6 +509,23 @@ def test_target_corrections_require_current_translation_leaf_and_span():
     reasons = {finding.evidence["correction_id"]: finding.evidence["reason"] for finding in result.findings}
     assert reasons[segment.correction_id] == "target_relation_missing"
     assert reasons[occurrence.correction_id] == "mapping_text_mismatch"
+
+
+def test_correction_impact_finding_includes_terminology_selector_occurrences():
+    correction = correction_record_for({
+        "kind": "terminology", "applies_to_revision_id": "revision",
+        "scope": {"concept_id": "concept", "selector": {"kind": "occurrence_ids", "ids": ["occ-a", "occ-b"]}},
+        "base": {"projection": {"artifact_id": "projection", "sha256": "a" * 64},
+                 "membership": {"artifact_id": "membership", "sha256": "b" * 64}},
+        "replacement": "term",
+    })
+    impact = CorrectionImpact(
+        base_revision_id="revision", projection_plan_id="plan",
+        correction_id=correction.correction_id, correction_set_id="set",
+    )
+    finding = correction_impact_finding(impact, correction)
+    assert finding.evidence["occurrence_ids"] == ["occ-a", "occ-b"]
+    assert {"occ-a", "occ-b"}.issubset(finding.subject_refs)
 
 
 def test_apply_revert_and_supersede_publish_atomic_set_and_nonexecuting_impact(tmp_path):

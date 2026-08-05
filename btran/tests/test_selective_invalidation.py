@@ -17,6 +17,7 @@ from PIL import Image
 from btran.artifacts import ArtifactStore, DependencyGraph, RevisionStore
 from btran.config import Config
 from btran.corrections import (
+    CorrectionError,
     CorrectionSet,
     CorrectionStore,
     base_hash_for_artifact,
@@ -361,6 +362,17 @@ async def test_correction_planning_uses_provided_closure_without_selected_state_
     assert transitioned_impact.affected == impact.affected
     assert impact.correction_id == correction.correction_id
     assert any(item["base_artifact_id"] == raw.artifact_id for item in impact.affected)
+
+    wrong_revision_closure = SimpleNamespace(
+        revision_id="wrong-revision",
+        records=closure.records,
+        edges=closure.edges,
+    )
+    with pytest.raises(CorrectionError, match="does not match"):
+        impact_for_correction(
+            CorrectionStore(config.workspace), revisions, correction,
+            correction_set=correction_set, selected_closure=wrong_revision_closure,
+        )
 
 
 @pytest.mark.asyncio
