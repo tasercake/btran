@@ -19,6 +19,7 @@ from btran.corrections import (
     base_hash_for_artifact,
     correction_event_for,
     correction_event_id_for,
+    correction_impact_finding,
     correction_record_for,
     correction_transition,
     parse_correction_json,
@@ -239,6 +240,8 @@ def test_historical_supersession_rejects_scope_mismatch_and_branch_conflict():
     )
     assert not conflict.applicable_correction_ids
     assert {finding.kind for finding in conflict.findings} == {"correction_conflict"}
+    assert all(finding.audit_category == "conflict" for finding in conflict.findings)
+    assert all(finding.evidence.get("trigger") for finding in conflict.findings)
 
 
 def test_stale_supersession_ancestor_makes_all_successors_inapplicable():
@@ -445,6 +448,38 @@ def _sealed_source_revision(tmp_path):
     return artifacts, revisions, source, revision_id
 
 
+def test_selected_closure_is_compact_correction_boundary(tmp_path):
+    source = _artifact("source", {"segment_id": "segment", "source_text": "old"})
+    record = correction_record_for(_source("revision", source))
+    event, correction_set = _successor_event_set("revision", (record.correction_id,), record.correction_id, "apply")
+    store = CorrectionStore(tmp_path)
+    store.put_record(record)
+    store.put_set(correction_set)
+    store.put_event(event)
+
+    class NoRevisionTraversal:
+        def snapshot(self, revision_id):
+            raise AssertionError("selected closure must avoid revision traversal")
+
+        def _revision_path(self, revision_id):
+            raise AssertionError("selected closure must avoid archive reads")
+
+    closure = {"revision_id": "revision", source.artifact_id: source}
+    result = resolve_selected_overlays(
+        store, NoRevisionTraversal(), base_revision_id="revision",
+        correction_set_id=correction_set.set_id, selected_closure=closure,
+    )
+    assert result.applicable_correction_ids == (record.correction_id,)
+    assert result.source_inputs[0].replacement == "fixed"
+
+    wrong_revision_closure = {"revision_id": "another-revision", source.artifact_id: source}
+    with pytest.raises(CorrectionError, match="does not match"):
+        resolve_selected_overlays(
+            store, NoRevisionTraversal(), base_revision_id="revision",
+            correction_set_id=correction_set.set_id, selected_closure=wrong_revision_closure,
+        )
+
+
 def test_target_corrections_require_current_translation_leaf_and_span():
     effective = _artifact(
         "effective", {"segment_id": "segment", "translated_text": "old", "mappings": []},
@@ -476,6 +511,23 @@ def test_target_corrections_require_current_translation_leaf_and_span():
     assert reasons[occurrence.correction_id] == "mapping_text_mismatch"
 
 
+def test_correction_impact_finding_includes_terminology_selector_occurrences():
+    correction = correction_record_for({
+        "kind": "terminology", "applies_to_revision_id": "revision",
+        "scope": {"concept_id": "concept", "selector": {"kind": "occurrence_ids", "ids": ["occ-a", "occ-b"]}},
+        "base": {"projection": {"artifact_id": "projection", "sha256": "a" * 64},
+                 "membership": {"artifact_id": "membership", "sha256": "b" * 64}},
+        "replacement": "term",
+    })
+    impact = CorrectionImpact(
+        base_revision_id="revision", projection_plan_id="plan",
+        correction_id=correction.correction_id, correction_set_id="set",
+    )
+    finding = correction_impact_finding(impact, correction)
+    assert finding.evidence["occurrence_ids"] == ["occ-a", "occ-b"]
+    assert {"occ-a", "occ-b"}.issubset(finding.subject_refs)
+
+
 def test_apply_revert_and_supersede_publish_atomic_set_and_nonexecuting_impact(tmp_path):
     _, revisions, source, revision_id = _sealed_source_revision(tmp_path)
     store = CorrectionStore(tmp_path)
@@ -486,6 +538,15 @@ def test_apply_revert_and_supersede_publish_atomic_set_and_nonexecuting_impact(t
     assert impact.projection_plan_id and impact.regenerated == ()
     assert impact.correction_id == first.active_correction_ids[0]
     assert impact.correction_set_id == first.set_id
+    impact_finding = correction_impact_finding(impact, correction_record_for(first_payload))
+    stored_impact_finding = store.artifacts.get_finding(impact_finding.finding_id)
+    assert stored_impact_finding.audit_category == "correction_impact"
+    assert stored_impact_finding.evidence["correction_id"] == impact.correction_id
+    assert stored_impact_finding.evidence["prior_selected_ids"]
+    assert set(stored_impact_finding.evidence["invalidated_selected_ids"]).issubset(
+        set(stored_impact_finding.evidence["prior_selected_ids"])
+    )
+    assert stored_impact_finding.evidence["dirty_set"]
     assert store.correction_time_impact(impact.correction_id) == impact
     partition = (*impact.affected, *impact.unaffected, *impact.ambiguous, *impact.protected)
     assert len(partition) == len({(item["stage"], item["subject_id"], item["base_artifact_id"]) for item in partition})

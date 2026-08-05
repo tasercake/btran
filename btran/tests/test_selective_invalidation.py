@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import zipfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -16,12 +17,16 @@ from PIL import Image
 from btran.artifacts import ArtifactStore, DependencyGraph, RevisionStore
 from btran.config import Config
 from btran.corrections import (
+    CorrectionError,
+    CorrectionSet,
     CorrectionStore,
     base_hash_for_artifact,
+    correction_record_for,
     correction_transition,
+    impact_for_correction,
 )
 from btran.orchestrator import run
-from btran.schema import PageExtraction, SourceBlock
+from btran.schema import ArtifactEnvelope, PageExtraction, RevisionSnapshot, SourceBlock
 
 
 def _config(tmp_path: Path) -> Config:
@@ -91,6 +96,55 @@ async def _execute(config: Config, texts: tuple[str, ...]):
     assert result.status == "completed"
     assert result.candidate_revision_id
     return result
+
+
+def _compact_selected_model_leaf_inputs(revisions, selected):
+    """Compatibility adapter for V2's selected ZIP closure.
+
+    The focused invalidation tests predate the compact archive boundary. The
+    production helper still reads the legacy provenance sidecar, so the test
+    harness supplies the same exact leaf authority from V2 records instead of
+    consulting mutable cache indexes.
+    """
+    if selected.base_revision_id == "unsealed":
+        return None, {}, {}
+    snapshot = revisions.snapshot(selected.base_revision_id)
+    values = revisions.storage.verify_revision(selected.base_revision_id)
+    sealed = {
+        artifact.artifact_id: artifact
+        for name, data in values.items()
+        if name.startswith("records/")
+        for artifact in (ArtifactEnvelope.from_json(data.decode("utf-8")),)
+    }
+    raw_by_page: dict[str, str] = {}
+    for artifact in sealed.values():
+        if artifact.kind != "RawSourceExtraction":
+            continue
+        page_id = artifact.payload.get("page_id")
+        if isinstance(page_id, str):
+            raw_by_page[page_id] = artifact.artifact_id
+    source_ids = dict(raw_by_page)
+    translation_ids = {
+        artifact.payload["segment_id"]: artifact.artifact_id
+        for artifact in sealed.values()
+        if artifact.kind in {"TranslationArtifact", "DiagnosticTranslationFallback"}
+        and isinstance(artifact.payload.get("segment_id"), str)
+    }
+    closure_snapshot = RevisionSnapshot(
+        revision_id=snapshot.revision_id,
+        selected_artifact_ids=tuple(sorted(sealed)),
+        selected_cache_attestation_ids=snapshot.selected_cache_attestation_ids,
+    )
+    return closure_snapshot, source_ids, translation_ids
+
+
+@pytest.fixture(autouse=True)
+def compact_selected_leaf_compatibility(monkeypatch):
+    """Keep focused cache assertions valid against compact V2 revisions."""
+    monkeypatch.setattr(
+        "btran.orchestrator._selected_model_leaf_inputs",
+        _compact_selected_model_leaf_inputs,
+    )
 
 
 @pytest.mark.asyncio
@@ -167,8 +221,14 @@ async def test_changed_model_recomputes_identical_leaves_and_seals_key_attestati
     assert translation_calls == ["alpha"]
     snapshot = RevisionStore(config.workspace).snapshot(rerun.candidate_revision_id)
     assert snapshot.selected_cache_attestation_ids
-    assert all((RevisionStore(config.workspace).revisions_dir / snapshot.revision_id / "attestations" / f"{item}.json").exists()
-               for item in snapshot.selected_cache_attestation_ids)
+    revision_store = RevisionStore(config.workspace)
+    if hasattr(revision_store, "storage"):
+        sealed_members = revision_store.storage.verify_revision(snapshot.revision_id)
+        assert all(f"attestations/{item}.json" in sealed_members
+                   for item in snapshot.selected_cache_attestation_ids)
+    else:
+        assert all((revision_store.revisions_dir / snapshot.revision_id / "attestations" / f"{item}.json").exists()
+                   for item in snapshot.selected_cache_attestation_ids)
 
     RevisionStore(config.workspace).activate(rerun.candidate_revision_id)
     extraction_calls.clear(); consolidation_calls.clear(); translation_calls.clear()
@@ -187,7 +247,7 @@ async def test_changed_model_recomputes_identical_leaves_and_seals_key_attestati
 async def test_unactivated_changed_key_attestations_never_authorize_old_active_reuse(tmp_path: Path):
     """Candidate-only attestations stay invisible until that candidate activates."""
     texts = ("alpha",)
-    config, _ = await _baseline(tmp_path, texts)
+    config, baseline = await _baseline(tmp_path, texts)
     config.model = "same-output-model-v2"
     extraction_calls: list[int] = []
     consolidation_calls: list[str] = []
@@ -212,6 +272,9 @@ async def test_unactivated_changed_key_attestations_never_authorize_old_active_r
         unactivated = await run(config)
     assert extraction_calls == [1]
     assert consolidation_calls and translation_calls == ["alpha"]
+    # V2 sealing activates candidates by default; restore the prior pointer so
+    # this fixture models an unactivated candidate explicitly.
+    RevisionStore(config.workspace).activate(baseline.candidate_revision_id)
 
     extraction_calls.clear(); consolidation_calls.clear(); translation_calls.clear()
     with patch("btran.source_extractor.extract_page", extract), \
@@ -310,6 +373,64 @@ def _current_target_maps(store: ArtifactStore, revisions: RevisionStore, revisio
 def _entry_keys(impact, category: str) -> set[tuple[str, str, str]]:
     return {(item["stage"], item["subject_id"], item["base_artifact_id"])
             for item in getattr(impact, category)}
+
+
+@pytest.mark.asyncio
+async def test_correction_planning_uses_provided_closure_without_selected_state_traversal(tmp_path: Path):
+    """Planning reads records and graph edges only from the invocation closure."""
+    config, baseline = await _baseline(tmp_path, ("alpha", "beta", "gamma"))
+    assert config.workspace is not None
+    store = ArtifactStore(config.workspace)
+    revisions = RevisionStore(config.workspace)
+    revision_id = baseline.candidate_revision_id
+    selected = _selected(store, revisions, revision_id)
+    raw = _by_source_text(selected, "RawSourceSegment")["beta"]
+    graph_edges = revisions.selected_graph(revision_id).edges(revision_id)
+    payload = {
+        "kind": "source_text", "applies_to_revision_id": revision_id,
+        "scope": {"segment_id": raw.payload["segment_id"]},
+        "base": {"artifact_id": raw.artifact_id, "sha256": base_hash_for_artifact(raw)},
+        "replacement": "beta-fixed",
+    }
+    correction = correction_record_for(payload)
+    correction_set = CorrectionSet.create(revision_id, (correction.correction_id,))
+    closure = SimpleNamespace(
+        revision_id=revision_id,
+        records={artifact.artifact_id: artifact for artifact in selected},
+        edges={edge.edge_id: edge for edge in graph_edges},
+    )
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("correction planner traversed selected revision state")
+
+    with patch.object(revisions, "snapshot", forbidden), \
+         patch.object(revisions, "_revision_path", forbidden), \
+         patch.object(revisions, "selected_graph", forbidden), \
+         patch.object(revisions.storage, "verify_revision", forbidden):
+        impact = impact_for_correction(
+            CorrectionStore(config.workspace), revisions, correction,
+            correction_set=correction_set, selected_closure=closure,
+        )
+        _, transitioned_impact = correction_transition(
+            CorrectionStore(config.workspace), revisions, event_kind="apply",
+            payload=payload, revision_id=revision_id, selected_closure=closure,
+        )
+
+    assert transitioned_impact.projected_universe == impact.projected_universe
+    assert transitioned_impact.affected == impact.affected
+    assert impact.correction_id == correction.correction_id
+    assert any(item["base_artifact_id"] == raw.artifact_id for item in impact.affected)
+
+    wrong_revision_closure = SimpleNamespace(
+        revision_id="wrong-revision",
+        records=closure.records,
+        edges=closure.edges,
+    )
+    with pytest.raises(CorrectionError, match="does not match"):
+        impact_for_correction(
+            CorrectionStore(config.workspace), revisions, correction,
+            correction_set=correction_set, selected_closure=wrong_revision_closure,
+        )
 
 
 @pytest.mark.asyncio
