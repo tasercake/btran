@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+from contextlib import contextmanager
 from pathlib import Path
 import zipfile
 
@@ -12,9 +13,14 @@ import pytest
 from btran.schema import SourceBlock, TermMention, TerminologyEntry
 from btran.terminology import (
     HARD_TOKEN_CAP,
+    CandidateTable,
     PiConsolidationError,
+    TerminologyCandidate,
     batch_term_groups,
+    build_candidate_table,
     cache_identity_with_glossary,
+    consolidate_candidate_table,
+    terminology_candidate_key,
     consolidate_terminology,
     estimate_tokens,
     freeze_terminology,
@@ -22,6 +28,7 @@ from btran.terminology import (
     make_pi_consolidation_call,
     shard_terminology_map,
     slice_for_page,
+    _candidate_fallback_entries,
 )
 
 
@@ -47,6 +54,236 @@ def test_grouping_preserves_original_source_spelling_while_normalizing_its_key()
     assert groups[0].normalized_term == "ffoo"
     assert groups[0].forms == (original,)
     assert groups[0].provenance == ("p1-b1",)
+
+
+def test_sparse_candidate_tiers_keep_selected_tier_zero_and_order_automatic_tiers():
+    blocks = [
+        SourceBlock("b1", "paragraph", "ALPHA v2", 0),
+        SourceBlock("b2", "paragraph", "Ada\u2003\u2003Lovelace", 1),
+        SourceBlock("b3", "paragraph", "ALPHA", 2),
+        SourceBlock("b4", "paragraph", "ordinary phrase", 3),
+    ]
+    selected = TerminologyEntry("selected-concept", ["ordinary phrase"], "terme", ["b4"], 1.0)
+    table = build_candidate_table(blocks, selected_entries=[selected], limit=1)
+
+    assert table.tier_zero[0].entry_ids == ("selected-concept",)
+    assert table.selected[0].tier == 0
+    assert {item.tier for item in table.candidates} >= {0, 2, 3, 5}
+    assert [item.tier for item in table.selected] == [0]
+
+
+def test_selected_rows_retain_origin_categories_and_explicit_target_conflicts():
+    corrections = [
+        {"correction_id": "correction-1", "source_forms": ["Magic"], "replacement": "Magie"},
+    ]
+    glossary = [
+        TerminologyEntry("glossary-1", ["Sword"], "Épée", ["b1"], 1.0),
+        TerminologyEntry("glossary-2", ["Magic"], "Sorcellerie", ["b1"], 1.0),
+    ]
+    table = build_candidate_table(
+        [SourceBlock("b1", "paragraph", "Magic Sword", 0)],
+        selected_terminology_corrections=corrections,
+        selected_entries=glossary,
+    )
+
+    assert table.selected_by_form["Magic"].declared_categories == ("conflict", "user_glossary", "user_selected")
+    assert table.selected_by_form["Sword"].declared_categories == ("user_glossary",)
+    prompt_row = next(item for item in table.prompt_items() if item["source_form"] == "Magic")
+    assert prompt_row["declared_categories"] == ["conflict", "user_glossary", "user_selected"]
+
+
+def test_tier_three_compounds_require_ascii_operands():
+    table = build_candidate_table(
+        [SourceBlock("b1", "paragraph", "foo-bar foo/βeta café-latte", 0)],
+        include_fallback=False,
+    )
+    tier_three = {item.source_form for item in table.candidates if item.tier == 3}
+
+    assert "foo-bar" in tier_three
+    assert "foo/βeta" not in tier_three
+    assert "café-latte" not in tier_three
+
+
+def test_missing_tier_zero_reports_candidate_ids_not_source_forms():
+    table = build_candidate_table(
+        [SourceBlock("b1", "paragraph", "Magic Sword", 0)],
+        selected_entries=[
+            TerminologyEntry("glossary-magic", ["Magic"], "Magie", ["b1"], 1.0),
+            TerminologyEntry("glossary-sword", ["Sword"], "Épée", ["b1"], 1.0),
+        ],
+    )
+    result = consolidate_candidate_table(
+        table, source_lang="en", target_lang="fr",
+        pi_call=lambda _: json.dumps({"entries": [{
+            "concept_id": "magic", "source_terms": ["Magic"], "target_term": "Magie",
+            "provenance": ["glossary-magic"], "confidence": 1.0,
+        }]}),
+    )
+
+    assert result.missing_tier_zero == (terminology_candidate_key("Sword"),)
+    assert "Sword" not in result.missing_tier_zero
+
+
+def test_sparse_model_call_is_bracketed_by_fc5_model_timing():
+    events = []
+
+    class Ledger:
+        @contextmanager
+        def model_execution(self):
+            events.append("enter")
+            try:
+                yield
+            finally:
+                events.append("exit")
+
+    table = build_candidate_table(
+        [SourceBlock("b1", "paragraph", "Magic", 0)],
+        selected_entries=[TerminologyEntry("glossary-magic", ["Magic"], "Magie", ["b1"], 1.0)],
+    )
+
+    def pi_call(_):
+        events.append("call")
+        return json.dumps({"entries": [{
+            "concept_id": "magic", "source_terms": ["Magic"], "target_term": "Magie",
+            "provenance": ["glossary-magic"], "confidence": 1.0,
+        }]})
+
+    result = consolidate_candidate_table(
+        table, source_lang="en", target_lang="fr", pi_call=pi_call, timing_ledger=Ledger(),
+    )
+    assert not result.rejected
+    assert events == ["enter", "call", "exit"]
+
+
+def test_proper_name_detection_accepts_one_or_more_unicode_space_separators():
+    blocks = [
+        SourceBlock("b1", "paragraph", "Ada\u2003\u2003Lovelace", 0),
+        SourceBlock("b2", "paragraph", "Ada\u2003\u2003Lovelace returned", 1),
+    ]
+    table = build_candidate_table(blocks, include_fallback=False)
+
+    names = [item for item in table.candidates if item.source_form == "Ada\u2003\u2003Lovelace"]
+    assert len(names) == 1
+    assert names[0].tier == 2
+
+
+def test_tier_zero_fallback_reuses_each_selected_concept_and_target_sharing_key():
+    first = TerminologyCandidate("Foo", "foo", 0, entry_ids=("concept-a",))
+    second = TerminologyCandidate("foo", "foo", 0, entry_ids=("concept-b",))
+    table = CandidateTable(
+        candidates=(first, second), selected=(first, second),
+        source_forms_by_key={"foo": ("Foo", "foo")},
+        protected_target_forms={"Foo": "un", "foo": "une"},
+    )
+
+    fallback = _candidate_fallback_entries(table)
+    assert [(item.concept_id, item.source_terms, item.target_term) for item in fallback] == [
+        ("concept-a", ["Foo"], "un"), ("concept-b", ["foo"], "une"),
+    ]
+    assert all(not item.concept_id.startswith("fallback-") for item in fallback)
+
+
+@pytest.mark.parametrize(
+    ("pi_call", "primary_kind", "primary_category"),
+    [
+        (lambda _: '{"entries": []}', "terminology_consolidation_invalid", "validation"),
+        (lambda _: None, "terminology_consolidation_failed", "failure"),
+        (lambda _: "", "terminology_consolidation_failed", "failure"),
+        (lambda _: (_ for _ in ()).throw(RuntimeError("offline")), "terminology_consolidation_failed", "failure"),
+    ],
+)
+def test_fc7_sparse_rejection_and_continuation_have_separate_fallback_classification(
+    tmp_path, pi_call, primary_kind, primary_category,
+):
+    from btran.terminology import build_terminology_evidence
+
+    store, graph, record, artifact = _effective_source_artifact(tmp_path, text="Magic")
+    selected = TerminologyEntry("magic-concept", ["Magic"], "Magie", [record.segment_id], 1.0)
+    table = build_candidate_table([record], selected_entries=[selected])
+    run = build_terminology_evidence(
+        [artifact.artifact_id], store=store, graph=graph, mode="translated", target_lang="fr",
+        candidate_table=table, pi_call=pi_call, base_revision_id="base-revision",
+    )
+
+    findings = [store.get_finding(item) for item in run.finding_ids]
+    categorized = {(item.kind, item.audit_category) for item in findings}
+    assert (primary_kind, primary_category) in categorized
+    assert ("terminology_consolidation_fallback", "fallback") in categorized
+    assert {store.get(item).payload["target_form"] for item in run.projection_artifact_ids} == {"Magie"}
+    fallback = next(item for item in findings if item.kind == "terminology_consolidation_fallback")
+    assert fallback.evidence["trigger"] == "selected_tier_zero_fallback"
+
+
+def test_fc6_same_key_tier_zero_requires_every_exact_form(tmp_path):
+    selected = [
+        TerminologyEntry("concept-a", ["Foo"], "un", ["b1"], 1.0),
+        TerminologyEntry("concept-b", ["foo"], "une", ["b1"], 1.0),
+    ]
+    table = build_candidate_table(
+        [SourceBlock("b1", "paragraph", "Foo foo", 0)], selected_entries=selected,
+    )
+    result = consolidate_candidate_table(
+        table, source_lang="en", target_lang="fr",
+        pi_call=lambda _: json.dumps({"entries": [{
+            "concept_id": "only-one", "source_terms": ["Foo"], "target_term": "un",
+            "provenance": ["concept-a"], "confidence": 1.0,
+        }]}),
+    )
+
+    assert result.rejected
+    assert result.missing_tier_zero == (terminology_candidate_key("foo"),)
+    assert [(entry.concept_id, entry.target_term) for entry in result.output] == [
+        ("concept-a", "un"), ("concept-b", "une"),
+    ]
+
+
+def test_fc6_selected_multiword_candidates_form_local_occurrences_and_memberships(tmp_path):
+    from btran.terminology import build_terminology_evidence
+
+    store, graph, record, artifact = _effective_source_artifact(
+        tmp_path, text="Ada Lovelace visited. Aurora Protocol protects keys.",
+    )
+    selected = [
+        TerminologyEntry("proper-name", ["Ada Lovelace"], "Ada Lovelace", [record.segment_id], 1.0),
+        TerminologyEntry("repeated-phrase", ["Aurora Protocol protects"], "Aurora Protocol protects", [record.segment_id], 1.0),
+    ]
+    table = build_candidate_table([record], selected_entries=selected)
+    response = json.dumps({"entries": [
+        {"concept_id": "proper", "source_terms": ["Ada Lovelace"],
+         "target_term": "Ada Lovelace", "provenance": ["proper-name"], "confidence": 1.0},
+        {"concept_id": "protocol", "source_terms": ["Aurora Protocol protects"],
+         "target_term": "Aurora Protocol protects", "provenance": ["repeated-phrase"], "confidence": 1.0},
+    ]})
+    run = build_terminology_evidence(
+        [artifact.artifact_id], store=store, graph=graph, mode="translated", target_lang="fr",
+        candidate_table=table, pi_call=lambda _: response, base_revision_id="base-revision",
+    )
+
+    forms = {
+        store.get(item).payload["canonical_source_form"]
+        for item in run.membership_artifact_ids
+    }
+    assert forms == {"Ada Lovelace", "Aurora Protocol protects"}
+
+
+def test_fc7_exact_tier_zero_targets_do_not_collapse_on_candidate_key(tmp_path):
+    from btran.terminology import build_terminology_evidence
+
+    store, graph, record, artifact = _effective_source_artifact(tmp_path, text="Foo foo")
+    selected = [
+        TerminologyEntry("concept-a", ["Foo"], "un", [record.segment_id], 1.0),
+        TerminologyEntry("concept-b", ["foo"], "une", [record.segment_id], 1.0),
+    ]
+    table = build_candidate_table([record], selected_entries=selected)
+    run = build_terminology_evidence(
+        [artifact.artifact_id], store=store, graph=graph, mode="translated", target_lang="fr",
+        candidate_table=table, pi_call=lambda _: '{"entries": []}', base_revision_id="base-revision",
+    )
+    concept_forms = {store.get(item).payload["concept_id"]: store.get(item).payload["canonical_source_form"]
+                     for item in run.membership_artifact_ids}
+    targets = {concept_forms[store.get(item).payload["concept_id"]]: store.get(item).payload["target_form"]
+               for item in run.projection_artifact_ids}
+    assert targets == {"Foo": "un", "foo": "une"}
 
 
 def test_token_measurement_is_a_conservative_utf8_bound():
@@ -363,27 +600,24 @@ def test_consolidation_fails_when_multiple_batches_do_not_reduce_without_target_
         )
 
 
-@pytest.mark.parametrize("timeout", [-1, 0, 3601, 1.5, float("nan"), True])
-def test_pi_consolidation_rejects_invalid_timeout_before_constructing_leaf(timeout):
-    with pytest.raises(ValueError, match="between 1 and 3600"):
-        make_pi_consolidation_call(pi_bin="pi", model="test-model", timeout=timeout)
+def test_pi_consolidation_has_no_model_timeout_parameter():
+    import inspect
+    assert "timeout" not in inspect.signature(make_pi_consolidation_call).parameters
 
 
-def test_tool_less_ephemeral_pi_call_returns_stdout_and_cleans_up_timeout(tmp_path):
+def test_tool_less_ephemeral_pi_call_is_unbounded_for_model_execution(tmp_path):
     fake_pi = tmp_path / "fake-pi"
     fake_pi.write_text(
         "#!/usr/bin/env python3\n"
         "import json, sys, time\n"
         "if sys.argv[-1] == 'sleep':\n"
-        "    time.sleep(10)\n"
+        "    time.sleep(0.05)\n"
         "else:\n"
         "    print(json.dumps(sys.argv[1:]))\n"
     )
     fake_pi.chmod(0o755)
-    bounded_success_call = make_pi_consolidation_call(
-        pi_bin=str(fake_pi), model="test-model", timeout=1
-    )
-    arguments = json.loads(bounded_success_call("prompt"))
+    call = make_pi_consolidation_call(pi_bin=str(fake_pi), model="test-model")
+    arguments = json.loads(call("prompt"))
     assert "--no-session" not in arguments
     assert arguments[arguments.index("--thinking") + 1] == "low"
     assert arguments[arguments.index("--session-dir") + 1] == str(Path.cwd() / ".btran" / "pi-sessions")
@@ -394,12 +628,7 @@ def test_tool_less_ephemeral_pi_call_returns_stdout_and_cleans_up_timeout(tmp_pa
     assert "--no-context-files" in arguments
     assert "--no-approve" in arguments
     assert arguments[-1] == "prompt"
-
-    bounded_call = make_pi_consolidation_call(
-        pi_bin=str(fake_pi), model="test-model", timeout=1
-    )
-    with pytest.raises(PiConsolidationError, match="timed out"):
-        bounded_call("sleep")
+    assert call("sleep") == ""
 
 
 def test_stable_sharding_builds_alias_index_for_oversized_map():
@@ -614,45 +843,25 @@ def test_task8_consolidation_failure_uses_source_form_projection_and_complete_re
     assert run.status == "degraded"
     assert len(run.failure_artifact_ids) == 1
     assert store.get(run.failure_artifact_ids[0]).kind == TERMINOLOGY_FAILURE_KIND
-    projections = [store.get(artifact_id).payload for artifact_id in run.projection_artifact_ids]
-    assert {item["target_form"] for item in projections} == {"Magic", "sword"}
-    requests = [store.get_finding(finding_id) for finding_id in run.finding_ids]
-    requests = [finding for finding in requests if finding.kind == "review_request"]
-    assert requests
-    for request in requests:
-        assert request.evidence["trigger"] == "degraded_unknown_confidence"
-        assert request.evidence["scope"] == "all_concept_occurrences"
-        assert request.evidence["base_artifact_ids"] == list(request.dependency_ids)
+    # FC6 rejects a failed response without selected tier-0 evidence to an
+    # empty terminology map.  Legacy source-form projections must not survive.
+    assert run.projection_artifact_ids == ()
+    assert run.membership_artifact_ids == ()
 
 
-def test_task8_low_confidence_and_source_sense_ambiguity_emit_complete_review_requests(tmp_path):
+def test_task8_translated_without_sparse_inputs_never_uses_legacy_consolidation(tmp_path):
     from btran.terminology import build_terminology_evidence
 
     store, graph, record, artifact = _effective_source_artifact(tmp_path, text="bank")
-
-    def ambiguous_response(prompt):
-        request = json.loads(prompt.split("\n", 1)[1])
-        item = request["items"][0]
-        return json.dumps({"entries": [
-            {"concept_id": "river", "source_terms": item["source_terms"], "target_term": "rive",
-             "provenance": item["provenance"], "confidence": 0.2},
-            {"concept_id": "finance", "source_terms": item["source_terms"], "target_term": "banque",
-             "provenance": item["provenance"], "confidence": 0.2},
-        ]})
+    called = []
 
     run = build_terminology_evidence(
         [artifact.artifact_id], store=store, graph=graph, mode="translated", target_lang="fr",
-        pi_call=ambiguous_response, base_revision_id="base-revision",
+        pi_call=lambda prompt: called.append(prompt) or '{"entries": []}', base_revision_id="base-revision",
     )
-    requests = [store.get_finding(finding_id) for finding_id in run.finding_ids]
-    requests = [finding for finding in requests if finding.kind == "review_request"]
-    assert {finding.evidence["trigger"] for finding in requests} >= {"low_confidence", "source_sense_ambiguity"}
-    for request in requests:
-        assert request.requires_action is False
-        assert request.evidence["applicable_subject_ids"] == list(request.subject_refs)
-        assert request.evidence["base_revision_id"] == "base-revision"
-        assert request.evidence["base_artifact_ids"] == list(request.dependency_ids)
-        assert request.evidence["scope"] == "all_concept_occurrences"
+    assert called == []  # ordinary one-word fallback is not a candidate
+    assert run.membership_artifact_ids == ()
+    assert run.projection_artifact_ids == ()
 
 
 def test_task8_subset_terminology_overlay_creates_exact_selector_and_correction_edge(tmp_path):
@@ -824,11 +1033,12 @@ def test_task8_successor_transition_keeps_old_evidence_in_sealed_graph_closure(t
         edge_ids=successor.graph_edge_ids, expected_embedded_provenance=provenance,
     )
     revisions.verify_bundle("successor")
-    assert (bundle / "artifacts" / f"{old_magic_shard}.json").exists()
+    with zipfile.ZipFile(bundle) as archive:
+        assert f"records/{old_magic_shard}.json" in archive.namelist()
+        manifest = json.loads(archive.read("manifest.json"))
     sealed_edges = revisions.selected_graph("successor").edges("successor")
-    manifest = json.loads((bundle / "bundle-manifest.json").read_text())
-    assert all(edge.parent_artifact_id in manifest["artifact_ids"]
-               and edge.child_artifact_id in manifest["artifact_ids"] for edge in sealed_edges)
+    assert all(f"records/{edge.parent_artifact_id}.json" in manifest["members"]
+               and f"records/{edge.child_artifact_id}.json" in manifest["members"] for edge in sealed_edges)
 
 
 def test_task8_selected_leaf_roots_seal_zero_occurrence_and_diagnostic_edges(tmp_path):
@@ -879,14 +1089,15 @@ def test_task8_selected_leaf_roots_seal_zero_occurrence_and_diagnostic_edges(tmp
         edge_ids=run.graph_edge_ids, expected_embedded_provenance=provenance,
     )
     revisions.verify_bundle("zero-leaves")
-    manifest = json.loads((bundle / "bundle-manifest.json").read_text())
+    with zipfile.ZipFile(bundle) as archive:
+        manifest = json.loads(archive.read("manifest.json"))
     for leaf in zero_leaves:
         source_id = next(item.effective_source_artifact_id for item in run.evidence_leaves
                          if item.evidence_shard_artifact_id == leaf.evidence_shard_artifact_id)
-        assert leaf.evidence_shard_artifact_id in manifest["artifact_ids"]
-        assert source_id in manifest["artifact_ids"]
-    assert all(edge.parent_artifact_id in manifest["artifact_ids"]
-               and edge.child_artifact_id in manifest["artifact_ids"]
+        assert f"records/{leaf.evidence_shard_artifact_id}.json" in manifest["members"]
+        assert f"records/{source_id}.json" in manifest["members"]
+    assert all(f"records/{edge.parent_artifact_id}.json" in manifest["members"]
+               and f"records/{edge.child_artifact_id}.json" in manifest["members"]
                for edge in revisions.selected_graph("zero-leaves").edges("zero-leaves"))
 
 
@@ -931,6 +1142,137 @@ def test_task8_invalid_evidence_degrades_typed_shard_with_correction_ready_revie
     summary = store.get_finding(run.stage_summary_finding_id)
     assert summary.evidence["status"] == "degraded"
     assert summary.evidence["counts"]["invalid_evidence_shards"] == 1
+
+
+def test_fc6_selected_effective_content_preserves_declared_segment_order(tmp_path):
+    import hashlib
+    from btran.artifacts import ArtifactStore, DependencyGraph
+    from btran.orchestrator_contract import OrderedEffectivePage, SelectedEffectiveContent
+    from btran.schema import EffectivePage, EffectiveSegment
+    from btran.terminology import build_terminology_evidence
+
+    store = ArtifactStore(tmp_path)
+    graph = DependencyGraph(tmp_path)
+    records = []
+    artifacts = []
+    for segment_id, text in (("z-segment", "Zulu"), ("a-segment", "Alpha")):
+        record = EffectiveSegment(
+            effective_segment_id=hashlib.sha256(("effective:" + segment_id).encode()).hexdigest(),
+            segment_id=segment_id, source_lang="en", source_text=text, effective_text=text,
+            render_lang="en", mode="native",
+        )
+        artifact = store.put("EffectiveSourceSegment", record.to_dict(), semantic_key=segment_id)
+        records.append(record)
+        artifacts.append(artifact)
+    page = EffectivePage(
+        effective_page_id="effective-page", page_id="page",
+        effective_segment_ids=tuple(item.effective_segment_id for item in records), source_langs=("en",),
+    )
+    selected = SelectedEffectiveContent((OrderedEffectivePage(page, tuple(records)),))
+    run = build_terminology_evidence(selected, store=store, graph=graph, mode="native")
+    assert [leaf.segment_id for leaf in run.evidence_leaves] == ["z-segment", "a-segment"]
+
+
+def test_fc6_multilingual_grapheme_and_declared_category_candidates():
+    combining = "Ada\u0308 Lovelace"
+    blocks = [
+        SourceBlock("en", "paragraph", combining, 0),
+        SourceBlock("ar", "paragraph", "ليلى وجهاز التحليل", 1),
+        SourceBlock("hi", "paragraph", "रवि और क्वांटम सेंसर", 2),
+        SourceBlock("te", "paragraph", "అనిత మరియు సముద్ర పటం", 3),
+        SourceBlock("ja", "paragraph", "美咲と量子センサー", 4),
+    ]
+    mentions = [
+        TermMention("ليلى", "ar", "proper_name"),
+        TermMention("جهاز التحليل", "ar", "technical_term"),
+        TermMention("रवि", "hi", "proper_name"),
+        TermMention("क्वांटम सेंसर", "hi", "technical_term"),
+        TermMention("అనిత", "te", "proper_name"),
+        TermMention("సముద్ర పటం", "te", "technical_term"),
+        TermMention("美咲", "ja", "proper_name"),
+        TermMention("量子センサー", "ja", "technical_term"),
+    ]
+    table = build_candidate_table(blocks, mentions, include_fallback=False)
+    assert "Adä Lovelace" in {item.source_form for item in table.candidates if item.tier == 2}
+    assert {item.tier for item in table.candidates if item.source_form in {item.term for item in mentions}} == {1}
+    assert all("\\u0308" not in item.source_form for item in table.candidates)
+
+
+def test_fc6_repeated_phrase_accepts_two_three_and_more_distinct_blocks():
+    blocks = [SourceBlock(f"b{n}", "paragraph", "The Aurora Protocol protects keys.", n) for n in range(4)]
+    table = build_candidate_table(blocks, include_fallback=False)
+    phrase = next(item for item in table.candidates if item.source_form == "The Aurora Protocol")
+    assert phrase.tier == 2  # maximal cased run wins over repeated-phrase tier
+    repeated = next(item for item in table.candidates if item.source_form == "Aurora Protocol protects")
+    assert repeated.tier == 4
+    assert repeated.declared_block_ids == ("b0", "b1", "b2", "b3")
+
+
+def test_fc6_tier_zero_is_retained_over_cap_and_ranks_remainder():
+    blocks = [SourceBlock("b1", "paragraph", "Ada Lovelace v2", 0)]
+    selected = [TerminologyEntry(f"selected-{n}", [f"term-{n}"], f"target-{n}", ["b1"], 1.0) for n in range(3)]
+    table = build_candidate_table(blocks, selected_entries=selected, limit=2)
+    assert len(table.tier_zero) == 3
+    assert tuple(table.selected) == table.tier_zero
+    assert all(item.tier == 0 for item in table.selected)
+
+
+def test_fc6_rejected_response_creates_no_non_tier_zero_membership_or_projection(tmp_path):
+    from btran.terminology import build_terminology_evidence
+
+    store, graph, record, artifact = _effective_source_artifact(tmp_path, text="Magic Sword")
+    selected = TerminologyEntry("selected-magic", ["Magic"], "Magie", [record.segment_id], 1.0)
+    table = build_candidate_table([record], selected_entries=[selected])
+    run = build_terminology_evidence(
+        [artifact.artifact_id], store=store, graph=graph, mode="translated", target_lang="fr",
+        candidate_table=table,
+        pi_call=lambda _: '{"entries":[{"concept_id":"wrong","source_terms":["Sword"],"target_term":"Épée","provenance":["Sword"],"confidence":1.0}]}',
+    )
+    assert run.membership_artifact_ids
+    assert run.projection_artifact_ids
+    assert {store.get(item).payload["canonical_source_form"] for item in run.membership_artifact_ids} == {"Magic"}
+    assert all(store.get(item).payload["target_form"] == "Magie" for item in run.projection_artifact_ids)
+    assert not any(store.get(item).payload.get("canonical_source_form") == "Sword"
+                   for item in run.membership_artifact_ids)
+    assert any(store.get_finding(item).audit_category == "validation" for item in run.finding_ids)
+
+
+def test_fc6_conflicting_and_unmatched_explicit_inputs_create_conflict_finding(tmp_path):
+    from btran.terminology import build_terminology_evidence
+
+    store, graph, record, artifact = _effective_source_artifact(tmp_path, text="Magic")
+    corrections = [
+        {"correction_id": "c1", "source_forms": ["Magic"], "replacement": "Magie"},
+        {"correction_id": "c2", "source_forms": ["Magic"], "replacement": "Sorcière"},
+        {"correction_id": "c3", "source_forms": ["Missing"], "replacement": "Absent"},
+    ]
+    run = build_terminology_evidence(
+        [artifact.artifact_id], store=store, graph=graph, mode="translated", target_lang="fr",
+        selected_terminology_corrections=corrections,
+        pi_call=lambda _: '{"entries":[]}',
+    )
+    conflict = next(store.get_finding(item) for item in run.finding_ids
+                    if store.get_finding(item).audit_category == "conflict")
+    assert set(conflict.evidence["unmatched_source_forms"]) == {"missing"}
+    assert conflict.evidence["conflicting_candidate_ids"] == [terminology_candidate_key("Magic")]
+
+
+def test_fc4_cancelled_consolidation_cleanup_is_cancellation(monkeypatch, tmp_path):
+    captured = []
+    class Process:
+        pid = 123
+        returncode = None
+        stdout = stderr = None
+        def communicate(self):
+            raise __import__("asyncio").CancelledError()
+    monkeypatch.setattr("subprocess.Popen", lambda *args, **kwargs: Process())
+    monkeypatch.setattr("btran.terminology._failed_process_cleanup",
+                        lambda proc, *, cause: captured.append(cause) or ("", ""))
+    call = make_pi_consolidation_call(pi_bin="pi", model="model", session_dir=tmp_path / "sessions")
+    with pytest.raises(PiConsolidationError):
+        call("prompt")
+    from btran.process_cleanup import CleanupCause
+    assert captured == [CleanupCause.CANCELLATION]
 
 
 def test_task8_terminology_review_requests_name_exact_projection_and_membership_bases(tmp_path):
