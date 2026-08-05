@@ -236,6 +236,21 @@ def test_selected_closure_rejects_duplicate_stable_identity(tmp_path):
         load_selected_closure(RevisionStore(tmp_path), "revision-2")
 
 
+@pytest.mark.parametrize("kind", ["RawSourceExtraction", "DiagnosticSourceFallback"])
+def test_selected_closure_rejects_duplicate_source_page_cache_leaf_identity(tmp_path, kind):
+    store = ArtifactStore(tmp_path)
+    payload = {"page_id": "duplicate-source-page"}
+    first = store.put(kind, payload, semantic_key="first")
+    duplicate = store.put(kind, {**payload, "variant": 2}, semantic_key="second")
+    snapshot = RevisionSnapshot(
+        revision_id=f"duplicate-{kind}",
+        selected_artifact_ids=tuple(sorted((first.artifact_id, duplicate.artifact_id))),
+    )
+    RevisionStore(tmp_path).seal_bundle(snapshot, {}, b"")
+    with pytest.raises(SelectedClosureError, match="stable identity"):
+        load_selected_closure(RevisionStore(tmp_path), snapshot.revision_id)
+
+
 def test_selected_closure_rejects_missing_declared_page_child(tmp_path):
     store = ArtifactStore(tmp_path)
     page = EffectivePage(
