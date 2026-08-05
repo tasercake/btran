@@ -789,45 +789,25 @@ def test_task8_consolidation_failure_uses_source_form_projection_and_complete_re
     assert run.status == "degraded"
     assert len(run.failure_artifact_ids) == 1
     assert store.get(run.failure_artifact_ids[0]).kind == TERMINOLOGY_FAILURE_KIND
-    projections = [store.get(artifact_id).payload for artifact_id in run.projection_artifact_ids]
-    assert {item["target_form"] for item in projections} == {"Magic", "sword"}
-    requests = [store.get_finding(finding_id) for finding_id in run.finding_ids]
-    requests = [finding for finding in requests if finding.kind == "review_request"]
-    assert requests
-    for request in requests:
-        assert request.evidence["trigger"] == "degraded_unknown_confidence"
-        assert request.evidence["scope"] == "all_concept_occurrences"
-        assert request.evidence["base_artifact_ids"] == list(request.dependency_ids)
+    # FC6 rejects a failed response without selected tier-0 evidence to an
+    # empty terminology map.  Legacy source-form projections must not survive.
+    assert run.projection_artifact_ids == ()
+    assert run.membership_artifact_ids == ()
 
 
-def test_task8_low_confidence_and_source_sense_ambiguity_emit_complete_review_requests(tmp_path):
+def test_task8_translated_without_sparse_inputs_never_uses_legacy_consolidation(tmp_path):
     from btran.terminology import build_terminology_evidence
 
     store, graph, record, artifact = _effective_source_artifact(tmp_path, text="bank")
-
-    def ambiguous_response(prompt):
-        request = json.loads(prompt.split("\n", 1)[1])
-        item = request["items"][0]
-        return json.dumps({"entries": [
-            {"concept_id": "river", "source_terms": item["source_terms"], "target_term": "rive",
-             "provenance": item["provenance"], "confidence": 0.2},
-            {"concept_id": "finance", "source_terms": item["source_terms"], "target_term": "banque",
-             "provenance": item["provenance"], "confidence": 0.2},
-        ]})
+    called = []
 
     run = build_terminology_evidence(
         [artifact.artifact_id], store=store, graph=graph, mode="translated", target_lang="fr",
-        pi_call=ambiguous_response, base_revision_id="base-revision",
+        pi_call=lambda prompt: called.append(prompt) or '{"entries": []}', base_revision_id="base-revision",
     )
-    requests = [store.get_finding(finding_id) for finding_id in run.finding_ids]
-    requests = [finding for finding in requests if finding.kind == "review_request"]
-    assert {finding.evidence["trigger"] for finding in requests} >= {"low_confidence", "source_sense_ambiguity"}
-    for request in requests:
-        assert request.requires_action is False
-        assert request.evidence["applicable_subject_ids"] == list(request.subject_refs)
-        assert request.evidence["base_revision_id"] == "base-revision"
-        assert request.evidence["base_artifact_ids"] == list(request.dependency_ids)
-        assert request.evidence["scope"] == "all_concept_occurrences"
+    assert called == []  # ordinary one-word fallback is not a candidate
+    assert run.membership_artifact_ids == ()
+    assert run.projection_artifact_ids == ()
 
 
 def test_task8_subset_terminology_overlay_creates_exact_selector_and_correction_edge(tmp_path):
@@ -1108,6 +1088,137 @@ def test_task8_invalid_evidence_degrades_typed_shard_with_correction_ready_revie
     summary = store.get_finding(run.stage_summary_finding_id)
     assert summary.evidence["status"] == "degraded"
     assert summary.evidence["counts"]["invalid_evidence_shards"] == 1
+
+
+def test_fc6_selected_effective_content_preserves_declared_segment_order(tmp_path):
+    import hashlib
+    from btran.artifacts import ArtifactStore, DependencyGraph
+    from btran.orchestrator_contract import OrderedEffectivePage, SelectedEffectiveContent
+    from btran.schema import EffectivePage, EffectiveSegment
+    from btran.terminology import build_terminology_evidence
+
+    store = ArtifactStore(tmp_path)
+    graph = DependencyGraph(tmp_path)
+    records = []
+    artifacts = []
+    for segment_id, text in (("z-segment", "Zulu"), ("a-segment", "Alpha")):
+        record = EffectiveSegment(
+            effective_segment_id=hashlib.sha256(("effective:" + segment_id).encode()).hexdigest(),
+            segment_id=segment_id, source_lang="en", source_text=text, effective_text=text,
+            render_lang="en", mode="native",
+        )
+        artifact = store.put("EffectiveSourceSegment", record.to_dict(), semantic_key=segment_id)
+        records.append(record)
+        artifacts.append(artifact)
+    page = EffectivePage(
+        effective_page_id="effective-page", page_id="page",
+        effective_segment_ids=tuple(item.effective_segment_id for item in records), source_langs=("en",),
+    )
+    selected = SelectedEffectiveContent((OrderedEffectivePage(page, tuple(records)),))
+    run = build_terminology_evidence(selected, store=store, graph=graph, mode="native")
+    assert [leaf.segment_id for leaf in run.evidence_leaves] == ["z-segment", "a-segment"]
+
+
+def test_fc6_multilingual_grapheme_and_declared_category_candidates():
+    combining = "Ada\u0308 Lovelace"
+    blocks = [
+        SourceBlock("en", "paragraph", combining, 0),
+        SourceBlock("ar", "paragraph", "ليلى وجهاز التحليل", 1),
+        SourceBlock("hi", "paragraph", "रवि और क्वांटम सेंसर", 2),
+        SourceBlock("te", "paragraph", "అనిత మరియు సముద్ర పటం", 3),
+        SourceBlock("ja", "paragraph", "美咲と量子センサー", 4),
+    ]
+    mentions = [
+        TermMention("ليلى", "ar", "proper_name"),
+        TermMention("جهاز التحليل", "ar", "technical_term"),
+        TermMention("रवि", "hi", "proper_name"),
+        TermMention("क्वांटम सेंसर", "hi", "technical_term"),
+        TermMention("అనిత", "te", "proper_name"),
+        TermMention("సముద్ర పటం", "te", "technical_term"),
+        TermMention("美咲", "ja", "proper_name"),
+        TermMention("量子センサー", "ja", "technical_term"),
+    ]
+    table = build_candidate_table(blocks, mentions, include_fallback=False)
+    assert "Adä Lovelace" in {item.source_form for item in table.candidates if item.tier == 2}
+    assert {item.tier for item in table.candidates if item.source_form in {item.term for item in mentions}} == {1}
+    assert all("\\u0308" not in item.source_form for item in table.candidates)
+
+
+def test_fc6_repeated_phrase_accepts_two_three_and_more_distinct_blocks():
+    blocks = [SourceBlock(f"b{n}", "paragraph", "The Aurora Protocol protects keys.", n) for n in range(4)]
+    table = build_candidate_table(blocks, include_fallback=False)
+    phrase = next(item for item in table.candidates if item.source_form == "The Aurora Protocol")
+    assert phrase.tier == 2  # maximal cased run wins over repeated-phrase tier
+    repeated = next(item for item in table.candidates if item.source_form == "Aurora Protocol protects")
+    assert repeated.tier == 4
+    assert repeated.declared_block_ids == ("b0", "b1", "b2", "b3")
+
+
+def test_fc6_tier_zero_is_retained_over_cap_and_ranks_remainder():
+    blocks = [SourceBlock("b1", "paragraph", "Ada Lovelace v2", 0)]
+    selected = [TerminologyEntry(f"selected-{n}", [f"term-{n}"], f"target-{n}", ["b1"], 1.0) for n in range(3)]
+    table = build_candidate_table(blocks, selected_entries=selected, limit=2)
+    assert len(table.tier_zero) == 3
+    assert tuple(table.selected) == table.tier_zero
+    assert all(item.tier == 0 for item in table.selected)
+
+
+def test_fc6_rejected_response_creates_no_non_tier_zero_membership_or_projection(tmp_path):
+    from btran.terminology import build_terminology_evidence
+
+    store, graph, record, artifact = _effective_source_artifact(tmp_path, text="Magic Sword")
+    selected = TerminologyEntry("selected-magic", ["Magic"], "Magie", [record.segment_id], 1.0)
+    table = build_candidate_table([record], selected_entries=[selected])
+    run = build_terminology_evidence(
+        [artifact.artifact_id], store=store, graph=graph, mode="translated", target_lang="fr",
+        candidate_table=table,
+        pi_call=lambda _: '{"entries":[{"concept_id":"wrong","source_terms":["Sword"],"target_term":"Épée","provenance":["Sword"],"confidence":1.0}]}',
+    )
+    assert run.membership_artifact_ids
+    assert run.projection_artifact_ids
+    assert {store.get(item).payload["canonical_source_form"] for item in run.membership_artifact_ids} == {"Magic"}
+    assert all(store.get(item).payload["target_form"] == "Magie" for item in run.projection_artifact_ids)
+    assert not any(store.get(item).payload.get("canonical_source_form") == "Sword"
+                   for item in run.membership_artifact_ids)
+    assert any(store.get_finding(item).audit_category == "validation" for item in run.finding_ids)
+
+
+def test_fc6_conflicting_and_unmatched_explicit_inputs_create_conflict_finding(tmp_path):
+    from btran.terminology import build_terminology_evidence
+
+    store, graph, record, artifact = _effective_source_artifact(tmp_path, text="Magic")
+    corrections = [
+        {"correction_id": "c1", "source_forms": ["Magic"], "replacement": "Magie"},
+        {"correction_id": "c2", "source_forms": ["Magic"], "replacement": "Sorcière"},
+        {"correction_id": "c3", "source_forms": ["Missing"], "replacement": "Absent"},
+    ]
+    run = build_terminology_evidence(
+        [artifact.artifact_id], store=store, graph=graph, mode="translated", target_lang="fr",
+        selected_terminology_corrections=corrections,
+        pi_call=lambda _: '{"entries":[]}',
+    )
+    conflict = next(store.get_finding(item) for item in run.finding_ids
+                    if store.get_finding(item).audit_category == "conflict")
+    assert set(conflict.evidence["unmatched_source_forms"]) == {"missing"}
+    assert conflict.evidence["conflicting_candidate_ids"] == [terminology_candidate_key("Magic")]
+
+
+def test_fc4_cancelled_consolidation_cleanup_is_cancellation(monkeypatch, tmp_path):
+    captured = []
+    class Process:
+        pid = 123
+        returncode = None
+        stdout = stderr = None
+        def communicate(self):
+            raise __import__("asyncio").CancelledError()
+    monkeypatch.setattr("subprocess.Popen", lambda *args, **kwargs: Process())
+    monkeypatch.setattr("btran.terminology._failed_process_cleanup",
+                        lambda proc, *, cause: captured.append(cause) or ("", ""))
+    call = make_pi_consolidation_call(pi_bin="pi", model="model", session_dir=tmp_path / "sessions")
+    with pytest.raises(PiConsolidationError):
+        call("prompt")
+    from btran.process_cleanup import CleanupCause
+    assert captured == [CleanupCause.CANCELLATION]
 
 
 def test_task8_terminology_review_requests_name_exact_projection_and_membership_bases(tmp_path):

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import math
@@ -215,11 +216,24 @@ def _first_cased_codepoint(word: str) -> str | None:
 
 
 def _block_parts(source: Any) -> list[tuple[str, str, int, str | None]]:
-    """Flatten supported selected-content views without storage-order scans."""
+    """Flatten supported selected-content views in declared reading order."""
     if source is None:
         return []
+    # SelectedEffectiveContent is already an immutable declared-order view.
+    # Preserve that order instead of sorting each page's local fallback order
+    # together by storage/segment identity.
     if hasattr(source, "pages"):
-        source = [page for page in source.pages]
+        result: list[tuple[str, str, int, str | None]] = []
+        order = 0
+        for page in source.pages:
+            for item in page.segments:
+                block_id = getattr(item, "segment_id", getattr(item, "effective_segment_id", ""))
+                text = getattr(item, "source_text", getattr(item, "effective_text", ""))
+                if isinstance(block_id, str) and isinstance(text, str):
+                    result.append((block_id, _nfc_surface(text), order,
+                                   getattr(item, "segment_id", None)))
+                    order += 1
+        return result
     if hasattr(source, "blocks") and not isinstance(source, (str, bytes, Mapping)):
         source = source.blocks
     if hasattr(source, "segments") and not isinstance(source, (str, bytes, Mapping)):
@@ -814,7 +828,7 @@ def sparse_consolidation_prompt(table: CandidateTable, *, source_lang: str = "",
         "Return exactly {\\\"entries\\\":[{\\\"concept_id\\\":\\\"model concept ID\\\",\\\"source_terms\\\":[\\\"exact selected spelling\\\"],\\\"target_term\\\":\\\"term\\\",\\\"provenance\\\":[\\\"stable occurrence or block ID\\\"],\\\"confidence\\\":0.0}]}. "
         "Every source term must be an exact NFC spelling from one selected row; do not add aliases, fragments, ordinary words, or unselected candidates."
         + (f" Translate each target_term from {source_lang} into {target_lang}." if source_lang and target_lang else "")
-        + "\\n" + json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        + "\n" + json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     )
 
 
@@ -994,7 +1008,9 @@ def make_pi_consolidation_call(
             # No timeout: model execution has no deadline under FC4.
             stdout, stderr = proc.communicate()
         except BaseException as exc:
-            cause = CleanupCause.CANCELLATION if isinstance(exc, (KeyboardInterrupt, GeneratorExit)) else CleanupCause.FAILURE
+            cause = CleanupCause.CANCELLATION if isinstance(
+                exc, (asyncio.CancelledError, KeyboardInterrupt, GeneratorExit)
+            ) else CleanupCause.FAILURE
             stdout_tail, stderr_tail = _failed_process_cleanup(proc, cause=cause)
             raise PiConsolidationError(
                 f"Pi consolidation process failed during {cause.value}: "
@@ -1479,18 +1495,83 @@ def _shard_candidate_key_input(
     }
 
 
+def _find_effective_source_artifact(store: ArtifactStore, record: EffectiveSegment) -> str:
+    """Resolve a selected view segment to its already-persisted source leaf.
+
+    SelectedEffectiveContent deliberately exposes schema records, not mutable
+    store handles.  The source leaf is therefore resolved by its stable
+    effective-segment identity; it is never created or selected from an index.
+    """
+    for attribute in ("artifact_id", "effective_source_artifact_id", "source_artifact_id"):
+        artifact_id = getattr(record, attribute, None)
+        if isinstance(artifact_id, str) and artifact_id:
+            artifact = store.get(artifact_id)
+            if artifact.kind in {"EffectiveSourceSegment", "DiagnosticEffectiveSourceSegment"}:
+                return artifact_id
+    # V2 exposes immutable record IDs through its storage adapter.  Match the
+    # selected stable identity, then validate the one resolved record normally.
+    storage = getattr(store, "storage", None)
+    if storage is not None and callable(getattr(storage, "_connect", None)):
+        connection = storage._connect()
+        try:
+            rows = connection.execute(
+                "SELECT record_id FROM records WHERE kind IN (?, ?) AND instr(canonical_json_bytes, ?) > 0",
+                ("EffectiveSourceSegment", "DiagnosticEffectiveSourceSegment",
+                 record.effective_segment_id.encode("utf-8")),
+            )
+            for row in rows:
+                artifact_id = row[0]
+                try:
+                    artifact = store.get(artifact_id)
+                except Exception:
+                    continue
+                if artifact.payload.get("effective_segment_id") == record.effective_segment_id:
+                    return artifact_id
+        finally:
+            connection.close()
+    # Legacy stores have no index API that can address an effective segment by
+    # semantic identity.  Their read-only adapter is still safe to inspect.
+    artifacts_dir = getattr(store, "artifacts_dir", None)
+    if isinstance(artifacts_dir, Path) and artifacts_dir.exists():
+        for path in sorted(artifacts_dir.glob("*.json"), key=lambda item: item.name):
+            try:
+                artifact_id = path.stem
+                artifact = store.get(artifact_id)
+            except Exception:
+                continue
+            if (artifact.kind in {"EffectiveSourceSegment", "DiagnosticEffectiveSourceSegment"}
+                    and artifact.payload.get("effective_segment_id") == record.effective_segment_id):
+                return artifact_id
+    raise TerminologyEvidenceError(
+        f"selected effective segment is not persisted: {record.effective_segment_id}"
+    )
+
+
 def _effective_source_inputs(
     value: Any, store: ArtifactStore,
 ) -> tuple[tuple[str, EffectiveSegment], ...]:
-    """Accept Task-7 run/leaves, explicit artifact IDs, or explicit records."""
-    if hasattr(value, "leaves"):
+    """Accept Task-7 runs, selected content, IDs, or explicit records.
+
+    IDs supplied by a Task-7 run already carry declared order.  A
+    SelectedEffectiveContent view carries that order in its page/segment
+    tuples and is handled without re-sorting by segment identity.
+    """
+    selected_view = hasattr(value, "pages") and hasattr(value, "segments")
+    if selected_view:
+        ids_and_records = [(_find_effective_source_artifact(store, record), record)
+                           for page in value.pages for record in page.segments]
+    elif hasattr(value, "leaves"):
         ids = [item for leaf in value.leaves for item in leaf.segment_artifact_ids]
+        ids_and_records = [(item, None) for item in ids]
     else:
-        ids = value
-    if not isinstance(ids, (list, tuple)):
-        raise TerminologyEvidenceError("effective source input must be Task 7 run or sequence")
+        ids_and_records = [(item, None) for item in value] if isinstance(value, (list, tuple)) else []
+    if not ids_and_records and not selected_view and value not in ((), []):
+        raise TerminologyEvidenceError("effective source input must be Task 7 run, selected content, or sequence")
     result: list[tuple[str, EffectiveSegment]] = []
-    for item in ids:
+    for item, selected_record in ids_and_records:
+        if selected_record is not None:
+            result.append((item, selected_record))
+            continue
         if isinstance(item, str):
             artifact = store.get(item)
             if artifact.kind not in {"EffectiveSourceSegment", "DiagnosticEffectiveSourceSegment"}:
@@ -1506,7 +1587,7 @@ def _effective_source_inputs(
             raise TerminologyEvidenceError("effective source item is malformed")
     if len({record.segment_id for _, record in result}) != len(result):
         raise TerminologyEvidenceError("effective source closure has duplicate segment identity")
-    return tuple(sorted(result, key=lambda value: value[1].segment_id))
+    return tuple(result)
 
 
 def _artifact_for_selected(
@@ -1708,21 +1789,124 @@ def build_terminology_evidence(
     source_inputs = _effective_source_inputs(effective_source, store)
     if candidate_table is not None and not isinstance(candidate_table, CandidateTable):
         raise TerminologyEvidenceError("candidate_table must be CandidateTable")
-    sparse_enabled = mode == "translated" and (
-        candidate_table is not None or declared_mentions is not None
-        or bool(selected_terminology_corrections) or bool(selected_entries)
-        or selected_closure_entries is not None
-    )
+    # FC6 is the translated terminology path.  There is no unrestricted
+    # occurrence-based consolidation fallback: even callers that omit optional
+    # evidence receive the same deterministic sparse candidate table.
+    sparse_enabled = mode == "translated"
     if sparse_enabled:
         candidate_table = candidate_table or build_candidate_table(
             [record for _, record in source_inputs], declared_mentions,
             selected_terminology_corrections=selected_terminology_corrections,
             selected_entries=(selected_entries if selected_entries else selected_closure_entries),
         )
+    # These are populated before memberships are persisted.  A rejected model
+    # response must not leave non-tier-0 concepts cached or projected.
+    targets: dict[tuple[str, str], tuple[str, float | None, bool]] = {}
+    exact_targets: dict[tuple[str, str], tuple[str, float | None, bool]] = {}
+    failures: dict[str, tuple[str, str]] = {}
+    sparse_output_forms: set[str] | None = None
+    finding_ids: list[str] = []
+    if sparse_enabled and candidate_table is not None:
+        table = candidate_table
+        language = source_lang or next((item.source_lang for _, item in source_inputs if item.source_lang), "")
+        explicit_forms = {
+            form for value in (_selected_values(selected_terminology_corrections),
+                               _selected_values(selected_entries if selected_entries else selected_closure_entries))
+            for item in value
+            for form in _evidence_parts((item,), id_name="entry_id")
+            for form in (form[0],)
+        }
+        conflicting_forms = {
+            row.candidate_key for row in table.selected
+            if "conflict" in row.declared_categories
+        }
+        unmatched_forms = {
+            row.candidate_key for row in table.tier_zero
+            if not row.declared_block_ids and not row.occurrence_ids
+            and any(form in explicit_forms for form in row.source_forms)
+        }
+        conflict_forms = conflicting_forms | unmatched_forms
+        if conflict_forms:
+            conflict = Finding(
+                kind="terminology_explicit_input_conflict", severity="warning", stage="terminology",
+                subject_refs=tuple(sorted(conflict_forms)),
+                evidence={"trigger": "conflicting_or_unmatched_explicit_input",
+                          "conflicting_candidate_ids": sorted(conflicting_forms),
+                          "unmatched_source_forms": sorted(unmatched_forms)},
+                message="Explicit terminology evidence conflicts or does not match selected source content.",
+                dependency_ids=tuple(sorted(item[0] for item in source_inputs)),
+                audit_category="conflict",
+            )
+            store.put_finding(conflict)
+            finding_ids.append(conflict.finding_id)
+        if table.selected:
+            if pi_call is None:
+                result = ConsolidationResult(
+                    tuple(), tuple(_candidate_fallback_entries(table)), True,
+                    (), (), "failure",
+                )
+            else:
+                result = consolidate_candidate_table(
+                    table, source_lang=language, target_lang=target_lang or "",
+                    pi_call=pi_call, timing_ledger=timing_ledger,
+                )
+            if result.rejected:
+                # Only exact selected tier-0 entries are legal continuation.
+                sparse_output_forms = {
+                    form for row in table.tier_zero for form in row.source_forms
+                }
+                subject_refs = tuple(sorted({item.candidate_key for item in table.tier_zero}
+                                            or {item.candidate_key for item in table.selected}))
+                category = result.audit_category or "validation"
+                finding = Finding(
+                    kind="terminology_consolidation_invalid" if category == "validation"
+                    else "terminology_consolidation_failed",
+                    severity="warning", stage="terminology", subject_refs=subject_refs,
+                    evidence={"trigger": "invalid_response" if category == "validation" else "model_failure",
+                              "offending_forms": list(result.offending_forms),
+                              "missing_tier_zero": list(result.missing_tier_zero)},
+                    message="Terminology response was rejected; selected tier-0 fallback continued.",
+                    audit_category=category,
+                )
+                store.put_finding(finding)
+                finding_ids.append(finding.finding_id)
+                fallback = Finding(
+                    kind="terminology_consolidation_fallback", severity="warning", stage="terminology",
+                    audit_category="fallback", subject_refs=subject_refs,
+                    evidence={"trigger": "selected_tier_zero_fallback", "failure_finding_id": finding.finding_id,
+                              "source_lang": language, "fallback": "selected_tier_zero"},
+                    message="Terminology consolidation continued with the exact selected tier-0 fallback.",
+                )
+                store.put_finding(fallback)
+                finding_ids.append(fallback.finding_id)
+                failure_artifact = store.put(
+                    TERMINOLOGY_FAILURE_KIND,
+                    {"source_lang": language, "error": category, "fallback": "selected_tier_zero"},
+                    finding_ids=(finding.finding_id, fallback.finding_id),
+                    semantic_key=hashlib.sha256(canonical_json({
+                        "source_lang": language, "error": category,
+                        "v": PROJECTION_ALGORITHM_VERSION,
+                    }).encode()).hexdigest(),
+                )
+                failures[language] = (failure_artifact.artifact_id, finding.finding_id)
+            else:
+                sparse_output_forms = {form for entry in result.output for form in entry.source_terms}
+            for entry in result.output:
+                for alias in entry.source_terms:
+                    candidate = (entry.target_term, entry.confidence, False)
+                    exact_key = (language, _nfc_surface(alias))
+                    old_exact = exact_targets.get(exact_key)
+                    exact_targets[exact_key] = candidate if old_exact is None else (
+                        old_exact[0], old_exact[1], old_exact[0] != candidate[0] or old_exact[2])
+                    key = (language, terminology_candidate_key(alias))
+                    old = targets.get(key)
+                    targets[key] = candidate if old is None else (
+                        old[0], old[1], old[0] != candidate[0] or old[2])
+        else:
+            sparse_output_forms = set()
     leaves: list[OccurrenceEvidenceLeaf] = []
     all_occurrences: list[TermOccurrence] = []
     evidence_by_segment: dict[str, str] = {}
-    finding_ids: list[str] = []
     edge_ids: list[str] = []
     invalid_evidence_count = 0
     invalid_assessment_ids: list[str] = []
@@ -1803,7 +1987,8 @@ def build_terminology_evidence(
     # intentionally sparse: only selected candidate source spellings can become
     # memberships or reach consolidation.
     if sparse_enabled and candidate_table is not None:
-        selected_forms = {form for row in candidate_table.selected for form in row.source_forms}
+        selected_forms = (sparse_output_forms if sparse_output_forms is not None else
+                          {form for row in candidate_table.selected for form in row.source_forms})
         all_occurrences = [item for item in all_occurrences if _nfc_surface(item.surface) in selected_forms]
     # Concept membership is identity-v1 source form + exact occurrence evidence.
     grouped: dict[tuple[str, str], list[TermOccurrence]] = {}
@@ -1976,111 +2161,10 @@ def build_terminology_evidence(
             except Exception:
                 continue
 
-    # One bounded model consolidation per language with a missing selected
-    # target. Native mode intentionally never evaluates pi_call.
-    targets: dict[tuple[str, str], tuple[str, float | None, bool]] = dict(cached_targets)
-    exact_targets: dict[tuple[str, str], tuple[str, float | None, bool]] = dict(cached_exact_targets)
-    failures: dict[str, tuple[str, str]] = {}
-    if sparse_enabled:
-        # Exactly one sparse table/model request per source language.  A
-        # rejected response never contributes aliases or target mappings.
-        table = candidate_table or build_candidate_table([record for _, record in source_inputs], declared_mentions,
-            selected_terminology_corrections=selected_terminology_corrections,
-            selected_entries=(selected_entries if selected_entries else selected_closure_entries))
-        language = source_lang or next((item.source_lang for _, item in source_inputs if item.source_lang), "")
-        if table.selected and pi_call is not None:
-            try:
-                result = consolidate_candidate_table(table, source_lang=language, target_lang=target_lang or "",
-                                                     pi_call=pi_call, timing_ledger=timing_ledger)
-                if result.rejected:
-                    subject_refs = tuple(sorted({item.candidate_key for item in table.tier_zero} or {item.candidate_key for item in table.selected}))
-                    category = result.audit_category or "validation"
-                    finding = Finding(kind="terminology_consolidation_invalid" if category == "validation" else "terminology_consolidation_failed",
-                                      severity="warning", stage="terminology", subject_refs=subject_refs,
-                                      evidence={"trigger": "invalid_response" if category == "validation" else "model_failure",
-                                                "offending_forms": list(result.offending_forms),
-                                                "missing_tier_zero": list(result.missing_tier_zero)},
-                                      message="Terminology response was rejected; selected tier-0 fallback continued.",
-                                      audit_category=category)
-                    store.put_finding(finding); finding_ids.append(finding.finding_id)
-                    fallback = Finding(
-                        kind="terminology_consolidation_fallback", severity="warning", stage="terminology",
-                        audit_category="fallback", subject_refs=subject_refs,
-                        evidence={"trigger": "selected_tier_zero_fallback", "failure_finding_id": finding.finding_id,
-                                  "source_lang": language, "fallback": "selected_tier_zero"},
-                        message="Terminology consolidation continued with the exact selected tier-0 fallback.",
-                    )
-                    store.put_finding(fallback); finding_ids.append(fallback.finding_id)
-                    failure_artifact = store.put(TERMINOLOGY_FAILURE_KIND,
-                        {"source_lang": language, "error": category, "fallback": "selected_tier_zero"},
-                        finding_ids=(finding.finding_id, fallback.finding_id), semantic_key=hashlib.sha256(
-                            canonical_json({"source_lang": language, "error": category, "v": PROJECTION_ALGORITHM_VERSION}).encode()).hexdigest())
-                    failures[language] = (failure_artifact.artifact_id, finding.finding_id)
-                for entry in result.output:
-                    for alias in entry.source_terms:
-                        candidate = (entry.target_term, entry.confidence, False)
-                        exact_key = (language, _nfc_surface(alias))
-                        old_exact = exact_targets.get(exact_key)
-                        exact_targets[exact_key] = candidate if old_exact is None else (
-                            old_exact[0], old_exact[1], old_exact[0] != candidate[0] or old_exact[2])
-                        key = (language, terminology_candidate_key(alias))
-                        old = targets.get(key)
-                        targets[key] = candidate if old is None else (old[0], old[1], old[0] != candidate[0] or old[2])
-            except Exception as exc:
-                subject_refs = tuple(sorted(item.candidate_key for item in table.selected)) or (language or "terminology",)
-                failure = Finding(kind="terminology_consolidation_failed", severity="warning", stage="terminology",
-                                  subject_refs=subject_refs, evidence={"trigger": "model_failure", "source_lang": language, "error": type(exc).__name__},
-                                  message="Terminology consolidation failed; selected tier-0 fallback continued.", audit_category="failure")
-                store.put_finding(failure); finding_ids.append(failure.finding_id)
-                fallback = Finding(
-                    kind="terminology_consolidation_fallback", severity="warning", stage="terminology",
-                    audit_category="fallback", subject_refs=subject_refs,
-                    evidence={"trigger": "selected_tier_zero_fallback", "failure_finding_id": failure.finding_id,
-                              "source_lang": language, "fallback": "selected_tier_zero"},
-                    message="Terminology consolidation continued with the exact selected tier-0 fallback.",
-                )
-                store.put_finding(fallback); finding_ids.append(fallback.finding_id)
-                failure_artifact = store.put(TERMINOLOGY_FAILURE_KIND,
-                    {"source_lang": language, "error": type(exc).__name__, "fallback": "selected_tier_zero"},
-                    finding_ids=(failure.finding_id, fallback.finding_id), semantic_key=hashlib.sha256(
-                        canonical_json({"source_lang": language, "error": type(exc).__name__, "v": PROJECTION_ALGORITHM_VERSION}).encode()).hexdigest())
-                failures[language] = (failure_artifact.artifact_id, failure.finding_id)
-    elif mode == "translated":
-        # Legacy callers which do not provide FC6 declarations retain the
-        # occurrence-based compatibility path until their migration lands.
-        forms_by_language: dict[str, list[TermMention]] = {}
-        for concept_id, (_, occurrences) in memberships.items():
-            occurrence = occurrences[0]
-            key = (occurrence.source_lang, terminology_candidate_key(canonical_source_text(occurrence.surface)))
-            if key not in targets:
-                forms_by_language.setdefault(occurrence.source_lang, []).append(
-                    TermMention(term=canonical_source_text(occurrence.surface), block_id=concept_id))
-        for language, mentions in sorted(forms_by_language.items()):
-            try:
-                glossary = consolidate_terminology(mentions, source_lang=language, target_lang=target_lang or "",
-                                                    pi_call=pi_call, token_budget=token_budget, max_rounds=max_rounds,
-                                                    version=CONSOLIDATION_SCHEMA_VERSION, timing_ledger=timing_ledger)
-                for entry in glossary.entries:
-                    for alias in entry.source_terms:
-                        candidate = (entry.target_term, entry.confidence, False)
-                        exact_key = (language, _nfc_surface(alias))
-                        old_exact = exact_targets.get(exact_key)
-                        exact_targets[exact_key] = candidate if old_exact is None else (
-                            old_exact[0], old_exact[1], old_exact[0] != candidate[0] or old_exact[2])
-                        key = (language, terminology_candidate_key(alias))
-                        old = targets.get(key)
-                        targets[key] = candidate if old is None else (old[0], old[1], old[0] != candidate[0] or old[2])
-            except Exception as exc:
-                failure = Finding(kind="terminology_consolidation_failed", severity="warning", stage="terminology",
-                                  subject_refs=tuple(sorted(item.block_id for item in mentions)),
-                                  evidence={"source_lang": language, "error": type(exc).__name__},
-                                  message="Terminology consolidation failed; source-form fallback used.")
-                store.put_finding(failure); finding_ids.append(failure.finding_id)
-                failure_artifact = store.put(TERMINOLOGY_FAILURE_KIND,
-                    {"source_lang": language, "error": type(exc).__name__, "fallback": "source_form"},
-                    finding_ids=(failure.finding_id,), semantic_key=hashlib.sha256(
-                        canonical_json({"source_lang": language, "error": type(exc).__name__, "v": PROJECTION_ALGORITHM_VERSION}).encode()).hexdigest())
-                failures[language] = (failure_artifact.artifact_id, failure.finding_id)
+    # Merge exact selected cache targets only after the sparse table was
+    # accepted.  They are immutable authority, not discovery candidates.
+    targets.update(cached_targets)
+    exact_targets.update(cached_exact_targets)
 
     projection_ids: list[str] = []
     assessment_ids: list[str] = []
