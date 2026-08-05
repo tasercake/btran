@@ -483,8 +483,8 @@ class TestPersistedRawLeaves:
                              raw_bytes=raw)
             ], store=store, workspace=tmp_path / "state", model="vision", max_retries=6)
 
-        assert not list(store.artifacts_dir.iterdir())
-        assert not list(store.findings_dir.iterdir())
+        assert not store.artifacts_dir.exists() or not list(store.artifacts_dir.iterdir())
+        assert not store.findings_dir.exists() or not list(store.findings_dir.iterdir())
 
     @pytest.mark.asyncio
     async def test_low_confidence_page_aggregation_keeps_segment_review_provenance(self, tmp_path):
