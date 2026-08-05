@@ -872,23 +872,30 @@ class ConsolidationResult:
 def _validate_sparse_entries(entries: Sequence[TerminologyEntry], table: CandidateTable) -> tuple[list[TerminologyEntry], tuple[str, ...], tuple[str, ...]]:
     by_form = table.selected_by_form
     offending: set[str] = set()
+    returned_tier_zero_forms: set[str] = set()
+    tier_zero_by_form = {form: row for row in table.tier_zero for form in row.source_forms}
     for entry in entries:
         for raw_form in entry.source_terms:
             form = _nfc_surface(raw_form)
             row = by_form.get(form)
             if row is None or terminology_candidate_key(form) != row.candidate_key:
                 offending.add(raw_form)
-            elif form in table.protected_target_forms and entry.target_term != table.protected_target_forms[form]:
+                continue
+            if form in tier_zero_by_form:
+                # Candidate keys are lookup keys, not protected concept
+                # identities.  Every exact NFC spelling must be returned so a
+                # normalized collision cannot silently remove its target.
+                returned_tier_zero_forms.add(form)
+            if form in table.protected_target_forms and entry.target_term != table.protected_target_forms[form]:
                 offending.add(form)
             elif isinstance(entry.provenance, list):
                 allowed = set(by_form[form].declared_block_ids) | set(by_form[form].occurrence_ids) | set(by_form[form].entry_ids) | set(by_form[form].correction_ids)
                 if not set(entry.provenance) <= allowed:
                     offending.add(form)
-    tier_zero_by_form = {form: row for row in table.tier_zero for form in row.source_forms}
-    seen_tier_zero = {tier_zero_by_form[form].candidate_key for entry in entries
-                      for form in entry.source_terms if form in tier_zero_by_form}
-    required_tier_zero = {row.candidate_key for row in table.tier_zero}
-    missing = required_tier_zero - seen_tier_zero
+    missing_forms = set(tier_zero_by_form) - returned_tier_zero_forms
+    # Keep the public diagnostic as candidate IDs for compatibility.  The
+    # exact-form check above is what makes same-key tier-0 rows fail closed.
+    missing = {tier_zero_by_form[form].candidate_key for form in missing_forms}
     if offending or missing:
         return [], tuple(sorted(offending)), tuple(sorted(missing))
     # Canonical source sets are deduplicated by the lowest evidence tier, then
@@ -1400,22 +1407,46 @@ class TerminologyEvidenceRun:
         }))
 
 
-def _term_spans(text: str) -> tuple[tuple[int, int, str], ...]:
-    """Deterministic local candidate rule, with Unicode code-point offsets.
+def _term_spans(
+    text: str, selected_forms: Iterable[str] = (),
+) -> tuple[tuple[int, int, str], ...]:
+    """Return local word spans plus exact selected multiword spans.
 
     Model extraction is deliberately not used for occurrence evidence: exact
-    evidence must remain inspectable and independently reproducible.  A run of
-    Unicode word characters (with internal apostrophe/dash) is a candidate;
-    this also gives CJK runs a stable, non-empty local form.
+    evidence must remain inspectable and independently reproducible.  The
+    normal local scan emits complete word spans.  FC6 candidates can also be
+    proper names or repeated phrases, so add an exact selected span when its
+    endpoints are complete WORD_RE spans; never synthesize an arbitrary
+    substring or fragment.
     """
-    return tuple((match.start(), match.end(), match.group(0)) for match in re.finditer(
-        r"[^\W_]+(?:['’\-][^\W_]+)*", text, flags=re.UNICODE
-    ))
+    spans = {
+        (match.start(), match.end(), match.group(0))
+        for match in re.finditer(r"[^\W_]+(?:['’\-][^\W_]+)*", text, flags=re.UNICODE)
+    }
+    word_matches = tuple(WORD_RE.finditer(text))
+    starts = {match.start() for match in word_matches}
+    ends = {match.end() for match in word_matches}
+    for raw_form in selected_forms:
+        if not isinstance(raw_form, str) or not raw_form:
+            continue
+        form = _nfc_surface(raw_form)
+        start = 0
+        while True:
+            start = text.find(form, start)
+            if start < 0:
+                break
+            end = start + len(form)
+            if start in starts and end in ends and _span_is_boundary(text, start, end):
+                spans.add((start, end, text[start:end]))
+            start = max(end, start + 1)
+    return tuple(sorted(spans, key=lambda item: (item[0], item[1], item[2])))
 
 
 def _validated_occurrences(
     effective: EffectiveSegment,
     supplied: Sequence[TermOccurrence | Mapping[str, Any]] | None,
+    *,
+    selected_forms: Iterable[str] = (),
 ) -> tuple[TermOccurrence, ...]:
     if effective.source_lang is None:
         return ()
@@ -1423,7 +1454,7 @@ def _validated_occurrences(
     if supplied is not None and (isinstance(supplied, (str, bytes, bytearray, Mapping))
                                  or not isinstance(supplied, Sequence)):
         raise TerminologyEvidenceError("supplied occurrence evidence must be a sequence")
-    raw = supplied if supplied is not None else _term_spans(text)
+    raw = supplied if supplied is not None else _term_spans(text, selected_forms)
     occurrences: list[TermOccurrence] = []
     for item in raw:
         if isinstance(item, TermOccurrence):
@@ -1920,7 +1951,14 @@ def build_terminology_evidence(
         try:
             if supplied_present and supplied is None:
                 raise TerminologyEvidenceError("supplied occurrence evidence must be a sequence")
-            occurrences = _validated_occurrences(effective, supplied)
+            selected_forms = ()
+            if sparse_enabled and candidate_table is not None:
+                selected_forms = tuple(
+                    form for row in candidate_table.selected for form in row.source_forms
+                )
+            occurrences = _validated_occurrences(
+                effective, supplied, selected_forms=selected_forms,
+            )
             leaf_findings: tuple[str, ...] = ()
             kind = OCCURRENCE_EVIDENCE_SHARD_KIND
         except TerminologyEvidenceError as exc:

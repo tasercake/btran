@@ -212,6 +212,58 @@ def test_fc7_sparse_rejection_and_continuation_have_separate_fallback_classifica
     assert fallback.evidence["trigger"] == "selected_tier_zero_fallback"
 
 
+def test_fc6_same_key_tier_zero_requires_every_exact_form(tmp_path):
+    selected = [
+        TerminologyEntry("concept-a", ["Foo"], "un", ["b1"], 1.0),
+        TerminologyEntry("concept-b", ["foo"], "une", ["b1"], 1.0),
+    ]
+    table = build_candidate_table(
+        [SourceBlock("b1", "paragraph", "Foo foo", 0)], selected_entries=selected,
+    )
+    result = consolidate_candidate_table(
+        table, source_lang="en", target_lang="fr",
+        pi_call=lambda _: json.dumps({"entries": [{
+            "concept_id": "only-one", "source_terms": ["Foo"], "target_term": "un",
+            "provenance": ["concept-a"], "confidence": 1.0,
+        }]}),
+    )
+
+    assert result.rejected
+    assert result.missing_tier_zero == (terminology_candidate_key("foo"),)
+    assert [(entry.concept_id, entry.target_term) for entry in result.output] == [
+        ("concept-a", "un"), ("concept-b", "une"),
+    ]
+
+
+def test_fc6_selected_multiword_candidates_form_local_occurrences_and_memberships(tmp_path):
+    from btran.terminology import build_terminology_evidence
+
+    store, graph, record, artifact = _effective_source_artifact(
+        tmp_path, text="Ada Lovelace visited. Aurora Protocol protects keys.",
+    )
+    selected = [
+        TerminologyEntry("proper-name", ["Ada Lovelace"], "Ada Lovelace", [record.segment_id], 1.0),
+        TerminologyEntry("repeated-phrase", ["Aurora Protocol protects"], "Aurora Protocol protects", [record.segment_id], 1.0),
+    ]
+    table = build_candidate_table([record], selected_entries=selected)
+    response = json.dumps({"entries": [
+        {"concept_id": "proper", "source_terms": ["Ada Lovelace"],
+         "target_term": "Ada Lovelace", "provenance": ["proper-name"], "confidence": 1.0},
+        {"concept_id": "protocol", "source_terms": ["Aurora Protocol protects"],
+         "target_term": "Aurora Protocol protects", "provenance": ["repeated-phrase"], "confidence": 1.0},
+    ]})
+    run = build_terminology_evidence(
+        [artifact.artifact_id], store=store, graph=graph, mode="translated", target_lang="fr",
+        candidate_table=table, pi_call=lambda _: response, base_revision_id="base-revision",
+    )
+
+    forms = {
+        store.get(item).payload["canonical_source_form"]
+        for item in run.membership_artifact_ids
+    }
+    assert forms == {"Ada Lovelace", "Aurora Protocol protects"}
+
+
 def test_fc7_exact_tier_zero_targets_do_not_collapse_on_candidate_key(tmp_path):
     from btran.terminology import build_terminology_evidence
 
