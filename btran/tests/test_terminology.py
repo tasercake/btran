@@ -12,8 +12,11 @@ import pytest
 from btran.schema import SourceBlock, TermMention, TerminologyEntry
 from btran.terminology import (
     HARD_TOKEN_CAP,
+    CandidateTable,
     PiConsolidationError,
+    TerminologyCandidate,
     batch_term_groups,
+    build_candidate_table,
     cache_identity_with_glossary,
     consolidate_terminology,
     estimate_tokens,
@@ -22,6 +25,7 @@ from btran.terminology import (
     make_pi_consolidation_call,
     shard_terminology_map,
     slice_for_page,
+    _candidate_fallback_entries,
 )
 
 
@@ -47,6 +51,99 @@ def test_grouping_preserves_original_source_spelling_while_normalizing_its_key()
     assert groups[0].normalized_term == "ffoo"
     assert groups[0].forms == (original,)
     assert groups[0].provenance == ("p1-b1",)
+
+
+def test_sparse_candidate_tiers_keep_selected_tier_zero_and_order_automatic_tiers():
+    blocks = [
+        SourceBlock("b1", "paragraph", "ALPHA v2", 0),
+        SourceBlock("b2", "paragraph", "Ada\u2003\u2003Lovelace", 1),
+        SourceBlock("b3", "paragraph", "ALPHA", 2),
+        SourceBlock("b4", "paragraph", "ordinary phrase", 3),
+    ]
+    selected = TerminologyEntry("selected-concept", ["ordinary phrase"], "terme", ["b4"], 1.0)
+    table = build_candidate_table(blocks, selected_entries=[selected], limit=1)
+
+    assert table.tier_zero[0].entry_ids == ("selected-concept",)
+    assert table.selected[0].tier == 0
+    assert {item.tier for item in table.candidates} >= {0, 2, 3, 5}
+    assert [item.tier for item in table.selected] == [0]
+
+
+def test_proper_name_detection_accepts_one_or_more_unicode_space_separators():
+    blocks = [
+        SourceBlock("b1", "paragraph", "Ada\u2003\u2003Lovelace", 0),
+        SourceBlock("b2", "paragraph", "Ada\u2003\u2003Lovelace returned", 1),
+    ]
+    table = build_candidate_table(blocks, include_fallback=False)
+
+    names = [item for item in table.candidates if item.source_form == "Ada\u2003\u2003Lovelace"]
+    assert len(names) == 1
+    assert names[0].tier == 2
+
+
+def test_tier_zero_fallback_reuses_each_selected_concept_and_target_sharing_key():
+    first = TerminologyCandidate("Foo", "foo", 0, entry_ids=("concept-a",))
+    second = TerminologyCandidate("foo", "foo", 0, entry_ids=("concept-b",))
+    table = CandidateTable(
+        candidates=(first, second), selected=(first, second),
+        source_forms_by_key={"foo": ("Foo", "foo")},
+        protected_target_forms={"Foo": "un", "foo": "une"},
+    )
+
+    fallback = _candidate_fallback_entries(table)
+    assert [(item.concept_id, item.source_terms, item.target_term) for item in fallback] == [
+        ("concept-a", ["Foo"], "un"), ("concept-b", ["foo"], "une"),
+    ]
+    assert all(not item.concept_id.startswith("fallback-") for item in fallback)
+
+
+@pytest.mark.parametrize(
+    ("pi_call", "primary_kind", "primary_category"),
+    [
+        (lambda _: '{"entries": []}', "terminology_consolidation_invalid", "validation"),
+        (lambda _: (_ for _ in ()).throw(RuntimeError("offline")), "terminology_consolidation_failed", "failure"),
+    ],
+)
+def test_fc7_sparse_rejection_and_continuation_have_separate_fallback_classification(
+    tmp_path, pi_call, primary_kind, primary_category,
+):
+    from btran.terminology import build_terminology_evidence
+
+    store, graph, record, artifact = _effective_source_artifact(tmp_path, text="Magic")
+    selected = TerminologyEntry("magic-concept", ["Magic"], "Magie", [record.segment_id], 1.0)
+    table = build_candidate_table([record], selected_entries=[selected])
+    run = build_terminology_evidence(
+        [artifact.artifact_id], store=store, graph=graph, mode="translated", target_lang="fr",
+        candidate_table=table, pi_call=pi_call, base_revision_id="base-revision",
+    )
+
+    findings = [store.get_finding(item) for item in run.finding_ids]
+    categorized = {(item.kind, item.audit_category) for item in findings}
+    assert (primary_kind, primary_category) in categorized
+    assert ("terminology_consolidation_fallback", "fallback") in categorized
+    assert {store.get(item).payload["target_form"] for item in run.projection_artifact_ids} == {"Magie"}
+    fallback = next(item for item in findings if item.kind == "terminology_consolidation_fallback")
+    assert fallback.evidence["trigger"] == "selected_tier_zero_fallback"
+
+
+def test_fc7_exact_tier_zero_targets_do_not_collapse_on_candidate_key(tmp_path):
+    from btran.terminology import build_terminology_evidence
+
+    store, graph, record, artifact = _effective_source_artifact(tmp_path, text="Foo foo")
+    selected = [
+        TerminologyEntry("concept-a", ["Foo"], "un", [record.segment_id], 1.0),
+        TerminologyEntry("concept-b", ["foo"], "une", [record.segment_id], 1.0),
+    ]
+    table = build_candidate_table([record], selected_entries=selected)
+    run = build_terminology_evidence(
+        [artifact.artifact_id], store=store, graph=graph, mode="translated", target_lang="fr",
+        candidate_table=table, pi_call=lambda _: '{"entries": []}', base_revision_id="base-revision",
+    )
+    concept_forms = {store.get(item).payload["concept_id"]: store.get(item).payload["canonical_source_form"]
+                     for item in run.membership_artifact_ids}
+    targets = {concept_forms[store.get(item).payload["concept_id"]]: store.get(item).payload["target_form"]
+               for item in run.projection_artifact_ids}
+    assert targets == {"Foo": "un", "foo": "une"}
 
 
 def test_token_measurement_is_a_conservative_utf8_bound():

@@ -147,6 +147,10 @@ class CandidateTable:
     selected: tuple[TerminologyCandidate, ...]
     source_forms_by_key: Mapping[str, tuple[str, ...]]
     protected_target_forms: Mapping[str, str] = field(default_factory=dict)
+    # Preserve selected tier-0 entries as independent concepts for a local
+    # fallback.  Candidate keys are only lookup keys: distinct selected
+    # concepts may intentionally share one key.
+    protected_fallback_entries: tuple[TerminologyEntry, ...] = ()
 
     def __post_init__(self) -> None:
         candidates = tuple(self.candidates)
@@ -162,6 +166,10 @@ class CandidateTable:
         object.__setattr__(self, "selected", selected)
         object.__setattr__(self, "source_forms_by_key", MappingProxyType(dict(self.source_forms_by_key)))
         object.__setattr__(self, "protected_target_forms", MappingProxyType(dict(self.protected_target_forms)))
+        fallback_entries = tuple(self.protected_fallback_entries)
+        if any(not isinstance(item, TerminologyEntry) for item in fallback_entries):
+            raise TypeError("protected fallback contains an invalid entry")
+        object.__setattr__(self, "protected_fallback_entries", fallback_entries)
 
     @property
     def selected_by_form(self) -> Mapping[str, TerminologyCandidate]:
@@ -296,6 +304,60 @@ def _evidence_parts(values: Any, *, id_name: str) -> list[tuple[str, str, tuple[
     return result
 
 
+def _selected_values(values: Any) -> tuple[Any, ...]:
+    """Return selected evidence records without collapsing equal candidate keys."""
+    if values is None:
+        return ()
+    if isinstance(values, Mapping):
+        if any(key in values for key in (
+            "source_forms", "source_terms", "canonical_source_forms", "correction_id", "entry_id", "concept_id",
+        )):
+            return (values,)
+        values = values.get("entries", values.get("corrections", ()))
+    if isinstance(values, (str, bytes)):
+        return ()
+    return tuple(values) if isinstance(values, Iterable) else ()
+
+
+def _selected_fallback_entries(values: Any, *, id_name: str) -> tuple[TerminologyEntry, ...]:
+    """Copy selected tier-0 concept/target pairs for exact local continuation."""
+    result: list[TerminologyEntry] = []
+    for item in _selected_values(values):
+        if isinstance(item, Mapping):
+            identifier = item.get("concept_id", item.get(id_name, item.get("entry_id", item.get("correction_id", ""))))
+            forms = item.get("source_forms", item.get("source_terms", item.get("canonical_source_forms", ())))
+            target = item.get("replacement", item.get("target_form", item.get("target_term")))
+            provenance = item.get("provenance", item.get("block_ids", ()))
+            confidence = item.get("confidence", 0.0)
+            notes = item.get("notes", "selected tier-0 fallback")
+        else:
+            identifier = getattr(item, "concept_id", getattr(item, id_name, getattr(item, "entry_id", getattr(item, "correction_id", ""))))
+            forms = getattr(item, "source_forms", getattr(item, "source_terms", getattr(item, "canonical_source_forms", ())))
+            target = getattr(item, "replacement", getattr(item, "target_form", getattr(item, "target_term", None)))
+            provenance = getattr(item, "provenance", getattr(item, "block_ids", ()))
+            confidence = getattr(item, "confidence", 0.0)
+            notes = getattr(item, "notes", "selected tier-0 fallback")
+        if isinstance(forms, str):
+            forms = (forms,)
+        if isinstance(provenance, str):
+            provenance = (provenance,)
+        if isinstance(forms, Iterable):
+            forms = tuple(_nfc_surface(form) for form in forms if isinstance(form, str) and form)
+        else:
+            forms = ()
+        if not forms or not isinstance(identifier, str) or not identifier:
+            continue
+        if not isinstance(target, str) or not target:
+            continue
+        provenance = tuple(item for item in provenance if isinstance(item, str) and item) if isinstance(provenance, Iterable) else ()
+        result.append(TerminologyEntry(
+            concept_id=identifier, source_terms=list(forms), target_term=_nfc_surface(target),
+            provenance=list(provenance or forms), confidence=confidence if isinstance(confidence, (int, float)) and not isinstance(confidence, bool) else 0.0,
+            notes=notes if isinstance(notes, str) else "selected tier-0 fallback",
+        ))
+    return tuple(result)
+
+
 def _target_parts(values: Any) -> dict[str, str]:
     result: dict[str, str] = {}
     if values is None:
@@ -371,7 +433,10 @@ def build_candidate_table(source: Any, declared_mentions: Any = None, *,
         mentions = _mention_parts(source if isinstance(source, Mapping) or hasattr(source, "term_mentions") else None)
     rows: dict[str, dict[str, Any]] = {}
     protected_target_forms = _target_parts(selected_terminology_corrections)
-    protected_target_forms.update(_target_parts(selected_entries if selected_entries else selected_closure_entries))
+    protected_source_entries = _selected_fallback_entries(selected_terminology_corrections, id_name="correction_id")
+    protected_entries_input = selected_entries if selected_entries else selected_closure_entries
+    protected_target_forms.update(_target_parts(protected_entries_input))
+    protected_source_entries += _selected_fallback_entries(protected_entries_input, id_name="entry_id")
     # Explicit selected evidence is protected before any detector runs.
     for form, identifier, _ in _evidence_parts(selected_terminology_corrections, id_name="correction_id"):
         _merge_candidate(rows, form, tier=0, correction_id=identifier)
@@ -426,7 +491,7 @@ def build_candidate_table(source: Any, declared_mentions: Any = None, *,
             while end_index + 1 < len(words):
                 separator = text[words[end_index].end():words[end_index + 1].start()]
                 next_first = _first_cased_codepoint(words[end_index + 1].group(0))
-                if separator != " " and not regex.fullmatch(r"\p{Zs}", separator, flags=regex.VERSION1):
+                if regex.fullmatch(r"\p{Zs}+", separator, flags=regex.VERSION1) is None:
                     break
                 if next_first is None or unicodedata.category(next_first) not in {"Lu", "Lt"}:
                     break
@@ -508,7 +573,7 @@ def build_candidate_table(source: Any, declared_mentions: Any = None, *,
     selected = protected + [item for item in candidates if item.tier != 0][:max(0, limit - len(protected))] if len(protected) <= limit else protected
     return CandidateTable(tuple(candidates), tuple(selected),
                           {key: tuple(sorted(value["forms"], key=lambda form: (terminology_candidate_key(form), form)))
-                           for key, value in sorted(rows.items())}, protected_target_forms)
+                           for key, value in sorted(rows.items())}, protected_target_forms, protected_source_entries)
 
 
 # Descriptive aliases are kept stable for external stage consumers.
@@ -707,21 +772,22 @@ def sparse_consolidation_prompt(table: CandidateTable, *, source_lang: str = "",
 
 
 def _candidate_fallback_entries(table: CandidateTable) -> list[TerminologyEntry]:
-    """Return exactly the protected rows, with no rejected model content."""
-    grouped: dict[str, list[TerminologyCandidate]] = {}
-    for row in table.tier_zero:
-        grouped.setdefault(row.candidate_key, []).append(row)
+    """Return each selected tier-0 concept and target without key-based merging."""
+    if table.protected_fallback_entries:
+        # Do not canonicalize by candidate key here.  A key is a matching aid,
+        # not concept identity; these entries are the exact selected closure.
+        return list(table.protected_fallback_entries)
     entries: list[TerminologyEntry] = []
-    for key, rows in sorted(grouped.items()):
-        forms = sorted({form for row in rows for form in row.source_forms}, key=lambda value: (terminology_candidate_key(value), value))
-        provenance = sorted({identifier for row in rows for identifier in (*row.declared_block_ids, *row.occurrence_ids)})
-        target = next((table.protected_target_forms.get(form) for form in forms if form in table.protected_target_forms), forms[0])
-        protected_ids = sorted({identifier for row in rows for identifier in (*row.entry_ids, *row.correction_ids)})
-        concept_id = protected_ids[0] if len(protected_ids) == 1 else "fallback-" + hashlib.sha256((key + "\\0" + "\\0".join(forms)).encode("utf-8")).hexdigest()
+    for row in sorted(table.tier_zero, key=lambda item: item.rank):
+        protected_ids = tuple(sorted((*row.entry_ids, *row.correction_ids)))
+        concept_id = protected_ids[0] if protected_ids else row.source_form
+        target = next((table.protected_target_forms.get(form) for form in row.source_forms
+                       if form in table.protected_target_forms), row.source_form)
+        provenance = sorted({identifier for identifier in (*row.declared_block_ids, *row.occurrence_ids)})
         entries.append(TerminologyEntry(
-            concept_id=concept_id,
-            source_terms=forms, target_term=target, provenance=provenance or forms,
-            confidence=0.0, notes="selected tier-0 fallback",
+            concept_id=concept_id, source_terms=list(row.source_forms), target_term=target,
+            provenance=provenance or list(row.source_forms), confidence=0.0,
+            notes="selected tier-0 fallback",
         ))
     return _canonical_entries(entries)
 
@@ -1820,6 +1886,7 @@ def build_terminology_evidence(
     # model/prompt key. Inspect that exact sealed selection before invoking the
     # consolidation model; index/history ordering never chooses a form.
     cached_targets: dict[tuple[str, str], tuple[str, float | None, bool]] = {}
+    cached_exact_targets: dict[tuple[str, str], tuple[str, float | None, bool]] = {}
     # Preserve exact selected base projection, not only its target form.  A
     # fallback projection owns a deterministic failure artifact in its closed
     # dependency set. Reconstructing it after the selected target suppresses a
@@ -1854,6 +1921,7 @@ def build_terminology_evidence(
                 )
                 if selected_projection is not None:
                     cached_targets[(language, terminology_candidate_key(form))] = (target_form, None, False)
+                    cached_exact_targets[(language, form)] = (target_form, None, False)
                     cached_base_projections[concept_id] = selected_projection
                     break
             except Exception:
@@ -1862,6 +1930,7 @@ def build_terminology_evidence(
     # One bounded model consolidation per language with a missing selected
     # target. Native mode intentionally never evaluates pi_call.
     targets: dict[tuple[str, str], tuple[str, float | None, bool]] = dict(cached_targets)
+    exact_targets: dict[tuple[str, str], tuple[str, float | None, bool]] = dict(cached_exact_targets)
     failures: dict[str, tuple[str, str]] = {}
     if sparse_enabled:
         # Exactly one sparse table/model request per source language.  A
@@ -1885,16 +1954,28 @@ def build_terminology_evidence(
                                       message="Terminology response was rejected; selected tier-0 fallback continued.",
                                       audit_category=category)
                     store.put_finding(finding); finding_ids.append(finding.finding_id)
+                    fallback = Finding(
+                        kind="terminology_consolidation_fallback", severity="warning", stage="terminology",
+                        audit_category="fallback", subject_refs=subject_refs,
+                        evidence={"trigger": "selected_tier_zero_fallback", "failure_finding_id": finding.finding_id,
+                                  "source_lang": language, "fallback": "selected_tier_zero"},
+                        message="Terminology consolidation continued with the exact selected tier-0 fallback.",
+                    )
+                    store.put_finding(fallback); finding_ids.append(fallback.finding_id)
                     failure_artifact = store.put(TERMINOLOGY_FAILURE_KIND,
                         {"source_lang": language, "error": category, "fallback": "selected_tier_zero"},
-                        finding_ids=(finding.finding_id,), semantic_key=hashlib.sha256(
+                        finding_ids=(finding.finding_id, fallback.finding_id), semantic_key=hashlib.sha256(
                             canonical_json({"source_lang": language, "error": category, "v": PROJECTION_ALGORITHM_VERSION}).encode()).hexdigest())
                     failures[language] = (failure_artifact.artifact_id, finding.finding_id)
                 for entry in result.output:
                     for alias in entry.source_terms:
+                        candidate = (entry.target_term, entry.confidence, False)
+                        exact_key = (language, _nfc_surface(alias))
+                        old_exact = exact_targets.get(exact_key)
+                        exact_targets[exact_key] = candidate if old_exact is None else (
+                            old_exact[0], old_exact[1], old_exact[0] != candidate[0] or old_exact[2])
                         key = (language, terminology_candidate_key(alias))
                         old = targets.get(key)
-                        candidate = (entry.target_term, entry.confidence, False)
                         targets[key] = candidate if old is None else (old[0], old[1], old[0] != candidate[0] or old[2])
             except Exception as exc:
                 subject_refs = tuple(sorted(item.source_form for item in table.selected)) or (language or "terminology",)
@@ -1902,9 +1983,17 @@ def build_terminology_evidence(
                                   subject_refs=subject_refs, evidence={"trigger": "model_failure", "source_lang": language, "error": type(exc).__name__},
                                   message="Terminology consolidation failed; selected tier-0 fallback continued.", audit_category="failure")
                 store.put_finding(failure); finding_ids.append(failure.finding_id)
+                fallback = Finding(
+                    kind="terminology_consolidation_fallback", severity="warning", stage="terminology",
+                    audit_category="fallback", subject_refs=subject_refs,
+                    evidence={"trigger": "selected_tier_zero_fallback", "failure_finding_id": failure.finding_id,
+                              "source_lang": language, "fallback": "selected_tier_zero"},
+                    message="Terminology consolidation continued with the exact selected tier-0 fallback.",
+                )
+                store.put_finding(fallback); finding_ids.append(fallback.finding_id)
                 failure_artifact = store.put(TERMINOLOGY_FAILURE_KIND,
                     {"source_lang": language, "error": type(exc).__name__, "fallback": "selected_tier_zero"},
-                    finding_ids=(failure.finding_id,), semantic_key=hashlib.sha256(
+                    finding_ids=(failure.finding_id, fallback.finding_id), semantic_key=hashlib.sha256(
                         canonical_json({"source_lang": language, "error": type(exc).__name__, "v": PROJECTION_ALGORITHM_VERSION}).encode()).hexdigest())
                 failures[language] = (failure_artifact.artifact_id, failure.finding_id)
     elif mode == "translated":
@@ -1924,9 +2013,13 @@ def build_terminology_evidence(
                                                     version=CONSOLIDATION_SCHEMA_VERSION, timing_ledger=timing_ledger)
                 for entry in glossary.entries:
                     for alias in entry.source_terms:
+                        candidate = (entry.target_term, entry.confidence, False)
+                        exact_key = (language, _nfc_surface(alias))
+                        old_exact = exact_targets.get(exact_key)
+                        exact_targets[exact_key] = candidate if old_exact is None else (
+                            old_exact[0], old_exact[1], old_exact[0] != candidate[0] or old_exact[2])
                         key = (language, terminology_candidate_key(alias))
                         old = targets.get(key)
-                        candidate = (entry.target_term, entry.confidence, False)
                         targets[key] = candidate if old is None else (old[0], old[1], old[0] != candidate[0] or old[2])
             except Exception as exc:
                 failure = Finding(kind="terminology_consolidation_failed", severity="warning", stage="terminology",
@@ -1947,9 +2040,9 @@ def build_terminology_evidence(
     anchor_concept_id = next(iter(sorted(memberships)), None)
     for concept_id, (membership, occurrences) in sorted(memberships.items()):
         language, form = occurrences[0].source_lang, canonical_source_text(occurrences[0].surface)
-        target, confidence, source_ambiguous = (form, None, False) if mode == "native" else targets.get(
-            (language, terminology_candidate_key(form)), (form, None, True))
-        missing_model_form = mode == "translated" and (language, terminology_candidate_key(form)) not in targets
+        target, confidence, source_ambiguous = (form, None, False) if mode == "native" else exact_targets.get(
+            (language, form), targets.get((language, terminology_candidate_key(form)), (form, None, True)))
+        missing_model_form = mode == "translated" and (language, form) not in exact_targets and (language, terminology_candidate_key(form)) not in targets
         degraded = mode == "native" or language in failures or missing_model_form
         ambiguity_kind: str | None = "source_sense" if source_ambiguous and not missing_model_form else ("concept" if missing_model_form else None)
         if language in failures:
