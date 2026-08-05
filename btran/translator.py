@@ -300,6 +300,11 @@ DIAGNOSTIC_EFFECTIVE_TARGET_SEGMENT_KIND = "DiagnosticEffectiveTargetSegment"
 EFFECTIVE_TARGET_PAGE_KIND = "EffectiveTargetPage"
 TRANSLATION_ARTIFACT_KIND = "TranslationArtifact"
 DIAGNOSTIC_TRANSLATION_FALLBACK_KIND = "DiagnosticTranslationFallback"
+DIAGNOSTIC_TRANSLATION_VALIDATION_FALLBACK_KIND = "DiagnosticTranslationValidationFallback"
+_TRANSLATION_FALLBACK_KINDS = frozenset({
+    DIAGNOSTIC_TRANSLATION_FALLBACK_KIND,
+    DIAGNOSTIC_TRANSLATION_VALIDATION_FALLBACK_KIND,
+})
 TARGET_SEGMENT_OVERLAY_KIND = "TargetSegmentOverlay"
 TARGET_OCCURRENCE_OVERLAY_KIND = "TargetOccurrenceOverlay"
 ASSESSMENT_ARTIFACT_KIND = "ConfidenceAssessment"
@@ -423,11 +428,41 @@ def _target_overlay_inputs(value: Any) -> tuple[OverlayInput, ...]:
 
 def _translation_body(artifact: Any) -> Mapping[str, Any] | None:
     body = artifact.payload
-    if artifact.kind not in {TRANSLATION_ARTIFACT_KIND, DIAGNOSTIC_TRANSLATION_FALLBACK_KIND}:
+    if artifact.kind not in {TRANSLATION_ARTIFACT_KIND, *_TRANSLATION_FALLBACK_KINDS}:
         return None
     if not isinstance(body.get("segment_id"), str) or not isinstance(body.get("translated_text"), str):
         return None
     return body
+
+
+def _selected_projections(
+    projections: Sequence[Mapping[str, Any]], occurrence_ids: set[str],
+) -> tuple[Mapping[str, Any], ...]:
+    """Select focal/context projections without dropping an unaffected base scope.
+
+    A corrected subset projection overlaps its reused broad base projection.  The
+    base remains authoritative for occurrences outside that subset; only its
+    selected scope is narrowed for this translation request.
+    """
+    selected = tuple(
+        item for item in projections
+        if set(item["selector_occurrence_ids"]) & occurrence_ids
+    )
+    corrected = set().union(*(
+        set(item["selector_occurrence_ids"])
+        for item in selected if item["correction_id"] is not None
+    )) if selected else set()
+    result: list[Mapping[str, Any]] = []
+    for item in selected:
+        scope = item["selector_occurrence_ids"]
+        if item["correction_id"] is None:
+            scope = [occurrence_id for occurrence_id in scope if occurrence_id not in corrected]
+            if not scope:
+                continue
+            if scope != item["selector_occurrence_ids"]:
+                item = {**item, "selector_occurrence_ids": scope}
+        result.append(item)
+    return tuple(result)
 
 
 def _local_overlay_base(
@@ -701,18 +736,7 @@ async def materialize_effective_target(
                 row.get("occurrence_id") for current in (segment, previous, following) if current is not None
                 for row in occurrences.get(current.segment_id, ())
             }
-            selected = tuple(item for item in projections if set(item["selector_occurrence_ids"]) & selected_occurrence_ids)
-            # A reused all-concept base projection remains selected for untouched
-            # occurrences, but scoped terminology overlays take precedence where
-            # their verified occurrence IDs apply.  Otherwise a subset edit
-            # would still fan out through its retained broad projection.
-            corrected_occurrence_ids = set().union(*(
-                set(item["selector_occurrence_ids"]) for item in selected
-                if item["correction_id"] is not None
-            )) if selected else set()
-            if corrected_occurrence_ids:
-                selected = tuple(item for item in selected if item["correction_id"] is not None
-                                 or not (set(item["selector_occurrence_ids"]) & corrected_occurrence_ids))
+            selected = _selected_projections(projections, selected_occurrence_ids)
             source_context_ids = tuple(item[0] for item in all_segments[max(0, flat_index - 1):flat_index] + all_segments[flat_index + 1:flat_index + 2]
                                        if item[1].source_lang is not None)
             local_base = _local_overlay_base(segment=segment, overlays=overlays, store=store)
@@ -750,6 +774,16 @@ async def materialize_effective_target(
                         model_executable_identity=model_executable_identity, model_id=model,
                         reasoning_level=reasoning_level,
                         prompt_bytes=SEGMENT_TRANSLATION_PROMPT.encode(), target_lang=target_lang or "")
+                if cached is None:
+                    cached = cache_validator.select(selected_snapshot, requested_artifact_id=requested,
+                        kind=DIAGNOSTIC_TRANSLATION_VALIDATION_FALLBACK_KIND, key_constructor=translation_semantic_key,
+                        source_artifact_id=source_artifact_id,
+                        preceding_source_artifact_id=source_context_ids[0] if previous is not None else None,
+                        following_source_artifact_id=source_context_ids[-1] if following is not None else None,
+                        projection_ids=tuple(item["artifact_id"] for item in selected),
+                        model_executable_identity=model_executable_identity, model_id=model,
+                        reasoning_level=reasoning_level,
+                        prompt_bytes=SEGMENT_TRANSLATION_PROMPT.encode(), target_lang=target_lang or "")
                 if cached is not None:
                     body = _translation_body(cached)
                     record_id = _target_id("translation-record-v1", {"segment_id": segment.segment_id,
@@ -766,7 +800,7 @@ async def materialize_effective_target(
                             and body.get("projection_ids") == [item["artifact_id"] for item in selected]
                             and body.get("mappings") == expected_rows and cached.dependency_ids == expected_dependencies):
                         local_base = (cached, body)
-                        translation_fallback = cached.kind == DIAGNOSTIC_TRANSLATION_FALLBACK_KIND
+                        translation_fallback = cached.kind in _TRANSLATION_FALLBACK_KINDS
                         if translation_fallback:
                             fallback = Finding(kind="translation_continuation", severity="warning", stage="translation",
                                 subject_refs=(segment.segment_id,), evidence={"trigger": "selected_diagnostic_translation",
@@ -852,7 +886,7 @@ async def materialize_effective_target(
                         category = exc.classification
                     else:
                         category = "failure"
-                    fallback_kind = ("DiagnosticTranslationValidationFallback"
+                    fallback_kind = (DIAGNOSTIC_TRANSLATION_VALIDATION_FALLBACK_KIND
                                      if category == "validation" else DIAGNOSTIC_TRANSLATION_FALLBACK_KIND)
                     translated_text = _diagnostic_placeholder("translation_failed", {"error": type(exc).__name__, "segment_id": segment.segment_id})
                     primary = Finding(
@@ -964,11 +998,11 @@ async def materialize_effective_target(
             tuple(sorted(set(translations))), tuple(sorted(assessments)),
             tuple(sorted(set((*semantic_page_findings, *run_context_findings)))), tuple(edge_ids),
             any(store.get(item[0]).kind == DIAGNOSTIC_EFFECTIVE_TARGET_SEGMENT_KIND for item in target_segments) or
-            any(store.get(item).kind == DIAGNOSTIC_TRANSLATION_FALLBACK_KIND for item in translations)))
+            any(store.get(item).kind in _TRANSLATION_FALLBACK_KINDS for item in translations)))
     status = "degraded" if any(item.degraded for item in output) else "completed"
     summary = stage_summary_finding("target_materialization", status, {"pages": len(output),
         "segments": sum(len(item.segment_artifact_ids) for item in output), "translation_fallbacks": sum(
-            1 for item in output for artifact_id in item.translation_artifact_ids if store.get(artifact_id).kind == DIAGNOSTIC_TRANSLATION_FALLBACK_KIND),
+            1 for item in output for artifact_id in item.translation_artifact_ids if store.get(artifact_id).kind in _TRANSLATION_FALLBACK_KINDS),
         "native_segments": sum(len(item.segment_artifact_ids) for item in output) if mode == "native" else 0},
         subject_refs=tuple(sorted(item.page_id for item in output)))
     store.put_finding(summary)

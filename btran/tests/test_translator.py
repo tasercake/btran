@@ -386,6 +386,8 @@ async def test_task10_translated_uses_only_immediate_non_diagnostic_context_and_
 
     assert result.status == "degraded"  # diagnostic source is retained, not skipped.
     assert [item["focal_source"]["segment_id"] for item in contexts] == ["segment-0", "segment-2"]
+    assert contexts[0]["immediate_source_neighbors"] == {"preceding": None, "following": None}
+    assert contexts[1]["immediate_source_neighbors"] == {"preceding": None, "following": None}
     assert all(item["immediate_source_neighbors"]["preceding"] is None or item["immediate_source_neighbors"]["following"] is None for item in contexts)
     findings = [store.get_finding(item) for item in result.leaves[0].finding_ids]
     assert any(item.kind == "context_neighbor_diagnostic" for item in findings)
@@ -426,6 +428,71 @@ async def test_task10_local_target_segment_overlay_bypasses_model_and_reaches_ta
 
 
 @pytest.mark.asyncio
+async def test_task10_translation_context_follows_declared_effective_segment_order(tmp_path):
+    from btran.translator import materialize_effective_target
+
+    store, graph, source, _ = _task10_source(tmp_path, ["first", "second", "third"])
+    contexts = []
+
+    async def model(context):
+        contexts.append(context)
+        return {"translated_text": "T:" + context["focal_source"]["text"]}
+
+    await materialize_effective_target(
+        source, store=store, graph=graph, mode="translated", target_lang="en",
+        translation_call=model,
+    )
+
+    assert [item["focal_source"]["segment_id"] for item in contexts] == [
+        "segment-0", "segment-1", "segment-2",
+    ]
+    assert [item["immediate_source_neighbors"] for item in contexts] == [
+        {"preceding": None, "following": {"segment_id": "segment-1", "text": "second"}},
+        {"preceding": {"segment_id": "segment-0", "text": "first"},
+         "following": {"segment_id": "segment-2", "text": "third"}},
+        {"preceding": {"segment_id": "segment-1", "text": "second"}, "following": None},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_task10_scoped_projection_keeps_unaffected_base_occurrences(tmp_path):
+    from btran.translator import materialize_effective_target
+
+    store, graph, source, _ = _task10_source(tmp_path, ["source"])
+    base = store.put("ConceptProjection", {
+        "schema_version": "schema-v1", "projection_id": "projection-base", "concept_id": "concept",
+        "membership_id": "membership", "selector_occurrence_ids": ["occ-a", "occ-b"],
+        "target_form": "base", "correction_id": None,
+    }, semantic_key="projection-base")
+    corrected = store.put("ConceptProjection", {
+        "schema_version": "schema-v1", "projection_id": "projection-corrected", "concept_id": "concept",
+        "membership_id": "membership", "selector_occurrence_ids": ["occ-a"],
+        "target_form": "corrected", "correction_id": "correction",
+    }, semantic_key="projection-corrected")
+    evidence = store.put("EvidenceShard", {"occurrences": [
+        {"occurrence_id": "occ-a"}, {"occurrence_id": "occ-b"},
+    ]}, semantic_key="evidence")
+    terminology = SimpleNamespace(
+        projection_artifact_ids=(base.artifact_id, corrected.artifact_id),
+        evidence_leaves=(SimpleNamespace(segment_id="segment-0", evidence_shard_artifact_id=evidence.artifact_id),),
+    )
+    contexts = []
+
+    async def model(context):
+        contexts.append(context)
+        return {"translated_text": "corrected base"}
+
+    await materialize_effective_target(
+        source, terminology, store=store, graph=graph, mode="translated", target_lang="en",
+        translation_call=model,
+    )
+
+    projections = {item["correction_id"]: item for item in contexts[0]["projections"]}
+    assert projections[None]["selector_occurrence_ids"] == ["occ-b"]
+    assert projections["correction"]["selector_occurrence_ids"] == ["occ-a"]
+
+
+@pytest.mark.asyncio
 async def test_task10_separates_translation_primary_and_continuation_findings(tmp_path):
     from btran.translator import materialize_effective_target
 
@@ -461,8 +528,47 @@ async def test_task10_invalid_translation_response_is_not_a_translation_cache_en
     translation = store.get(result.leaves[0].translation_artifact_ids[0])
     assert translation.kind == "DiagnosticTranslationValidationFallback"
     assert translation.kind != "TranslationArtifact"
+    assert result.status == "degraded"
+    assert result.leaves[0].degraded is True
     findings = [store.get_finding(item) for item in result.leaves[0].finding_ids]
     assert any(item.audit_category == "validation" for item in findings)
+    assert any(item.audit_category == "fallback" for item in findings)
+
+
+@pytest.mark.asyncio
+async def test_task10_reuses_cached_validation_fallback_with_continuation_finding(tmp_path):
+    from btran.schema import RevisionSnapshot
+    from btran.translator import materialize_effective_target
+
+    store, graph, source, segments = _task10_source(tmp_path, ["source"])
+
+    async def invalid_model(_):
+        return {"unexpected": "field"}
+
+    first = await materialize_effective_target(
+        source, store=store, graph=graph, mode="translated", target_lang="en",
+        translation_call=invalid_model,
+    )
+    fallback_id = first.leaves[0].translation_artifact_ids[0]
+    snapshot = RevisionSnapshot(
+        revision_id="snapshot",
+        selected_artifact_ids=tuple(sorted((segments[0][0].artifact_id, fallback_id))),
+        selected_cache_attestation_ids=store.attestation_ids_for((fallback_id,)),
+    )
+
+    async def should_not_run(_):
+        raise AssertionError("cached validation fallback must be reused")
+
+    second = await materialize_effective_target(
+        source, store=store, graph=graph, mode="translated", target_lang="en",
+        selected_snapshot=snapshot, selected_translation_artifact_ids={"segment-0": fallback_id},
+        translation_call=should_not_run,
+    )
+
+    assert second.status == "degraded"
+    assert any(event.outcome == "hit" for event in second.cache_events)
+    findings = [store.get_finding(item) for item in second.leaves[0].finding_ids]
+    assert sum(item.kind == "translation_continuation" for item in findings) == 1
     assert any(item.audit_category == "fallback" for item in findings)
 
 
