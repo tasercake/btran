@@ -74,6 +74,13 @@ def test_context_conflict_preserves_full_selected_projection_closure(tmp_path):
 
     conflict = next(issue for issue in result.issues if issue.kind == "context_conflict")
     assert set(conflict.evidence["projection_ids"]) == {first_projection_id, conflicting_projection_id}
+    conflict_findings = [item for item in (store.get_finding(item_id) for item_id in result.finding_ids) if item.kind == "context_conflict"]
+    assert len(conflict_findings) == 1
+    conflict_finding = conflict_findings[0]
+    assert conflict_finding.audit_category == "conflict"
+    assert conflict_finding.evidence["trigger"] == "conflict"
+    assert conflict_finding.evidence["evidence"]["occurrence_id"] == "occurrence-1"
+    assert set(conflict_finding.evidence["evidence"]["projection_ids"]) == {first_projection_id, conflicting_projection_id}
     assert result.projection_artifact_ids == selected_ids
     persisted = store.get(result.artifact_id)
     assert tuple(persisted.payload["projection_artifact_ids"]) == selected_ids
