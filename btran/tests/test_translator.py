@@ -425,6 +425,47 @@ async def test_task10_local_target_segment_overlay_bypasses_model_and_reaches_ta
     assert any(item.edge_kind == "target_overlay_to_effective_target" for item in edges)
 
 
+@pytest.mark.asyncio
+async def test_task10_separates_translation_primary_and_continuation_findings(tmp_path):
+    from btran.translator import materialize_effective_target
+
+    store, graph, source, _ = _task10_source(tmp_path, ["source"])
+
+    async def model(_):
+        raise RuntimeError("model unavailable")
+
+    result = await materialize_effective_target(
+        source, store=store, graph=graph, mode="translated", target_lang="en",
+        translation_call=model,
+    )
+    findings = [store.get_finding(item) for item in result.leaves[0].finding_ids]
+    categories = {item.audit_category for item in findings if item.audit_category is not None}
+    assert {"failure", "fallback"} <= categories
+    assert any(item.kind == "translation_failed" and item.audit_category == "failure" for item in findings)
+    assert any(item.kind == "translation_continuation" and item.audit_category == "fallback" for item in findings)
+
+
+@pytest.mark.asyncio
+async def test_task10_invalid_translation_response_is_not_a_translation_cache_entry(tmp_path):
+    from btran.translator import materialize_effective_target
+
+    store, graph, source, _ = _task10_source(tmp_path, ["source"])
+
+    async def model(_):
+        return {"unexpected": "field"}
+
+    result = await materialize_effective_target(
+        source, store=store, graph=graph, mode="translated", target_lang="en",
+        translation_call=model,
+    )
+    translation = store.get(result.leaves[0].translation_artifact_ids[0])
+    assert translation.kind == "DiagnosticTranslationValidationFallback"
+    assert translation.kind != "TranslationArtifact"
+    findings = [store.get_finding(item) for item in result.leaves[0].finding_ids]
+    assert any(item.audit_category == "validation" for item in findings)
+    assert any(item.audit_category == "fallback" for item in findings)
+
+
 def test_task10_refresh_preserves_old_and_new_leaves_in_unactivated_candidate(tmp_path):
     from btran.artifacts import ArtifactStore
     from btran.translator import refresh_reachable_model_leaves

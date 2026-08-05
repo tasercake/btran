@@ -9,19 +9,21 @@ import json
 import os
 import re
 import unicodedata
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Iterable, Mapping, Sequence
+from typing import Any, AsyncIterator, Awaitable, Callable, Iterable, Mapping, Sequence
 
 from btran.artifacts import ArtifactStore, CacheValidator, DependencyGraph, RevisionSnapshot, translation_semantic_key
 from btran.orchestrator_contract import CacheEvent
-from btran.process_cleanup import cleanup_async_process
+from btran.process_cleanup import CleanupCause, cleanup_async_process
 from btran.config import ensure_pi_session_dir, resolve_pi_session_dir, validate_reasoning_level
 from btran.corrections import OverlayInput
 from btran.identity import occurrence_id_for
 from btran.schema import (
     ConfidenceAssessment,
     EffectivePage,
+    actionable_uncertainty_finding,
     EffectiveSegment,
     Finding,
     PageExtraction,
@@ -33,7 +35,6 @@ from btran.schema import (
     review_requests_for,
     stage_summary_finding,
     tagged_sha256,
-    uncertainty_finding,
 )
 
 TRANSLATION_OUTPUT_SCHEMA = {
@@ -69,7 +70,37 @@ _CLEANUP_TIMEOUT_SECONDS = 2
 
 
 class TranslationError(Exception):
-    """Raised when text-block translation cannot produce a valid result."""
+    """Raised when text-block translation cannot produce a valid result.
+
+    ``classification`` is deliberately retained on the typed error so the
+    caller can publish the primary operational finding separately from any
+    continuation fallback.  Model/transport failures and response validation
+    failures are not interchangeable audit evidence.
+    """
+
+    def __init__(self, message: str, *, classification: str = "validation") -> None:
+        if classification not in {"failure", "validation"}:
+            raise ValueError("translation error classification must be failure or validation")
+        super().__init__(message)
+        self.classification = classification
+
+
+@asynccontextmanager
+async def _model_timing(timing_ledger: Any) -> AsyncIterator[None]:
+    """Measure only the model await, with compatibility for sync ledgers."""
+    if timing_ledger is None:
+        yield
+        return
+    async_context = getattr(timing_ledger, "model_execution_async", None)
+    if callable(async_context):
+        async with async_context():
+            yield
+        return
+    sync_context = getattr(timing_ledger, "model_execution", None)
+    if not callable(sync_context):
+        raise TranslationError("timing ledger does not provide model execution timing", classification="failure")
+    with sync_context():
+        yield
 
 
 def _normalize_text(text: str) -> str:
@@ -152,9 +183,9 @@ def translation_cache_identity(
 
 def _translated_blocks(data: object, source_ids: list[str]) -> list[TranslatedBlock]:
     if len(source_ids) != len(set(source_ids)):
-        raise TranslationError("source artifact contains duplicate block IDs")
+        raise TranslationError("source artifact contains duplicate block IDs", classification="validation")
     if not isinstance(data, dict) or set(data) != {"blocks"} or not isinstance(data["blocks"], list):
-        raise TranslationError("pi output violates the response schema")
+        raise TranslationError("pi output violates the response schema", classification="validation")
 
     returned: list[TranslatedBlock] = []
     for block in data["blocks"]:
@@ -163,8 +194,9 @@ def _translated_blocks(data: object, source_ids: list[str]) -> list[TranslatedBl
             or set(block) != {"block_id", "translated_text"}
             or not isinstance(block["block_id"], str)
             or not isinstance(block["translated_text"], str)
+            or not block["translated_text"].strip()
         ):
-            raise TranslationError("pi output violates the response schema")
+            raise TranslationError("pi output violates the response schema", classification="validation")
         returned.append(TranslatedBlock(block_id=block["block_id"], translated_text=block["translated_text"]))
 
     returned_ids = [block.block_id for block in returned]
@@ -186,9 +218,9 @@ def _translated_blocks(data: object, source_ids: list[str]) -> list[TranslatedBl
     return [by_id[block_id] for block_id in source_ids]
 
 
-async def _reap_process(proc: asyncio.subprocess.Process) -> None:
+async def _reap_process(proc: asyncio.subprocess.Process, *, cause: CleanupCause) -> None:
     """Shared bounded cleanup covers escaped descendants retaining Pi pipes."""
-    await cleanup_async_process(proc, term_grace=_CLEANUP_TIMEOUT_SECONDS,
+    await cleanup_async_process(proc, cause=cause, term_grace=_CLEANUP_TIMEOUT_SECONDS,
                                 kill_grace=_CLEANUP_TIMEOUT_SECONDS)
 
 
@@ -202,7 +234,7 @@ def _validate_translation_bounds(max_retries: int | None = None) -> None:
 
 async def _pi_json(
     prompt: str, *, model: str, pi_bin: str, reasoning_level: str = "low",
-    session_dir: Path | None = None,
+    session_dir: Path | None = None, timing_ledger: Any = None,
 ) -> object:
     """Run one isolated text-only Pi request; shared by page migration and Task 10."""
     reasoning_level = validate_reasoning_level(reasoning_level)
@@ -219,27 +251,36 @@ async def _pi_json(
             stderr=asyncio.subprocess.PIPE, env={**os.environ, "PI_OFFLINE": "0"},
             start_new_session=os.name == "posix",
         )
-        stdout_bytes, stderr_bytes = await proc.communicate()
+        async with _model_timing(timing_ledger):
+            stdout_bytes, stderr_bytes = await proc.communicate()
     except asyncio.CancelledError:
         if proc is not None:
-            await _reap_process(proc)
+            await _reap_process(proc, cause=CleanupCause.CANCELLATION)
         raise
     except OSError as exc:
-        raise TranslationError(f"could not start pi: {exc}") from None
+        if proc is not None:
+            await _reap_process(proc, cause=CleanupCause.FAILURE)
+        raise TranslationError(f"Pi process I/O failed: {exc}", classification="failure") from None
+    except Exception as exc:
+        if proc is not None:
+            await _reap_process(proc, cause=CleanupCause.FAILURE)
+        raise TranslationError(f"Pi process failed: {type(exc).__name__}", classification="failure") from None
     stdout = stdout_bytes.decode("utf-8", errors="replace").strip()
     stderr = stderr_bytes.decode("utf-8", errors="replace").strip()
     if proc.returncode != 0:
-        raise TranslationError(f"pi exited with code {proc.returncode}: {stderr[:500]}")
+        raise TranslationError(f"Pi exited with code {proc.returncode}: {stderr[:500]}", classification="failure")
+    if not stdout:
+        raise TranslationError("Pi returned no response", classification="failure")
     try:
         return json.loads(stdout)
     except json.JSONDecodeError as exc:
-        raise TranslationError(f"Failed to parse pi JSON output: {exc}") from None
+        raise TranslationError(f"Pi response is not valid JSON: {exc}", classification="validation") from None
 
 
 async def translate_blocks(
     extraction: PageExtraction, glossary: TerminologyMap, *, model: str, pi_bin: str = "pi",
     previous_page: PageExtraction | None = None, next_page: PageExtraction | None = None,
-    reasoning_level: str = "low", session_dir: Path | None = None,
+    reasoning_level: str = "low", session_dir: Path | None = None, timing_ledger: Any = None,
 ) -> list[TranslatedBlock]:
     """Translate legacy page blocks independently with adjacent source excerpts."""
     context = _translation_context(extraction, glossary, previous_page, next_page)
@@ -247,6 +288,7 @@ async def translate_blocks(
                                        context=json.dumps(context, ensure_ascii=False))
     data = await _pi_json(
         prompt, model=model, pi_bin=pi_bin, reasoning_level=reasoning_level, session_dir=session_dir,
+        timing_ledger=timing_ledger,
     )
     return _translated_blocks(data, [block.id for block in extraction.blocks])
 
@@ -486,7 +528,7 @@ async def translate_segment(
     segment: EffectiveSegment, *, target_lang: str, projections: Sequence[Mapping[str, Any]] = (),
     previous: EffectiveSegment | None = None, following: EffectiveSegment | None = None,
     model: str, pi_bin: str = "pi", max_retries: int = 3, reasoning_level: str = "low",
-    session_dir: Path | None = None,
+    session_dir: Path | None = None, timing_ledger: Any = None,
 ) -> str:
     """Translate exactly focal effective source; neighbors are context-only source records."""
     if segment.source_lang is None:
@@ -506,16 +548,19 @@ async def translate_segment(
         try:
             data = await _pi_json(
                 prompt, model=model, pi_bin=pi_bin, reasoning_level=reasoning_level,
-                session_dir=session_dir,
+                session_dir=session_dir, timing_ledger=timing_ledger,
             )
             if not isinstance(data, dict) or set(data) != {"translated_text"} or not isinstance(data["translated_text"], str):
-                raise TranslationError("pi output violates segment translation response schema")
+                raise TranslationError("pi output violates segment translation response schema", classification="validation")
+            if not data["translated_text"].strip():
+                raise TranslationError("pi output contains empty translated_text", classification="validation")
             return data["translated_text"]
         except TranslationError as exc:
             last = exc
             if attempt < max_retries:
                 await asyncio.sleep(min(2 ** attempt, 16))
-    raise TranslationError(f"translation retries exhausted: {last}") from last
+    classification = "failure" if last is not None and last.classification == "failure" else "validation"
+    raise TranslationError(f"translation retries exhausted: {last}", classification=classification) from last
 
 
 def _put_target_assessment(
@@ -525,18 +570,19 @@ def _put_target_assessment(
     assessment = ConfidenceAssessment(subject_id=segment_id, producing_stage="target_materialization",
         producing_artifact_id=target_artifact_id, score=score,
         signals=tuple(sorted(set((*( ("degraded", "fallback", "diagnostic_placeholder") if degraded else () ), *extra_signals)))),)
-    uncertainty = uncertainty_finding(assessment)
-    store.put_finding(uncertainty)
+    uncertainty = actionable_uncertainty_finding(assessment)
+    if uncertainty is not None:
+        store.put_finding(uncertainty)
     requests = review_requests_for(assessment=assessment, degraded_or_fallback=degraded,
         ambiguity="mapping" if "mapping_ambiguity" in extra_signals else None, stage="target_materialization",
         subject_ids=(segment_id,), suggested_correction_kind="target_segment", base_revision_id=base_revision_id,
         base_artifact_ids=(target_artifact_id,), scope="segment")
     for finding in requests:
         store.put_finding(finding)
-    all_findings = tuple(sorted(set((*finding_ids, uncertainty.finding_id, *(item.finding_id for item in requests)))))
+    all_findings = tuple(sorted(set((*finding_ids, *((uncertainty.finding_id,) if uncertainty is not None else ()), *(item.finding_id for item in requests)))))
     # Base-specific review findings do not alter immutable assessment closure.
     envelope = store.put(ASSESSMENT_ARTIFACT_KIND, assessment.to_dict(), dependency_ids=(target_artifact_id,),
-        finding_ids=(uncertainty.finding_id,), semantic_key=f"confidence:{target_artifact_id}")
+        finding_ids=() if uncertainty is None else (uncertainty.finding_id,), semantic_key=f"confidence:{target_artifact_id}")
     return envelope.artifact_id, all_findings
 
 
@@ -546,6 +592,7 @@ async def materialize_effective_target(
     model_executable_identity: str | None = None, pi_bin: str = "pi", reasoning_level: str = "low",
     session_dir: Path | None = None, base_revision_id: str = "unsealed", segment_translator: Callable[..., Any] | None = None,
     translation_call: Callable[[Mapping[str, Any]], Any] | None = None, max_retries: int = 3,
+    timing_ledger: Any = None,
     selected_snapshot: RevisionSnapshot | None = None,
     selected_translation_artifact_ids: Mapping[str, str] | None = None,
 ) -> EffectiveTargetRun:
@@ -564,6 +611,8 @@ async def materialize_effective_target(
         raise TranslationError("translated target materialization requires target_lang")
     if not isinstance(base_revision_id, str) or not base_revision_id:
         raise TranslationError("base_revision_id must be non-empty")
+    if timing_ledger is not None and not (callable(getattr(timing_ledger, "model_execution_async", None)) or callable(getattr(timing_ledger, "model_execution", None))):
+        raise TranslationError("timing ledger does not provide model execution timing", classification="failure")
     if translation_call is not None and segment_translator is not None:
         raise TranslationError("supply only one translation callback")
     if model_executable_identity is None:
@@ -610,10 +659,11 @@ async def materialize_effective_target(
             leaf_findings: list[str] = list(store.get(source_artifact_id).finding_ids)
             if neighbor_diagnostic:
                 finding = Finding(kind="context_neighbor_diagnostic", severity="warning", stage="translation",
-                    subject_refs=(segment.segment_id,), evidence={"segment_id": segment.segment_id,
+                    subject_refs=(segment.segment_id,), evidence={"trigger": "diagnostic_neighbor", "segment_id": segment.segment_id,
                     "previous_diagnostic": before is not None and before.source_lang is None,
                     "following_diagnostic": after is not None and after.source_lang is None},
-                    message="Immediate diagnostic neighbor omitted from translation context.", dependency_ids=(source_artifact_id,))
+                    message="Immediate diagnostic neighbor omitted from translation context.", dependency_ids=(source_artifact_id,),
+                    audit_category="fallback")
                 store.put_finding(finding); leaf_findings.append(finding.finding_id)
             if mode == "native" or segment.source_lang is None:
                 # A source diagnostic never invokes translation, but in an
@@ -671,6 +721,8 @@ async def materialize_effective_target(
             model_confidence: float | None = None
             translation_findings: list[Any] = []
             cache_reused = False
+            cache_rejected = False
+            fallback_kind = DIAGNOSTIC_TRANSLATION_FALLBACK_KIND
             if local_base is None and cache_validator is not None:
                 semantic = translation_semantic_key(source_artifact_id=source_artifact_id,
                     preceding_source_artifact_id=source_context_ids[0] if previous is not None else None,
@@ -715,10 +767,18 @@ async def materialize_effective_target(
                             and body.get("mappings") == expected_rows and cached.dependency_ids == expected_dependencies):
                         local_base = (cached, body)
                         translation_fallback = cached.kind == DIAGNOSTIC_TRANSLATION_FALLBACK_KIND
+                        if translation_fallback:
+                            fallback = Finding(kind="translation_continuation", severity="warning", stage="translation",
+                                subject_refs=(segment.segment_id,), evidence={"trigger": "selected_diagnostic_translation",
+                                "artifact_id": cached.artifact_id}, message="Selected diagnostic translation output continued.",
+                                dependency_ids=(cached.artifact_id,), audit_category="fallback")
+                            store.put_finding(fallback)
+                            translation_findings.append(fallback)
                         mapping_missing = expected_missing
                         cache_reused = True
                         cache_events.append(CacheEvent("translation", segment.segment_id, "hit", cached.artifact_id, semantic))
                 if not cache_reused:
+                    cache_rejected = requested is not None
                     cache_events.append(CacheEvent("translation", segment.segment_id, "miss", semantic_key=semantic))
             if local_base is not None:
                 translation_envelope, translation_body = local_base
@@ -728,8 +788,18 @@ async def materialize_effective_target(
                         store, overlays, translation_envelope.artifact_id, translation_body, segment.segment_id)
                 except TranslationError as exc:
                     local_base = None
-                    translation_findings.append(Finding(kind="target_overlay_inapplicable", severity="warning", stage="target_materialization",
-                        subject_refs=(segment.segment_id,), evidence={"error": str(exc)}, message="Target overlay did not match its immutable translation base.", dependency_ids=(translation_envelope.artifact_id,)))
+                    overlay_finding = Finding(kind="target_overlay_inapplicable", severity="warning", stage="translation",
+                        subject_refs=(segment.segment_id,), evidence={"trigger": "correction_scope_validation", "error": str(exc)},
+                        message="Target overlay did not match its immutable translation base.", dependency_ids=(translation_envelope.artifact_id,),
+                        audit_category="validation")
+                    store.put_finding(overlay_finding)
+                    continuation = Finding(kind="translation_continuation", severity="warning", stage="translation",
+                        subject_refs=(segment.segment_id,), evidence={"trigger": "correction_scope_continuation",
+                        "primary_finding_id": overlay_finding.finding_id},
+                        message="Translation continued after target correction scope validation failed.",
+                        dependency_ids=(translation_envelope.artifact_id,), audit_category="fallback")
+                    store.put_finding(continuation)
+                    translation_findings.extend((overlay_finding, continuation))
                 else:
                     for finding in translation_findings: store.put_finding(finding)
                     if cache_reused:
@@ -750,10 +820,14 @@ async def materialize_effective_target(
                             },
                             "projections": selected, "target_lang": target_lang,
                         }
-                        answer = translation_call(callback_context)
-                        answer = await answer if inspect.isawaitable(answer) else answer
-                        if not isinstance(answer, Mapping) or not isinstance(answer.get("translated_text"), str):
-                            raise TranslationError("translation_call must return translated_text")
+                        async with _model_timing(timing_ledger):
+                            answer = translation_call(callback_context)
+                            answer = await answer if inspect.isawaitable(answer) else answer
+                        if (not isinstance(answer, Mapping)
+                                or set(answer) - {"translated_text", "confidence"}
+                                or not isinstance(answer.get("translated_text"), str)
+                                or not answer["translated_text"].strip()):
+                            raise TranslationError("translation_call must return a non-empty translated_text", classification="validation")
                         translated_text = answer["translated_text"]
                         model_confidence = answer.get("confidence")
                         if model_confidence is not None and (isinstance(model_confidence, bool) or not isinstance(model_confidence, (int, float)) or not 0 <= model_confidence <= 1):
@@ -762,19 +836,42 @@ async def materialize_effective_target(
                         translated_text = await translate_segment(segment, target_lang=target_lang or "", projections=selected,
                             previous=previous, following=following, model=model, pi_bin=pi_bin,
                             max_retries=max_retries, reasoning_level=reasoning_level,
-                            session_dir=session_dir)
+                            session_dir=session_dir, timing_ledger=timing_ledger)
                     else:
-                        answer = segment_translator(segment=segment, target_lang=target_lang, projections=selected,
-                            previous=previous, following=following)
-                        translated_text = await answer if inspect.isawaitable(answer) else answer
-                    if not isinstance(translated_text, str):
-                        raise TranslationError("segment translator must return text")
+                        async with _model_timing(timing_ledger):
+                            answer = segment_translator(segment=segment, target_lang=target_lang, projections=selected,
+                                previous=previous, following=following)
+                            translated_text = await answer if inspect.isawaitable(answer) else answer
+                    if not isinstance(translated_text, str) or not translated_text.strip():
+                        raise TranslationError("segment translator must return non-empty text", classification="validation")
+                except asyncio.CancelledError:
+                    raise
                 except Exception as exc:
                     translation_fallback = True
+                    if isinstance(exc, TranslationError):
+                        category = exc.classification
+                    else:
+                        category = "failure"
+                    fallback_kind = ("DiagnosticTranslationValidationFallback"
+                                     if category == "validation" else DIAGNOSTIC_TRANSLATION_FALLBACK_KIND)
                     translated_text = _diagnostic_placeholder("translation_failed", {"error": type(exc).__name__, "segment_id": segment.segment_id})
-                    failure = Finding(kind="translation_failed", severity="warning", stage="translation", subject_refs=(segment.segment_id,),
-                        evidence={"error": type(exc).__name__}, message="Translation leaf fell back to diagnostic placeholder.", dependency_ids=(source_artifact_id,))
-                    store.put_finding(failure); translation_findings.append(failure)
+                    primary = Finding(
+                        kind="translation_response_invalid" if category == "validation" else "translation_failed",
+                        severity="warning", stage="translation", subject_refs=(segment.segment_id,),
+                        evidence={"trigger": "response_validation" if category == "validation" else "model_execution",
+                                  "error": type(exc).__name__},
+                        message=("Translation response failed validation."
+                                 if category == "validation" else "Translation model execution failed."),
+                        dependency_ids=(source_artifact_id,), audit_category=category)
+                    store.put_finding(primary)
+                    continuation = Finding(
+                        kind="translation_continuation", severity="warning", stage="translation",
+                        subject_refs=(segment.segment_id,),
+                        evidence={"trigger": "diagnostic_translation_continuation", "primary_finding_id": primary.finding_id},
+                        message="Translation continued with a diagnostic placeholder.",
+                        dependency_ids=(source_artifact_id,), audit_category="fallback")
+                    store.put_finding(continuation)
+                    translation_findings.extend((primary, continuation))
                 record_id = _target_id("translation-record-v1", {"segment_id": segment.segment_id, "source_artifact_id": source_artifact_id,
                     "text": translated_text, "projection_ids": [item["artifact_id"] for item in selected], "target_lang": target_lang})
                 mapping_rows, mapping_missing = _mapping_rows(segment=segment, translated_text=translated_text, projections=selected,
@@ -790,7 +887,14 @@ async def materialize_effective_target(
                     projection_ids=tuple(item["artifact_id"] for item in selected), model_executable_identity=model_executable_identity,
                     model_id=model, reasoning_level=reasoning_level,
                     prompt_bytes=SEGMENT_TRANSLATION_PROMPT.encode(), target_lang=target_lang or "")
-                translation_envelope = store.put(DIAGNOSTIC_TRANSLATION_FALLBACK_KIND if translation_fallback else TRANSLATION_ARTIFACT_KIND,
+                if cache_rejected:
+                    cache_fallback = Finding(kind="translation_cache_fallback", severity="warning", stage="translation",
+                        subject_refs=(segment.segment_id,), evidence={"trigger": "selected_cache_rejected"},
+                        message="Selected translation cache was rejected; translation continued.",
+                        dependency_ids=(source_artifact_id,), audit_category="fallback")
+                    store.put_finding(cache_fallback)
+                    translation_findings.append(cache_fallback)
+                translation_envelope = store.put((fallback_kind if translation_fallback else TRANSLATION_ARTIFACT_KIND),
                     body, dependency_ids=dependencies, finding_ids=tuple(sorted(item.finding_id for item in translation_findings)), semantic_key=semantic)
                 translations.append(translation_envelope.artifact_id)
                 translation_id = translation_envelope.artifact_id
