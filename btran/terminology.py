@@ -359,6 +359,7 @@ def _selected_fallback_entries(values: Any, *, id_name: str) -> tuple[Terminolog
 
 
 def _target_parts(values: Any) -> dict[str, str]:
+    """Return one deterministic target for each explicitly selected form."""
     result: dict[str, str] = {}
     if values is None:
         return result
@@ -377,10 +378,41 @@ def _target_parts(values: Any) -> dict[str, str]:
         if isinstance(forms, str):
             forms = (forms,)
         if isinstance(target, str) and target and isinstance(forms, Iterable):
+            target = _nfc_surface(target)
             for form in forms:
                 if isinstance(form, str) and form:
-                    result[_nfc_surface(form)] = _nfc_surface(target)
+                    # Keep the first target.  A conflicting pair is retained as
+                    # an explicit conflict category below, rather than being a
+                    # last-write-wins input.
+                    result.setdefault(_nfc_surface(form), target)
     return result
+
+
+def _target_conflicts(values: Any) -> set[str]:
+    """Return selected source forms with more than one explicit target."""
+    targets: dict[str, set[str]] = {}
+    if values is None:
+        return set()
+    if isinstance(values, Mapping):
+        if any(key in values for key in ("source_forms", "source_terms", "canonical_source_forms", "correction_id", "entry_id", "concept_id")):
+            values = (values,)
+        else:
+            values = values.get("entries", values.get("corrections", ()))
+    for item in values:
+        if isinstance(item, Mapping):
+            forms = item.get("source_forms", item.get("source_terms", item.get("canonical_source_forms", ())))
+            target = item.get("replacement", item.get("target_form", item.get("target_term")))
+        else:
+            forms = getattr(item, "source_forms", getattr(item, "source_terms", getattr(item, "canonical_source_forms", ())))
+            target = getattr(item, "replacement", getattr(item, "target_form", getattr(item, "target_term", None)))
+        if isinstance(forms, str):
+            forms = (forms,)
+        if isinstance(target, str) and target and isinstance(forms, Iterable):
+            normalized_target = _nfc_surface(target)
+            for form in forms:
+                if isinstance(form, str) and form:
+                    targets.setdefault(_nfc_surface(form), set()).add(normalized_target)
+    return {form for form, forms in targets.items() if len(forms) > 1}
 
 
 def _span_is_boundary(text: str, start: int, end: int) -> bool:
@@ -435,16 +467,29 @@ def build_candidate_table(source: Any, declared_mentions: Any = None, *,
     protected_target_forms = _target_parts(selected_terminology_corrections)
     protected_source_entries = _selected_fallback_entries(selected_terminology_corrections, id_name="correction_id")
     protected_entries_input = selected_entries if selected_entries else selected_closure_entries
-    protected_target_forms.update(_target_parts(protected_entries_input))
+    for form, target in _target_parts(protected_entries_input).items():
+        protected_target_forms.setdefault(form, target)
     protected_source_entries += _selected_fallback_entries(protected_entries_input, id_name="entry_id")
-    # Explicit selected evidence is protected before any detector runs.
+    conflicting_targets = (
+        _target_conflicts(selected_terminology_corrections)
+        | _target_conflicts(protected_entries_input)
+        | _target_conflicts((*_selected_values(selected_terminology_corrections), *_selected_values(protected_entries_input)))
+    )
+    # Explicit selected evidence is protected before any detector runs.  Keep
+    # its origin category on the row sent to Pi, including when rows share a
+    # candidate key.  Conflicting explicit targets are an input conflict, not
+    # an arbitrary last-write-wins target.
     for form, identifier, _ in _evidence_parts(selected_terminology_corrections, id_name="correction_id"):
-        _merge_candidate(rows, form, tier=0, correction_id=identifier)
+        _merge_candidate(rows, form, tier=0, correction_id=identifier, category="user_selected")
+        if form in conflicting_targets:
+            _merge_candidate(rows, form, tier=0, correction_id=identifier, category="conflict")
     entries = selected_entries if selected_entries is not None else selected_closure_entries
     if not entries and selected_closure_entries is not None:
         entries = selected_closure_entries
     for form, identifier, _ in _evidence_parts(entries, id_name="entry_id"):
-        _merge_candidate(rows, form, tier=0, entry_id=identifier)
+        _merge_candidate(rows, form, tier=0, entry_id=identifier, category="user_glossary")
+        if form in conflicting_targets:
+            _merge_candidate(rows, form, tier=0, entry_id=identifier, category="conflict")
     block_by_id = {block_id: (text, order, segment_id) for block_id, text, order, segment_id in blocks}
     # Declared mentions are tier one, including legacy ``other``.
     for form, block_id, category in mentions:
@@ -514,7 +559,9 @@ def build_candidate_table(source: Any, declared_mentions: Any = None, *,
                                  occurrence_id=_occurrence_id(block_id, segment_id, match.start(), match.end(), text))
         for left, right in zip(words, words[1:]):
             separator = text[left.end():right.start()]
-            if separator in {"-", "/"}:
+            if (separator in {"-", "/"}
+                    and _ASCII_WORD_RE.fullmatch(left.group(0))
+                    and _ASCII_WORD_RE.fullmatch(right.group(0))):
                 start, end = left.start(), right.end()
                 _merge_candidate(rows, text[start:end], tier=3, block_id=block_id,
                                  occurrence_id=_occurrence_id(block_id, segment_id, start, end, text))
@@ -823,8 +870,10 @@ def _validate_sparse_entries(entries: Sequence[TerminologyEntry], table: Candida
                 allowed = set(by_form[form].declared_block_ids) | set(by_form[form].occurrence_ids) | set(by_form[form].entry_ids) | set(by_form[form].correction_ids)
                 if not set(entry.provenance) <= allowed:
                     offending.add(form)
-    seen_tier_zero = {form for entry in entries for form in entry.source_terms if form in {form for row in table.tier_zero for form in row.source_forms}}
-    required_tier_zero = {row.source_form for row in table.tier_zero}
+    tier_zero_by_form = {form: row for row in table.tier_zero for form in row.source_forms}
+    seen_tier_zero = {tier_zero_by_form[form].candidate_key for entry in entries
+                      for form in entry.source_terms if form in tier_zero_by_form}
+    required_tier_zero = {row.candidate_key for row in table.tier_zero}
     missing = required_tier_zero - seen_tier_zero
     if offending or missing:
         return [], tuple(sorted(offending)), tuple(sorted(missing))
@@ -1944,7 +1993,7 @@ def build_terminology_evidence(
                 result = consolidate_candidate_table(table, source_lang=language, target_lang=target_lang or "",
                                                      pi_call=pi_call, timing_ledger=timing_ledger)
                 if result.rejected:
-                    subject_refs = tuple(sorted({item.source_form for item in table.tier_zero} or {item.source_form for item in table.selected}))
+                    subject_refs = tuple(sorted({item.candidate_key for item in table.tier_zero} or {item.candidate_key for item in table.selected}))
                     category = result.audit_category or "validation"
                     finding = Finding(kind="terminology_consolidation_invalid" if category == "validation" else "terminology_consolidation_failed",
                                       severity="warning", stage="terminology", subject_refs=subject_refs,
@@ -1978,7 +2027,7 @@ def build_terminology_evidence(
                         old = targets.get(key)
                         targets[key] = candidate if old is None else (old[0], old[1], old[0] != candidate[0] or old[2])
             except Exception as exc:
-                subject_refs = tuple(sorted(item.source_form for item in table.selected)) or (language or "terminology",)
+                subject_refs = tuple(sorted(item.candidate_key for item in table.selected)) or (language or "terminology",)
                 failure = Finding(kind="terminology_consolidation_failed", severity="warning", stage="terminology",
                                   subject_refs=subject_refs, evidence={"trigger": "model_failure", "source_lang": language, "error": type(exc).__name__},
                                   message="Terminology consolidation failed; selected tier-0 fallback continued.", audit_category="failure")

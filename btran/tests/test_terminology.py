@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+from contextlib import contextmanager
 from pathlib import Path
 import zipfile
 
@@ -18,6 +19,8 @@ from btran.terminology import (
     batch_term_groups,
     build_candidate_table,
     cache_identity_with_glossary,
+    consolidate_candidate_table,
+    terminology_candidate_key,
     consolidate_terminology,
     estimate_tokens,
     freeze_terminology,
@@ -67,6 +70,89 @@ def test_sparse_candidate_tiers_keep_selected_tier_zero_and_order_automatic_tier
     assert table.selected[0].tier == 0
     assert {item.tier for item in table.candidates} >= {0, 2, 3, 5}
     assert [item.tier for item in table.selected] == [0]
+
+
+def test_selected_rows_retain_origin_categories_and_explicit_target_conflicts():
+    corrections = [
+        {"correction_id": "correction-1", "source_forms": ["Magic"], "replacement": "Magie"},
+    ]
+    glossary = [
+        TerminologyEntry("glossary-1", ["Sword"], "Épée", ["b1"], 1.0),
+        TerminologyEntry("glossary-2", ["Magic"], "Sorcellerie", ["b1"], 1.0),
+    ]
+    table = build_candidate_table(
+        [SourceBlock("b1", "paragraph", "Magic Sword", 0)],
+        selected_terminology_corrections=corrections,
+        selected_entries=glossary,
+    )
+
+    assert table.selected_by_form["Magic"].declared_categories == ("conflict", "user_glossary", "user_selected")
+    assert table.selected_by_form["Sword"].declared_categories == ("user_glossary",)
+    prompt_row = next(item for item in table.prompt_items() if item["source_form"] == "Magic")
+    assert prompt_row["declared_categories"] == ["conflict", "user_glossary", "user_selected"]
+
+
+def test_tier_three_compounds_require_ascii_operands():
+    table = build_candidate_table(
+        [SourceBlock("b1", "paragraph", "foo-bar foo/βeta café-latte", 0)],
+        include_fallback=False,
+    )
+    tier_three = {item.source_form for item in table.candidates if item.tier == 3}
+
+    assert "foo-bar" in tier_three
+    assert "foo/βeta" not in tier_three
+    assert "café-latte" not in tier_three
+
+
+def test_missing_tier_zero_reports_candidate_ids_not_source_forms():
+    table = build_candidate_table(
+        [SourceBlock("b1", "paragraph", "Magic Sword", 0)],
+        selected_entries=[
+            TerminologyEntry("glossary-magic", ["Magic"], "Magie", ["b1"], 1.0),
+            TerminologyEntry("glossary-sword", ["Sword"], "Épée", ["b1"], 1.0),
+        ],
+    )
+    result = consolidate_candidate_table(
+        table, source_lang="en", target_lang="fr",
+        pi_call=lambda _: json.dumps({"entries": [{
+            "concept_id": "magic", "source_terms": ["Magic"], "target_term": "Magie",
+            "provenance": ["glossary-magic"], "confidence": 1.0,
+        }]}),
+    )
+
+    assert result.missing_tier_zero == (terminology_candidate_key("Sword"),)
+    assert "Sword" not in result.missing_tier_zero
+
+
+def test_sparse_model_call_is_bracketed_by_fc5_model_timing():
+    events = []
+
+    class Ledger:
+        @contextmanager
+        def model_execution(self):
+            events.append("enter")
+            try:
+                yield
+            finally:
+                events.append("exit")
+
+    table = build_candidate_table(
+        [SourceBlock("b1", "paragraph", "Magic", 0)],
+        selected_entries=[TerminologyEntry("glossary-magic", ["Magic"], "Magie", ["b1"], 1.0)],
+    )
+
+    def pi_call(_):
+        events.append("call")
+        return json.dumps({"entries": [{
+            "concept_id": "magic", "source_terms": ["Magic"], "target_term": "Magie",
+            "provenance": ["glossary-magic"], "confidence": 1.0,
+        }]})
+
+    result = consolidate_candidate_table(
+        table, source_lang="en", target_lang="fr", pi_call=pi_call, timing_ledger=Ledger(),
+    )
+    assert not result.rejected
+    assert events == ["enter", "call", "exit"]
 
 
 def test_proper_name_detection_accepts_one_or_more_unicode_space_separators():
