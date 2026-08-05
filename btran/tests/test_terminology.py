@@ -363,27 +363,24 @@ def test_consolidation_fails_when_multiple_batches_do_not_reduce_without_target_
         )
 
 
-@pytest.mark.parametrize("timeout", [-1, 0, 3601, 1.5, float("nan"), True])
-def test_pi_consolidation_rejects_invalid_timeout_before_constructing_leaf(timeout):
-    with pytest.raises(ValueError, match="between 1 and 3600"):
-        make_pi_consolidation_call(pi_bin="pi", model="test-model", timeout=timeout)
+def test_pi_consolidation_has_no_model_timeout_parameter():
+    import inspect
+    assert "timeout" not in inspect.signature(make_pi_consolidation_call).parameters
 
 
-def test_tool_less_ephemeral_pi_call_returns_stdout_and_cleans_up_timeout(tmp_path):
+def test_tool_less_ephemeral_pi_call_is_unbounded_for_model_execution(tmp_path):
     fake_pi = tmp_path / "fake-pi"
     fake_pi.write_text(
         "#!/usr/bin/env python3\n"
         "import json, sys, time\n"
         "if sys.argv[-1] == 'sleep':\n"
-        "    time.sleep(10)\n"
+        "    time.sleep(0.05)\n"
         "else:\n"
         "    print(json.dumps(sys.argv[1:]))\n"
     )
     fake_pi.chmod(0o755)
-    bounded_success_call = make_pi_consolidation_call(
-        pi_bin=str(fake_pi), model="test-model", timeout=1
-    )
-    arguments = json.loads(bounded_success_call("prompt"))
+    call = make_pi_consolidation_call(pi_bin=str(fake_pi), model="test-model")
+    arguments = json.loads(call("prompt"))
     assert "--no-session" not in arguments
     assert arguments[arguments.index("--thinking") + 1] == "low"
     assert arguments[arguments.index("--session-dir") + 1] == str(Path.cwd() / ".btran" / "pi-sessions")
@@ -394,12 +391,7 @@ def test_tool_less_ephemeral_pi_call_returns_stdout_and_cleans_up_timeout(tmp_pa
     assert "--no-context-files" in arguments
     assert "--no-approve" in arguments
     assert arguments[-1] == "prompt"
-
-    bounded_call = make_pi_consolidation_call(
-        pi_bin=str(fake_pi), model="test-model", timeout=1
-    )
-    with pytest.raises(PiConsolidationError, match="timed out"):
-        bounded_call("sleep")
+    assert call("sleep") == ""
 
 
 def test_stable_sharding_builds_alias_index_for_oversized_map():
@@ -824,11 +816,12 @@ def test_task8_successor_transition_keeps_old_evidence_in_sealed_graph_closure(t
         edge_ids=successor.graph_edge_ids, expected_embedded_provenance=provenance,
     )
     revisions.verify_bundle("successor")
-    assert (bundle / "artifacts" / f"{old_magic_shard}.json").exists()
+    with zipfile.ZipFile(bundle) as archive:
+        assert f"records/{old_magic_shard}.json" in archive.namelist()
+        manifest = json.loads(archive.read("manifest.json"))
     sealed_edges = revisions.selected_graph("successor").edges("successor")
-    manifest = json.loads((bundle / "bundle-manifest.json").read_text())
-    assert all(edge.parent_artifact_id in manifest["artifact_ids"]
-               and edge.child_artifact_id in manifest["artifact_ids"] for edge in sealed_edges)
+    assert all(f"records/{edge.parent_artifact_id}.json" in manifest["members"]
+               and f"records/{edge.child_artifact_id}.json" in manifest["members"] for edge in sealed_edges)
 
 
 def test_task8_selected_leaf_roots_seal_zero_occurrence_and_diagnostic_edges(tmp_path):
@@ -879,14 +872,15 @@ def test_task8_selected_leaf_roots_seal_zero_occurrence_and_diagnostic_edges(tmp
         edge_ids=run.graph_edge_ids, expected_embedded_provenance=provenance,
     )
     revisions.verify_bundle("zero-leaves")
-    manifest = json.loads((bundle / "bundle-manifest.json").read_text())
+    with zipfile.ZipFile(bundle) as archive:
+        manifest = json.loads(archive.read("manifest.json"))
     for leaf in zero_leaves:
         source_id = next(item.effective_source_artifact_id for item in run.evidence_leaves
                          if item.evidence_shard_artifact_id == leaf.evidence_shard_artifact_id)
-        assert leaf.evidence_shard_artifact_id in manifest["artifact_ids"]
-        assert source_id in manifest["artifact_ids"]
-    assert all(edge.parent_artifact_id in manifest["artifact_ids"]
-               and edge.child_artifact_id in manifest["artifact_ids"]
+        assert f"records/{leaf.evidence_shard_artifact_id}.json" in manifest["members"]
+        assert f"records/{source_id}.json" in manifest["members"]
+    assert all(f"records/{edge.parent_artifact_id}.json" in manifest["members"]
+               and f"records/{edge.child_artifact_id}.json" in manifest["members"]
                for edge in revisions.selected_graph("zero-leaves").edges("zero-leaves"))
 
 

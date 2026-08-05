@@ -8,6 +8,7 @@ dependencies = [
     "imagehash>=4.3",
     "Pillow>=10.0",
     "python-dotenv>=1.0",
+    "regex>=2024.0.0",
 ]
 
 [project.scripts]
