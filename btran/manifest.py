@@ -166,6 +166,11 @@ def _deep_immutable(value: Any) -> Any:
 class _ImmutableArtifactEnvelope(ArtifactEnvelope):
     """Read-only defensive view of a validated artifact envelope."""
 
+    @property
+    def __class__(self) -> type[Any]:
+        # Preserve compatibility with callers checking the concrete schema type.
+        return ArtifactEnvelope
+
     def __setattr__(self, name: str, value: Any) -> None:
         if getattr(self, "_selected_closure_sealed", False):
             raise TypeError("selected closure data is immutable")
@@ -180,6 +185,43 @@ class _ImmutableArtifactEnvelope(ArtifactEnvelope):
         ))
 
 
+class _ImmutableSchemaRecord:
+    """Mixin for a sealed, compatibility-preserving schema-record view."""
+
+    @property
+    def __class__(self) -> type[Any]:
+        # Keep legacy ``record.__class__ is Finding``-style checks working.
+        return type(self)._immutable_view_base
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if getattr(self, "_selected_closure_sealed", False):
+            raise TypeError("selected closure data is immutable")
+        object.__setattr__(self, name, value)
+
+
+_IMMUTABLE_SCHEMA_RECORD_TYPES: dict[type[Any], type[Any]] = {}
+
+
+def _immutable_schema_record(record: Any) -> Any:
+    """Copy a parsed schema record into a sealed view without revalidation."""
+    if isinstance(record, _ImmutableSchemaRecord):
+        return record
+    record_type = type(record)
+    view_type = _IMMUTABLE_SCHEMA_RECORD_TYPES.get(record_type)
+    if view_type is None:
+        view_type = type(
+            f"_Immutable{record_type.__name__}",
+            (_ImmutableSchemaRecord, record_type),
+            {"__module__": record_type.__module__, "_immutable_view_base": record_type},
+        )
+        _IMMUTABLE_SCHEMA_RECORD_TYPES[record_type] = view_type
+    view = object.__new__(view_type)
+    for item in fields(record):
+        object.__setattr__(view, item.name, _deep_immutable(getattr(record, item.name)))
+    object.__setattr__(view, "_selected_closure_sealed", True)
+    return view
+
+
 def _immutable_artifact(record: ArtifactEnvelope) -> ArtifactEnvelope:
     """Copy a validated record into a read-only view without validating again."""
     view = object.__new__(_ImmutableArtifactEnvelope)
@@ -189,13 +231,17 @@ def _immutable_artifact(record: ArtifactEnvelope) -> ArtifactEnvelope:
     return view
 
 
-def _freeze_record_data(record: Any) -> None:
-    """Freeze mutable nested fields of an already parsed schema record."""
-    for item in fields(record):
-        value = getattr(record, item.name)
-        frozen = _deep_immutable(value)
-        if frozen is not value:
-            object.__setattr__(record, item.name, frozen)
+def _immutable_ordered_pages(ordered_pages: tuple[Any, ...]) -> tuple[Any, ...]:
+    """Copy declared page views and children without reparsing their payloads."""
+    from btran.orchestrator_contract import OrderedEffectivePage
+
+    return tuple(
+        OrderedEffectivePage(
+            _immutable_schema_record(item.page),
+            tuple(_immutable_schema_record(segment) for segment in item.segments),
+        )
+        for item in ordered_pages
+    )
 
 
 def _expected_selected_closure_ids(
@@ -274,10 +320,22 @@ class SelectedClosure:
             raise TypeError("selected closure snapshot must be a RevisionSnapshot")
         if self.snapshot.revision_id != self.revision_id:
             raise ValueError("selected closure revision ID does not match snapshot")
-        for ordered_page in self._ordered_pages:
-            _freeze_record_data(ordered_page.page)
-            for segment in ordered_page.segments:
-                _freeze_record_data(segment)
+        # The parsed records are validation results, not mutable state owned by
+        # the caller.  Copy each exposed dataclass into a sealed view so a
+        # caller cannot mutate the archive authority after load.
+        object.__setattr__(self, "snapshot", _immutable_schema_record(self.snapshot))
+        ordered_pages = _immutable_ordered_pages(self._ordered_pages)
+        object.__setattr__(self, "_ordered_pages", ordered_pages)
+        if self._effective_content is not None:
+            from btran.orchestrator_contract import SelectedEffectiveContent
+            if isinstance(self._effective_content, SelectedEffectiveContent):
+                object.__setattr__(
+                    self, "_effective_content",
+                    SelectedEffectiveContent(
+                        ordered_pages,
+                        finding_ids=self._effective_content.finding_ids,
+                    ),
+                )
         maps = {
             "records": self.records, "findings": self.findings,
             "edges": self.edges, "attestations": self.attestations,
@@ -291,9 +349,8 @@ class SelectedClosure:
                     key: item if isinstance(item, _ImmutableArtifactEnvelope) else _immutable_artifact(item)
                     for key, item in value.items()
                 }
-            elif name == "findings":
-                for item in value.values():
-                    _freeze_record_data(item)
+            elif name in {"findings", "edges"}:
+                value = {key: _immutable_schema_record(item) for key, item in value.items()}
             elif name in {"attestations", "provenance"}:
                 value = _deep_immutable(value)
             object.__setattr__(self, name, MappingProxyType(dict(value)))

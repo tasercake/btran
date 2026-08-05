@@ -18,7 +18,7 @@ from btran.manifest import (
     load_selected_closure,
     write_manifest,
 )
-from btran.schema import EffectivePage, EffectiveSegment, RevisionSnapshot
+from btran.schema import EffectivePage, EffectiveSegment, Finding, RevisionSnapshot
 
 
 def test_discovery_accepts_supported_undecodable_file(tmp_path):
@@ -162,11 +162,24 @@ def _sealed_effective_page(store, *, semantic_key="page-key", page_id="page-1", 
 
 def test_selected_closure_loads_archive_once_and_preserves_declared_segment_order(tmp_path):
     store = ArtifactStore(tmp_path)
-    page_record, _ = _sealed_effective_page(store)
-    snapshot = RevisionSnapshot(revision_id="revision-1", selected_artifact_ids=(page_record.artifact_id,))
-    RevisionStore(tmp_path).seal_bundle(snapshot, {"run": "one"}, b"")
-
+    page_record, segment_record = _sealed_effective_page(store)
+    finding = Finding(
+        kind="closure_test", stage="test", message="closure finding",
+        evidence={"nested": {"value": "before"}},
+    )
+    store.put_finding(finding)
     revisions = RevisionStore(tmp_path)
+    edge = revisions.graph.edge(
+        stable_subject_id="closure-edge", parent_artifact_id=page_record.artifact_id,
+        child_artifact_id=segment_record.artifact_id, stage="test", edge_kind="child",
+    )
+    revisions.graph.put(edge)
+    snapshot = RevisionSnapshot(
+        revision_id="revision-1", selected_artifact_ids=(page_record.artifact_id,),
+        selected_finding_ids=(finding.finding_id,),
+    )
+    revisions.seal_bundle(snapshot, {"run": "one"}, b"", edge_ids=(edge.edge_id,))
+
     verify_calls = 0
     verify_revision = revisions.storage.verify_revision
 
@@ -185,8 +198,22 @@ def test_selected_closure_loads_archive_once_and_preserves_declared_segment_orde
     assert closure.selected_effective_content.pages == closure.ordered_effective_pages
     with pytest.raises(TypeError):
         closure.ordered_effective_pages[0].page.display_metadata["page_number"] = 2
+    with pytest.raises(TypeError):
+        closure.ordered_effective_pages[0].page.page_id = "changed"
+    with pytest.raises(TypeError):
+        closure.ordered_effective_pages[0].segments[0].effective_text = "changed"
+    with pytest.raises(TypeError):
+        closure.snapshot.revision_id = "changed"
+    with pytest.raises(TypeError):
+        closure.finding(finding.finding_id).message = "changed"
+    with pytest.raises(TypeError):
+        closure.finding(finding.finding_id).evidence["nested"]["value"] = "changed"
+    with pytest.raises(TypeError):
+        closure.edge(edge.edge_id).edge_kind = "changed"
+    with pytest.raises(AttributeError):
+        closure.selected_effective_content.pages = ()
     assert closure.provenance == {}
-    assert closure.final_finding_ids == ()
+    assert closure.final_finding_ids == (finding.finding_id,)
     with pytest.raises(TypeError):
         closure.records["new"] = page_record
     with pytest.raises(TypeError):
