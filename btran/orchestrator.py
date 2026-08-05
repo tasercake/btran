@@ -17,7 +17,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Mapping
 
-from btran.artifacts import ArtifactEnvelope, ArtifactError, ArtifactStore, DependencyGraph, RevisionStore
+from btran.artifacts import ArtifactError, ArtifactStore, DependencyGraph, RevisionStore
 from btran.config import Config, resolve_pi_session_dir, resolve_workspace
 from btran.corrections import (
     CorrectionError,
@@ -31,9 +31,10 @@ from btran.epub_builder import (
     build_epub,
     seal_effective_content,
 )
-from btran.manifest import BookDiscovery, InvocationFailure, discover_book
+from btran.manifest import BookDiscovery, InvocationFailure, SelectedClosure, discover_book, load_selected_closure
 from btran.orchestrator_contract import (
     CacheEvent,
+    CandidateClosure,
     OrchestratorCallable,
     PageErrorCallback,
     RunResult,
@@ -68,6 +69,7 @@ from btran.terminology import build_terminology_evidence, make_pi_consolidation_
 from btran.translator import materialize_effective_target, refresh_model_leaves
 from btran.reconciliation import reconcile_effective
 from btran.validators import validate_effective
+from btran.timing import TimingLedger
 
 
 # Kept for migration callers/tests.  Task 13 uses ArtifactStore atomic writes.
@@ -93,11 +95,29 @@ async def _with_retries(action: Callable[[], Awaitable[Any]], retries: int) -> A
 
 
 def _stage_key(record: StageRecord) -> str:
-    return tagged_sha256("stage-record-v1", canonical_json(record.to_dict()).encode("utf-8"))
+    payload = record.to_dict()
+    payload["duration_ms"] = 0.0
+    return tagged_sha256("stage-record-v1", canonical_json(payload).encode("utf-8"))
 
 
 def _store_finding(store: ArtifactStore, finding: Finding) -> str:
     return store.put_finding(finding)
+
+
+def _instrument_durable_writes(*objects: Any, ledger: TimingLedger | None) -> None:
+    """Bracket actual store/graph/revision writes without timing computation."""
+    if ledger is None:
+        return
+    for obj in objects:
+        for name in ("put", "put_finding", "seal_bundle"):
+            original = getattr(obj, name, None)
+            if original is None or getattr(original, "_btran_timed", False):
+                continue
+            def timed(*args: Any, _original=original, **kwargs: Any):
+                with ledger.durable_persistence():
+                    return _original(*args, **kwargs)
+            timed._btran_timed = True
+            setattr(obj, name, timed)
 
 
 def _selection_finding(stage: str, kind: str, message: str, *, subject_refs: tuple[str, ...] = ()) -> Finding:
@@ -109,13 +129,18 @@ class _CoreExecutor:
     """Owns ordering and durable stage boundaries, never model-stage internals."""
 
     def __init__(self, config: Config, workspace: Path, selected: SelectedRunInputs,
-                 store: ArtifactStore, graph: DependencyGraph) -> None:
+                 store: ArtifactStore, graph: DependencyGraph, *, timing_ledger: TimingLedger | None = None,
+                 selected_closure: SelectedClosure | None = None) -> None:
         self.config = config
         self.workspace = workspace
         self.selected = selected
         self.store = store
         self.graph = graph
+        self.timing_ledger = timing_ledger
+        self.selected_closure = selected_closure
         self.records: list[StageRecord] = []
+        self.stage_record_ids: list[str] = []
+        self.graph_edge_ids: list[str] = []
         self.cache_events: list[CacheEvent] = []
         self.report = initialized_report(run_id=uuid.uuid4().hex, mode=config.mode, selected=selected)
 
@@ -140,9 +165,15 @@ class _CoreExecutor:
                              duration_ms=duration_ms)
         # Stage records are immutable artifacts too.  Their dependency closure
         # makes a later candidate able to select exact prior stage evidence.
-        self.store.put("StageRecord", record.to_dict(),
-                       dependency_ids=tuple(sorted(set((*inputs.input_artifact_ids, *outputs.output_artifact_ids)))),
-                       finding_ids=record.finding_ids, semantic_key=_stage_key(record))
+        record_payload = record.to_dict()
+        # Stage timing is report-only metadata; persisted identity uses a
+        # constant value so reruns cannot create different revisions by clock.
+        record_payload["duration_ms"] = 0.0
+        persisted = self.store.put("StageRecord", record_payload,
+                                    dependency_ids=tuple(sorted(set((*inputs.input_artifact_ids, *outputs.output_artifact_ids)))),
+                                    finding_ids=record.finding_ids, semantic_key=_stage_key(record))
+        self.stage_record_ids.append(persisted.artifact_id)
+        self.graph_edge_ids.extend(outputs.graph_edge_ids)
         self.records.append(record)
         self.cache_events.extend(outputs.cache_events)
         self.report = replace(
@@ -189,7 +220,7 @@ def _selected_inputs(config: Config, revisions: RevisionStore) -> tuple[Selected
 
 
 def _selected_model_leaf_inputs(
-    revisions: RevisionStore, selected: SelectedRunInputs,
+    closure: SelectedClosure, selected: SelectedRunInputs,
 ) -> tuple[RevisionSnapshot | None, dict[str, str], dict[str, str]]:
     """Resolve exact prior leaf IDs from sealed final provenance, never cache history.
 
@@ -197,21 +228,15 @@ def _selected_model_leaf_inputs(
     validate transitive translation leaves while preserving one sealed revision
     as selection authority.  Mutable artifact reads remain fail-closed there.
     """
-    if selected.base_revision_id == "unsealed":
+    if selected.base_revision_id == "unsealed" or closure.revision_id == "unsealed":
         return None, {}, {}
     try:
-        snapshot = revisions.snapshot(selected.base_revision_id)
-        bundle = revisions.revisions_dir / snapshot.revision_id
-        sealed = {
-            path.stem: ArtifactEnvelope.from_file(path)
-            for path in (bundle / "artifacts").glob("*.json")
-        }
+        snapshot = closure.snapshot
+        sealed = dict(closure.records)
         # ``snapshot()`` verified every copied closure member.  Still reject a
         # malformed provenance shape rather than guessing from artifact age.
-        provenance = json.loads((bundle / "provenance.json").read_text(encoding="utf-8"))
-        rows = provenance.get("segments")
-        if not isinstance(rows, list):
-            return None, {}, {}
+        provenance = closure.provenance
+        rows = provenance.get("segments") if isinstance(provenance, Mapping) else ()
         raw_by_segment: dict[str, str] = {}
         for artifact in sealed.values():
             if artifact.kind == "RawSourceExtraction":
@@ -227,6 +252,20 @@ def _selected_model_leaf_inputs(
                     raw_by_segment[segment["segment_id"]] = artifact.artifact_id
         source_ids: dict[str, str] = {}
         translation_ids: dict[str, str] = {}
+        if not isinstance(rows, list):
+            # Compact v2 archives retain the same immutable leaves but not a
+            # loose provenance member. Reconstruct cache indexes directly from
+            # the already validated closure map, never from storage history.
+            for artifact in sealed.values():
+                if artifact.kind in {"RawSourceExtraction", "DiagnosticSourceFallback"}:
+                    page_id = artifact.payload.get("page_id")
+                    if isinstance(page_id, str):
+                        source_ids[page_id] = artifact.artifact_id
+                if artifact.kind in {"TranslationArtifact", "DiagnosticTranslationFallback"}:
+                    segment_id = artifact.payload.get("segment_id")
+                    if isinstance(segment_id, str):
+                        translation_ids[segment_id] = artifact.artifact_id
+            rows = []
         for row in rows:
             if not isinstance(row, dict) or not isinstance(row.get("segment_id"), str):
                 continue
@@ -326,7 +365,8 @@ def _provenance(store: ArtifactStore, target_run: Any) -> tuple[SegmentProvenanc
     return tuple(sorted(entries, key=lambda item: item.segment_id))
 
 
-async def _run_core(config: Config, on_page_error: PageErrorCallback | None = None) -> RunResult:
+async def _run_core(config: Config, on_page_error: PageErrorCallback | None = None,
+                    *, timing_ledger: TimingLedger | None = None) -> RunResult:
     """Execute immutable core stages through target materialization only."""
     errors: list[str] = []
     try:
@@ -337,13 +377,33 @@ async def _run_core(config: Config, on_page_error: PageErrorCallback | None = No
         return RunResult([f"[btran] workspace unavailable: {type(exc).__name__}: {exc}"],
                          status="invocation_failed", invocation_failure=failure)
     store, graph, revisions = ArtifactStore(workspace), DependencyGraph(workspace), RevisionStore(workspace)
-    selected, selection_finding = _selected_inputs(config, revisions)
+    _instrument_durable_writes(store, graph, revisions, ledger=timing_ledger)
+    # Read the selector once, then load and validate exactly one immutable
+    # selected closure.  No later stage is allowed to rediscover it.
+    active_id = None
+    try:
+        active_id = revisions.storage.active_revision_id() if hasattr(revisions, "storage") else None
+        base_id = config.base_revision or active_id or "unsealed"
+        selected_closure = load_selected_closure(revisions, base_id)
+        selected = SelectedRunInputs(
+            active_id, base_id, config.correction_set,
+            () if base_id == "unsealed" else tuple(selected_closure.snapshot.selected_artifact_ids),
+        )
+        selection_finding = None
+    except Exception as exc:
+        selected_closure = SelectedClosure.empty()
+        selected = SelectedRunInputs(active_id, "unsealed", config.correction_set, ())
+        selection_finding = _selection_finding(
+            "selection", "base_revision_unavailable",
+            f"Selected base revision is unavailable: {type(exc).__name__}.",
+        )
     # Both explicit CLI selector and retained pointer become immutable run
     # inputs before any stage can inspect correction records.
     selected = replace(selected, correction_set_id=(config.correction_set or _default_correction_set_id(workspace)))
-    executor = _CoreExecutor(config, workspace, selected, store, graph)
+    executor = _CoreExecutor(config, workspace, selected, store, graph,
+                             timing_ledger=timing_ledger, selected_closure=selected_closure)
     selected_leaf_snapshot, selected_source_leaf_ids, selected_translation_leaf_ids = _selected_model_leaf_inputs(
-        revisions, selected,
+        selected_closure, selected,
     )
     # Refresh explicitly requests fresh reachable model executions; ordinary
     # activated-base reruns use only exact sealed selections above.
@@ -403,7 +463,8 @@ async def _run_core(config: Config, on_page_error: PageErrorCallback | None = No
                       reasoning_level=config.reasoning_level, session_dir=pi_session_dir,
                       base_revision_id=selected.base_revision_id, concurrency=config.concurrency,
                       selected_snapshot=selected_leaf_snapshot,
-                      selected_page_artifact_ids=selected_source_leaf_ids))
+                      selected_page_artifact_ids=selected_source_leaf_ids,
+                      timing_ledger=timing_ledger))
         # Assessment artifacts feed deterministic effective-source confidence.
         # Select/seal them with their raw leaves; later reruns must not recover
         # them from mutable global index history.
@@ -472,16 +533,18 @@ async def _run_core(config: Config, on_page_error: PageErrorCallback | None = No
         fallback_finding: str | None = None
         try:
             pi_call = None if config.mode == "native" or empty_input else make_pi_consolidation_call(
-                pi_bin=config.pi_bin, model=config.model, timeout=config.timeout,
+                pi_bin=config.pi_bin, model=config.model,
                 reasoning_level=config.reasoning_level, session_dir=pi_session_dir,
             )
             result = build_terminology_evidence(effective_source_run, store=store, graph=graph, mode=config.mode,
-                                                target_lang=config.target_lang, terminology_overlays=overlays,
+                                                target_lang=config.target_lang,
+                                                terminology_overlays=(() if config.mode == "native" else overlays),
                                                 pi_call=pi_call, base_revision_id=selected.base_revision_id,
-                                                selected_evidence_shard_ids=selected.base_snapshot_artifact_ids,
-                                                selected_membership_artifact_ids=selected.base_snapshot_artifact_ids,
-                                                selected_projection_artifact_ids=selected.base_snapshot_artifact_ids,
-                                                selected_snapshot=selected_leaf_snapshot,
+                                                selected_evidence_shard_ids=(() if config.mode == "native" else selected.base_snapshot_artifact_ids),
+                                                selected_membership_artifact_ids=(() if config.mode == "native" else selected.base_snapshot_artifact_ids),
+                                                selected_projection_artifact_ids=(() if config.mode == "native" else selected.base_snapshot_artifact_ids),
+                                                selected_snapshot=(None if config.mode == "native" else selected_leaf_snapshot),
+                                                timing_ledger=timing_ledger,
                                                 model_executable_identity=f"pi-bin:{config.pi_bin}", model_id=config.model,
                                                 reasoning_level=config.reasoning_level,
                                                 token_budget=config.glossary_budget)
@@ -494,10 +557,11 @@ async def _run_core(config: Config, on_page_error: PageErrorCallback | None = No
             fallback_finding = _store_finding(store, finding)
             result = build_terminology_evidence(effective_source_run, store=store, graph=graph, mode="native",
                                                 terminology_overlays=(), base_revision_id=selected.base_revision_id,
-                                                selected_evidence_shard_ids=selected.base_snapshot_artifact_ids,
-                                                selected_membership_artifact_ids=selected.base_snapshot_artifact_ids,
-                                                selected_projection_artifact_ids=selected.base_snapshot_artifact_ids,
-                                                selected_snapshot=selected_leaf_snapshot,
+                                                selected_evidence_shard_ids=(),
+                                                selected_membership_artifact_ids=(),
+                                                selected_projection_artifact_ids=(),
+                                                selected_snapshot=None,
+                                                timing_ledger=timing_ledger,
                                                 model_executable_identity=f"pi-bin:{config.pi_bin}", model_id=config.model,
                                                 reasoning_level=config.reasoning_level,
                                                 token_budget=config.glossary_budget)
@@ -521,12 +585,13 @@ async def _run_core(config: Config, on_page_error: PageErrorCallback | None = No
         try:
             result = await materialize_effective_target(effective_source_run, terminology_run, store=store, graph=graph,
                                                         mode=config.mode, target_lang=config.target_lang,
-                                                        target_overlays=overlays, model=config.model, pi_bin=config.pi_bin,
+                                                        target_overlays=(() if config.mode == "native" else overlays), model=config.model, pi_bin=config.pi_bin,
                                                         reasoning_level=config.reasoning_level, session_dir=pi_session_dir,
                                                         max_retries=config.max_retries,
                                                         base_revision_id=selected.base_revision_id,
-                                                        selected_snapshot=selected_leaf_snapshot,
-                                                        selected_translation_artifact_ids=selected_translation_leaf_ids)
+                                                        timing_ledger=timing_ledger,
+                                                        selected_snapshot=(None if config.mode == "native" else selected_leaf_snapshot),
+                                                        selected_translation_artifact_ids=(selected_translation_leaf_ids if config.mode == "translated" else {}))
             status = result.status
         except Exception as exc:
             # Reuse Task-10's per-segment fallback path. It emits target-page
@@ -542,6 +607,7 @@ async def _run_core(config: Config, on_page_error: PageErrorCallback | None = No
                                                         reasoning_level=config.reasoning_level, session_dir=pi_session_dir,
                                                         max_retries=config.max_retries,
                                                         base_revision_id=selected.base_revision_id,
+                                                        timing_ledger=timing_ledger,
                                                         segment_translator=fail_translation)
             status = "degraded"
         roots = tuple(sorted(leaf.page_artifact_id for leaf in result.leaves))
@@ -581,10 +647,18 @@ async def _run_core(config: Config, on_page_error: PageErrorCallback | None = No
     # Task 14 owns reconciliation/validation/rendering/sealing and final report.
     if empty_input:
         errors.append("no supported pages found; diagnostic content rendered")
-    return RunResult(errors, status="core_completed", report=executor.report, target_run=target_run,
-                     terminology_run=terminology_run, provenance=provenance,
-                     placements=((empty_input_diagnostic_placement(),) if empty_input else tuple(page.placement for page in discovery.pages)),
-                     cache_events=tuple(executor.cache_events), refresh_attempt_ids=refresh_attempt_ids)
+    result = RunResult(errors, status="core_completed", report=executor.report, target_run=target_run,
+                       terminology_run=terminology_run, provenance=provenance,
+                       placements=((empty_input_diagnostic_placement(),) if empty_input else tuple(page.placement for page in discovery.pages)),
+                       cache_events=tuple(executor.cache_events), refresh_attempt_ids=refresh_attempt_ids)
+    # Execution-only references are intentionally attached without entering
+    # semantic identities or the public serialized RunResult contract.
+    result.selected_closure = selected_closure
+    result.selected_inputs = selected
+    result.legacy_selected = not hasattr(revisions, "storage") and selected.base_revision_id != "unsealed"
+    result.candidate_stage_record_ids = tuple(executor.stage_record_ids)
+    result.candidate_graph_edge_ids = tuple(executor.graph_edge_ids)
+    return result
 
 
 async def _refresh_reachable_model_leaves(*, store: ArtifactStore, selected: SelectedRunInputs,
@@ -707,6 +781,40 @@ def _report_groups(store: ArtifactStore, finding_ids: tuple[str, ...]) -> tuple[
     return tuple(sorted(content)), tuple(sorted(uncertainty)), tuple(sorted(review)), tuple(sorted(failures))
 
 
+def _audit_for_candidate(*, store: ArtifactStore, target_run: Any,
+                         executor: _CoreExecutor, candidate: CandidateClosure,
+                         selected_closure: SelectedClosure) -> tuple[tuple[str, ...], int, str]:
+    """Calculate the final audit from current effective content and stage IDs."""
+    effective_ids: set[str] = set()
+    for leaf in getattr(target_run, "leaves", ()):
+        for artifact_id in (leaf.page_artifact_id, *leaf.segment_artifact_ids):
+            try:
+                artifact = store.get(artifact_id, validate_closure=False)
+            except Exception:
+                continue
+            effective_ids.update(artifact.finding_ids)
+    # A selected closure is an immutable authority. Its effective view is used
+    # only when the current invocation has no newly materialized finding list.
+    if not effective_ids and selected_closure.selected_effective_content is not None:
+        effective_ids.update(selected_closure.selected_effective_content.finding_ids)
+    records_by_id = dict(zip(candidate.stage_record_ids, executor.records))
+    union = set(effective_ids)
+    for record_id in candidate.stage_record_ids:
+        record = records_by_id.get(record_id)
+        if record is not None:
+            union.update(record.finding_ids)
+    categorized: list[str] = []
+    non_actionable = 0
+    for finding_id in sorted(union):
+        finding = store.get_finding(finding_id)
+        if finding.audit_category is None:
+            non_actionable += 1
+        else:
+            categorized.append(finding_id)
+    audit_ids = tuple(sorted(set(categorized)))
+    return audit_ids, non_actionable, ("degraded" if audit_ids else "clean")
+
+
 def _revision_id(selected_artifacts: tuple[str, ...], selected_findings: tuple[str, ...],
                  selected_cache_attestation_ids: tuple[str, ...], correction_set_id: str | None) -> str:
     return tagged_sha256("candidate-revision-v1", canonical_json({
@@ -810,21 +918,37 @@ def _execution_impacts(
     return tuple(sorted(result)), tuple(findings)
 
 
-async def _finalize(config: Config, core: RunResult) -> RunResult:
+async def _finalize(config: Config, core: RunResult, *, timing_ledger: TimingLedger) -> RunResult:
     """Task-14 fixed tail: reconciliation -> validation -> render -> seal -> report."""
     if core.status == "invocation_failed" or core.target_run is None or core.report is None:
         return core
     workspace = resolve_workspace(config).workspace
     store, graph, revisions = ArtifactStore(workspace), DependencyGraph(workspace), RevisionStore(workspace)
-    selected, _ = _selected_inputs(config, revisions)
+    _instrument_durable_writes(store, graph, revisions, ledger=timing_ledger)
+    selected_closure = getattr(core, "selected_closure", SelectedClosure.empty())
+    selected = getattr(core, "selected_inputs", None)
+    if not isinstance(selected, SelectedRunInputs):
+        base_id = selected_closure.revision_id
+        active_id = getattr(core.report, "active_revision_id", None)
+        selected = SelectedRunInputs(active_id, base_id, config.correction_set,
+                                     () if base_id == "unsealed" else tuple(selected_closure.snapshot.selected_artifact_ids))
     selected = replace(selected, correction_set_id=config.correction_set or _default_correction_set_id(workspace))
-    executor = _CoreExecutor(config, workspace, selected, store, graph)
+    executor = _CoreExecutor(config, workspace, selected, store, graph,
+                             timing_ledger=timing_ledger, selected_closure=selected_closure)
     executor.records = list(core.report.stage_records)
+    executor.stage_record_ids = list(getattr(core, "candidate_stage_record_ids", ()))
+    executor.graph_edge_ids = list(getattr(core, "candidate_graph_edge_ids", ()))
     executor.cache_events = list(core.cache_events)
     executor.report = core.report
     target_run = core.target_run
 
     async def reconciliation_stage(_: StageInputs) -> StageOutputs:
+        # Native output has no translated terminology concepts, selectors,
+        # projections, or reconciliation input. Keep the stage boundary as a
+        # typed no-op so reports retain a stable execution order.
+        if config.mode == "native":
+            summary = _stage_summary(store, "reconciliation", "completed", {"pages": len(target_run.leaves), "bypassed": 1})
+            return StageOutputs("completed", (), (summary,), (), (), None)
         projections = getattr(core.terminology_run, "projection_artifact_ids", _target_projection_ids(target_run, store))
         result = reconcile_effective(effective_pages=target_run, projections=projections,
                                      store=store, base_revision_id=selected.base_revision_id)
@@ -844,8 +968,10 @@ async def _finalize(config: Config, core: RunResult) -> RunResult:
     async def validation_stage(_: StageInputs) -> StageOutputs:
         result = validate_effective(effective_pages=target_run, reconciliation=reconciliation.value, store=store,
                                     base_revision_id=selected.base_revision_id, mode=config.mode)
-        edges = [graph.put(graph.edge(stable_subject_id="validation", parent_artifact_id=reconciliation.value.artifact_id,
-                                      child_artifact_id=result.artifact_id, stage="validation", edge_kind="reconciliation_input"))]
+        edges = []
+        if reconciliation.value is not None:
+            edges.append(graph.put(graph.edge(stable_subject_id="validation", parent_artifact_id=reconciliation.value.artifact_id,
+                                              child_artifact_id=result.artifact_id, stage="validation", edge_kind="reconciliation_input")))
         return StageOutputs(result.status, (result.artifact_id,), result.finding_ids, tuple(edges),
                             (CacheEvent("validation", "selected-content", "produced", result.artifact_id),), result)
 
@@ -883,9 +1009,27 @@ async def _finalize(config: Config, core: RunResult) -> RunResult:
     rendering = await executor.stage("rendering", StageInputs("rendering", selected,
         rendering_inputs, validation.finding_ids), render_stage)
 
-    selected_artifacts = tuple(sorted({artifact_id for record in executor.records for artifact_id in record.output_artifact_ids}))
+    # Seal the final content closure and its selected stage outputs, not every
+    # intermediate page root. EffectiveSourcePage is a view over source
+    # segments; retaining it beside RawSourceExtraction would create duplicate
+    # cache-leaf identities in the selected closure.
+    selected_roots: set[str] = set()
+    for record in executor.records:
+        if record.stage == "effective_source":
+            continue
+        selected_roots.update(record.output_artifact_ids)
+    selected_artifacts = tuple(sorted(
+        artifact_id for artifact_id in selected_roots
+        if store.get(artifact_id, validate_closure=False).kind not in {"EffectiveSourcePage"}
+    ))
     execution_impact_ids, execution_impact_findings = _execution_impacts(workspace, selected, set(selected_artifacts))
-    selected_findings = tuple(sorted((*_all_finding_ids(tuple(executor.records)), *(finding.finding_id for finding in execution_impact_findings))))
+    report_findings = _all_finding_ids(tuple(executor.records))
+    # Effective-source page findings can depend on the omitted page view and
+    # would pull that duplicate cache leaf back into the sealed closure.
+    selected_findings = tuple(sorted({
+        finding_id for record in executor.records if record.stage != "effective_source"
+        for finding_id in record.finding_ids
+    } | {finding.finding_id for finding in execution_impact_findings}))
     # Translation/raw leaves are often transitive beneath effective-page stage
     # roots. Seal their exact key attestations too, not only direct outputs.
     closure_artifacts, _ = store.closure(selected_artifacts, finding_ids=selected_findings)
@@ -909,7 +1053,8 @@ async def _finalize(config: Config, core: RunResult) -> RunResult:
                                   "effective_page_artifact_id": target_leaf_by_page[placement.page_id].page_artifact_id,
                                   "effective_segment_artifact_ids": list(target_leaf_by_page[placement.page_id].segment_artifact_ids)}
                                  for placement in content.placements],
-                  "render_input_artifact_id": render_input.artifact_id, "reconciliation_artifact_id": reconciliation.value.artifact_id,
+                  "render_input_artifact_id": render_input.artifact_id, "reconciliation_artifact_id": (
+                      None if reconciliation.value is None else reconciliation.value.artifact_id),
                   "validation_artifact_id": validation.value.artifact_id,
                   "correction_execution_projection_plan_ids": list(execution_impact_ids),
                   "correction_execution_impact_records": execution_impact_records}
@@ -920,14 +1065,28 @@ async def _finalize(config: Config, core: RunResult) -> RunResult:
     # history from another run can therefore never leak into this bundle.
     closure_ids = set(closure_ids)
     candidate_edge_ids = tuple(sorted(
-        edge_id for path in graph.edges_dir.glob("*.json")
-        for edge_id in (path.stem,)
-        if (edge := graph.get(edge_id)).parent_artifact_id in closure_ids and edge.child_artifact_id in closure_ids
+        edge_id for edge_id in executor.graph_edge_ids
+        if (edge := graph.get(edge_id)).parent_artifact_id in closure_ids
+        and edge.child_artifact_id in closure_ids
     ))
 
     async def sealing_stage(_: StageInputs) -> StageOutputs:
-        revisions.seal_bundle(snapshot, provenance, Path(config.output_epub), render_input_artifact_id=render_input.artifact_id,
-                              edge_ids=candidate_edge_ids)
+        # Candidate publication must never activate the candidate. The compact
+        # adapter remains compatible with low-level callers that request
+        # activation, so force the orchestrator's candidate contract here.
+        seal_revision = getattr(revisions, "storage", None)
+        original_seal = getattr(seal_revision, "seal_revision", None)
+        if original_seal is not None:
+            def candidate_seal(revision_id: str, snapshot_bytes: bytes, members: Mapping[str, bytes], **kwargs: Any):
+                kwargs["activate"] = False
+                return original_seal(revision_id, snapshot_bytes, members, **kwargs)
+            seal_revision.seal_revision = candidate_seal
+        try:
+            revisions.seal_bundle(snapshot, provenance, Path(config.output_epub), render_input_artifact_id=render_input.artifact_id,
+                                  edge_ids=candidate_edge_ids)
+        finally:
+            if original_seal is not None:
+                seal_revision.seal_revision = original_seal
         candidate = store.put("CandidateRevision", snapshot.to_dict(), dependency_ids=selected_artifacts,
                               finding_ids=selected_findings, semantic_key=tagged_sha256("candidate-revision-v1", snapshot.to_json().encode("utf-8")))
         summary = _stage_summary(store, "candidate_seal", "completed", {"artifacts": len(selected_artifacts), "findings": len(selected_findings)})
@@ -935,8 +1094,13 @@ async def _finalize(config: Config, core: RunResult) -> RunResult:
                             (CacheEvent("candidate_seal", revision_id, "produced", candidate.artifact_id),), candidate)
 
     sealing = await executor.stage("candidate_seal", StageInputs("candidate_seal", selected, selected_artifacts, selected_findings), sealing_stage)
-    final_findings = selected_findings
+    candidate_closure = CandidateClosure(tuple(executor.stage_record_ids))
+    final_findings = tuple(sorted(set((*report_findings, *selected_findings, *sealing.finding_ids))))
     content_findings, uncertainty, review, failures = _report_groups(store, final_findings)
+    audit_ids, non_actionable_count, audit_status = _audit_for_candidate(
+        store=store, target_run=target_run, executor=executor,
+        candidate=candidate_closure, selected_closure=selected_closure,
+    )
     # Refresh leaves are immutable artifacts. Report only attempts in this
     # selected closure; unrelated historic attempts are not current-run state.
     refresh_attempt_ids = tuple(sorted(
@@ -947,6 +1111,7 @@ async def _finalize(config: Config, core: RunResult) -> RunResult:
     # fallbacks are usable output, but must report degraded completion rather
     # than appear equivalent to an all-translated run.
     completed_degraded = (rendering.value.status != "completed" or bool(core.errors)
+                          or audit_status == "degraded"
                           or (config.mode == "translated" and target_run.status == "degraded"))
     report = RunReport(run_id=executor.report.run_id, mode=config.mode, content_finding_ids=content_findings,
         uncertainty_finding_ids=uncertainty, review_finding_ids=review, recoverable_failure_finding_ids=failures,
@@ -956,36 +1121,63 @@ async def _finalize(config: Config, core: RunResult) -> RunResult:
         selected_base_revision_id=None if selected.base_revision_id == "unsealed" else selected.base_revision_id,
         candidate_revision_id=revision_id, active_revision_id=selected.active_revision_id,
         final_epub_status="completed_degraded" if completed_degraded else rendering.value.status,
-        stage_records=tuple(executor.records), total_stage_duration_ms=executor.report.total_stage_duration_ms)
-    report_path = _write_report(workspace, report)
-    store.put("RunReport", report.to_dict(), dependency_ids=(sealing.output_artifact_ids[0],), semantic_key=tagged_sha256("run-report-v1", report.to_json().encode("utf-8")))
-    return RunResult(core.errors, status="completed_degraded" if completed_degraded else "completed",
+        stage_records=tuple(executor.records), total_stage_duration_ms=executor.report.total_stage_duration_ms,
+        audit_finding_ids=audit_ids,
+        non_actionable_finding_count=non_actionable_count,
+        audit_status=("unknown_legacy" if getattr(core, "legacy_selected", False) else audit_status))
+    # Snapshot timing immediately before the durable report write. Completion
+    # is one-way and no pipeline/durable work follows it.
+    report = replace(report, timing_snapshot=timing_ledger.snapshot_before_report_persist())
+    report_payload = report.to_dict()
+    # Timing is execution metadata, never part of an artifact or semantic key.
+    report_payload["timing_snapshot"] = None
+    with timing_ledger.durable_persistence():
+        report_path = _write_report(workspace, report)
+        store.put("RunReport", report_payload, dependency_ids=(sealing.output_artifact_ids[0],),
+                  semantic_key=tagged_sha256("run-report-v1", canonical_json(report_payload).encode("utf-8")))
+    completion_timing = timing_ledger.complete_before_timing_serialization()
+    result = RunResult(core.errors, status="completed_degraded" if completed_degraded else "completed",
                      report=report, target_run=target_run, terminology_run=core.terminology_run, provenance=core.provenance,
                      placements=core.placements, cache_events=tuple(executor.cache_events), candidate_revision_id=revision_id,
                      report_path=str(report_path), refresh_attempt_ids=refresh_attempt_ids)
+    result.selected_closure = selected_closure
+    result.selected_inputs = selected
+    result.candidate_stage_record_ids = candidate_closure.stage_record_ids
+    result.candidate_graph_edge_ids = tuple(executor.graph_edge_ids)
+    result.completion_timing = completion_timing
+    return result
 
 
-async def run(config: Config, on_page_error: PageErrorCallback | None = None) -> RunResult:
+async def run(config: Config, on_page_error: PageErrorCallback | None = None,
+             *, timing_ledger: TimingLedger | None = None) -> RunResult:
     """Invocation boundary: file failures end promptly; quality failures render."""
+    ledger = timing_ledger or TimingLedger("orchestrator_run")
     try:
-        core = await _run_core(config, on_page_error=on_page_error)
+        core = await _run_core(config, on_page_error=on_page_error, timing_ledger=ledger)
         if core.status == "invocation_failed":
             failure = core.invocation_failure
             diagnostic = failure.to_dict() if failure is not None else _invocation_failure("input_access", config.input_dir, RuntimeError("unknown input failure"))
             if core.report is not None:
-                report = replace(core.report, invocation_failures=(diagnostic,), final_epub_status="invocation_failed")
-                report_path = _write_report(resolve_workspace(config).workspace, report)
+                report = replace(core.report, invocation_failures=(diagnostic,), final_epub_status="invocation_failed",
+                                 timing_snapshot=ledger.snapshot_before_report_persist())
+                with ledger.durable_persistence():
+                    report_path = _write_report(resolve_workspace(config).workspace, report)
+                completion_timing = ledger.complete_before_timing_serialization()
+                core.completion_timing = completion_timing
                 return replace(core, report=report, report_path=str(report_path))
             print(canonical_json(diagnostic), file=sys.stderr)
             return core
-        return await _finalize(config, core)
+        return await _finalize(config, core, timing_ledger=ledger)
     except EpubInvocationError as exc:
         try:
             workspace = resolve_workspace(config).workspace
-            selected, _ = _selected_inputs(config, RevisionStore(workspace))
+            selected = getattr(core, "selected_inputs", SelectedRunInputs(None, "unsealed", config.correction_set, ()))
             report = initialized_report(run_id=uuid.uuid4().hex, mode=config.mode, selected=selected)
-            report = replace(report, invocation_failures=(_invocation_failure("output_access", config.output_epub, exc),), final_epub_status="invocation_failed")
-            report_path = _write_report(workspace, report)
+            report = replace(report, invocation_failures=(_invocation_failure("output_access", config.output_epub, exc),), final_epub_status="invocation_failed",
+                             timing_snapshot=ledger.snapshot_before_report_persist())
+            with ledger.durable_persistence():
+                report_path = _write_report(workspace, report)
+            completion_timing = ledger.complete_before_timing_serialization()
             return RunResult([f"[btran] invocation failed [output_access] {config.output_epub}"], status="invocation_failed",
                              invocation_failure=_invocation_failure("output_access", config.output_epub, exc), report=report,
                              report_path=str(report_path))
@@ -995,9 +1187,10 @@ async def run(config: Config, on_page_error: PageErrorCallback | None = None) ->
                              invocation_failure=_invocation_failure("output_access", config.output_epub, exc))
 
 
-async def orchestrator_run(config: Config, on_page_error: PageErrorCallback | None = None) -> RunResult:
+async def orchestrator_run(config: Config, on_page_error: PageErrorCallback | None = None,
+                           *, timing_ledger: TimingLedger | None = None) -> RunResult:
     """Public full executor; finalization is deliberately never activation."""
-    return await run(config, on_page_error=on_page_error)
+    return await run(config, on_page_error=on_page_error, timing_ledger=timing_ledger)
 
 
 __all__ = ["RunResult", "OrchestratorCallable", "build_epub", "orchestrator_run", "run"]
