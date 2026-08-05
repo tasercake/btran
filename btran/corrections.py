@@ -1332,6 +1332,36 @@ def _graph_entries_and_descendants(
         direct_node = _entry(_DIRECT_STAGE, record.correction_id, artifact_id)
         values.append(direct_node)
         artifact_entries[artifact_id].append(direct_node)
+
+    # A verified occurrence subset is narrower than the concept projection
+    # closure.  Projection edges fan out to every occurrence of the concept;
+    # only the selected occurrence's segment and its immediate context
+    # consumers may be regenerated.  The graph's stable subject identifies
+    # those segment-scoped edges, so retain their child closures and discard
+    # unrelated same-concept descendants.
+    if record.kind == "terminology" and record.scope["selector"]["kind"] == "occurrence_ids":
+        selected_occurrences = set(record.scope["selector"]["ids"])
+        selected_segments = {
+            occurrence["segment_id"]
+            for artifact in selected.values()
+            if artifact.kind == "OccurrenceEvidenceShard"
+            for occurrence in artifact.payload.get("occurrences", ())
+            if isinstance(occurrence, Mapping)
+            and occurrence.get("occurrence_id") in selected_occurrences
+            and isinstance(occurrence.get("segment_id"), str)
+        }
+        scoped_roots = {
+            edge.child_artifact_id
+            for edge in edges
+            if edge.stable_subject_id in selected_segments
+        }
+        scoped_descendants = set(scoped_roots)
+        for artifact_id in tuple(sorted(scoped_roots)):
+            try:
+                scoped_descendants.update(graph.descendants(revision_id, artifact_id))
+            except ArtifactError as exc:
+                raise CorrectionError("selected base graph traversal failed") from exc
+        descendants = scoped_descendants
     for artifact_id in sorted(descendants):
         virtual = _entry(_REVERSE_STAGE, record.correction_id, artifact_id)
         values.append(virtual)
