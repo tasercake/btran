@@ -109,6 +109,55 @@ class SelectedClosureError(ManifestValidationError):
     """A selected revision is not a self-contained, readable closure."""
 
 
+def _expected_selected_closure_ids(
+    snapshot: RevisionSnapshot,
+    records: Mapping[str, ArtifactEnvelope],
+    findings: Mapping[str, Finding],
+) -> tuple[set[str], set[str]]:
+    """Follow selected records/findings to compute the exact archive closure."""
+    record_ids = set(snapshot.selected_artifact_ids)
+    finding_ids = set(snapshot.selected_finding_ids)
+    changed = True
+    while changed:
+        changed = False
+        for record_id in tuple(record_ids):
+            record = records.get(record_id)
+            if record is None:
+                continue
+            before = len(finding_ids)
+            finding_ids.update(record.finding_ids)
+            changed |= len(finding_ids) != before
+        for finding_id in tuple(finding_ids):
+            finding = findings.get(finding_id)
+            if finding is None:
+                continue
+            before = len(record_ids)
+            record_ids.update(finding.dependency_ids)
+            changed |= len(record_ids) != before
+        for record_id in tuple(record_ids):
+            record = records.get(record_id)
+            if record is None:
+                continue
+            before = len(record_ids)
+            record_ids.update(record.dependency_ids)
+            changed |= len(record_ids) != before
+    return record_ids, finding_ids
+
+
+def _assert_exact_selected_closure(
+    snapshot: RevisionSnapshot,
+    records: Mapping[str, ArtifactEnvelope],
+    findings: Mapping[str, Finding],
+    *,
+    error_type: type[Exception],
+) -> None:
+    expected_records, expected_findings = _expected_selected_closure_ids(snapshot, records, findings)
+    if set(records) != expected_records:
+        raise error_type("selected records are not the exact archive closure")
+    if set(findings) != expected_findings:
+        raise error_type("selected findings are not the exact archive closure")
+
+
 @dataclass(frozen=True)
 class SelectedClosure:
     """In-memory authority for one selected sealed revision.
@@ -146,23 +195,12 @@ class SelectedClosure:
                 raise TypeError(f"selected closure {name} must be a mapping")
             object.__setattr__(self, name, MappingProxyType(dict(value)))
         # The selected archive is the authority.  Do not silently broaden it
-        # from a mutable index or from historical records.
-        if set(self.records) != set(self.snapshot.selected_artifact_ids) | {
-            dependency_id
-            for record in self.records.values()
-            for dependency_id in record.dependency_ids
-        }:
-            raise ValueError("selected closure record map is not closed")
-        if set(self.findings) != set(self.snapshot.selected_finding_ids) | {
-            finding_id
-            for record in self.records.values()
-            for finding_id in record.finding_ids
-        } | {
-            finding_id
-            for finding in self.findings.values()
-            for finding_id in finding.dependency_ids
-        }:
-            raise ValueError("selected closure finding map is not closed")
+        # from a mutable index or from historical records.  Finding
+        # dependencies are part of the closure too, even when no selected
+        # record points at them directly.
+        _assert_exact_selected_closure(
+            self.snapshot, self.records, self.findings, error_type=ValueError,
+        )
 
     @classmethod
     def empty(cls) -> "SelectedClosure":
@@ -234,6 +272,11 @@ class SelectedClosure:
     @property
     def selected_effective_content(self) -> Any:
         return self._effective_content
+
+    @property
+    def ordered_effective_segments(self) -> tuple[Any, ...]:
+        """Return selected effective segments in declared page order."""
+        return tuple(segment for page in self._ordered_pages for segment in page.segments)
 
     @property
     def source_page_cache_leaves(self) -> tuple[ArtifactEnvelope, ...]:
@@ -669,12 +712,9 @@ def load_selected_closure(
 
     if snapshot.revision_id != revision_id:
         raise SelectedClosureError("selected revision ID does not match snapshot")
-    if set(records) != set(snapshot.selected_artifact_ids) | {
-        dependency_id for record in records.values() for dependency_id in record.dependency_ids
-    }:
-        raise SelectedClosureError("selected records are not the exact archive closure")
-    if not set(snapshot.selected_finding_ids).issubset(findings):
-        raise SelectedClosureError("selected findings are missing")
+    _assert_exact_selected_closure(
+        snapshot, records, findings, error_type=SelectedClosureError,
+    )
     if not set(snapshot.selected_cache_attestation_ids).issubset(attestations):
         raise SelectedClosureError("selected attestations are missing")
     for record in records.values():
@@ -742,6 +782,25 @@ def _read_discovery_history(workspace: Path) -> tuple[PageRecord, ...]:
     return records
 
 
+def _is_legacy_discovery_workspace(workspace: Path) -> bool:
+    """Return whether discovery must use the legacy read-only contract.
+
+    ``ArtifactStore`` cannot be constructed first: its v2 adapter creates the
+    SQLite state file.  An old discovery snapshot is itself legacy state, even
+    when the workspace predates the old artifact directories.  A v2 workspace
+    is unambiguously identified by its state database and remains writable.
+    """
+    if (workspace / "state-v2.sqlite3").exists():
+        return False
+    if any((workspace / name).exists() for name in (
+        DISCOVERY_FILENAME, MANIFEST_FILENAME, "artifacts", "findings", "index",
+        "attestations", "graph", "active-revision.json",
+    )):
+        return True
+    revisions = workspace / "revisions"
+    return revisions.is_dir() and any(path.is_dir() for path in revisions.iterdir())
+
+
 def _persist_discovery(
     workspace: Path,
     book: BookRecord,
@@ -749,9 +808,10 @@ def _persist_discovery(
     historical_pages: tuple[PageRecord, ...],
     findings: tuple[Finding, ...],
 ) -> None:
-    # A legacy workspace is read/verify-only.  In particular, do not let the
-    # discovery compatibility path create a v2 DB or call the legacy adapter's
-    # mutation guard while merely reading old state.
+    # A legacy workspace is read/verify-only.  Check this before constructing
+    # ArtifactStore: constructing the v2 adapter creates state-v2.sqlite3.
+    if _is_legacy_discovery_workspace(workspace):
+        return
     store = ArtifactStore(workspace)
     if isinstance(store, LegacyReadOnlyArtifactStore):
         return

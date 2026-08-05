@@ -11,6 +11,7 @@ import pytest
 from btran.artifacts import ArtifactStore, LegacyArtifactStore, LegacyRevisionStore, RevisionStore
 from btran.manifest import (
     DISCOVERY_FILENAME,
+    SelectedClosure,
     SelectedClosureError,
     discover_book,
     generate_manifest,
@@ -164,14 +165,34 @@ def test_selected_closure_loads_archive_once_and_preserves_declared_segment_orde
     snapshot = RevisionSnapshot(revision_id="revision-1", selected_artifact_ids=(page_record.artifact_id,))
     RevisionStore(tmp_path).seal_bundle(snapshot, {"run": "one"}, b"")
 
-    closure = load_selected_closure(RevisionStore(tmp_path), "revision-1")
+    revisions = RevisionStore(tmp_path)
+    verify_calls = 0
+    verify_revision = revisions.storage.verify_revision
+
+    def counted_verify(revision_id):
+        nonlocal verify_calls
+        verify_calls += 1
+        return verify_revision(revision_id)
+
+    revisions.storage.verify_revision = counted_verify
+    closure = load_selected_closure(revisions, "revision-1")
+    assert isinstance(closure, SelectedClosure)
     assert closure.revision_id == "revision-1"
     assert tuple(closure.records) == tuple(sorted(closure.records))
     assert closure.ordered_effective_pages[0].segments[0].effective_segment_id == "effective-segment-1"
+    assert closure.ordered_effective_segments[0].effective_segment_id == "effective-segment-1"
+    assert closure.selected_effective_content.pages == closure.ordered_effective_pages
     assert closure.provenance == {}
     assert closure.final_finding_ids == ()
     with pytest.raises(TypeError):
         closure.records["new"] = page_record
+    with pytest.raises(TypeError):
+        closure.provenance["new"] = True
+    with pytest.raises(AttributeError):
+        closure.revision_id = "changed"
+    # Loading validates the archive once; all later views use the in-memory
+    # SelectedClosure rather than reopening or rescanning the selected ZIP.
+    assert verify_calls == 1
 
 
 def test_selected_closure_rejects_duplicate_stable_identity(tmp_path):
@@ -267,6 +288,45 @@ def test_selected_closure_accessors_do_not_reparse_records(tmp_path, monkeypatch
     monkeypatch.setattr(EffectiveSegment, "from_dict", classmethod(fail))
     assert closure.ordered_effective_pages[0].page.page_id == "page-1"
     assert closure.selected_effective_content.ordered_page_ids == ("page-1",)
+
+
+def test_legacy_discovery_read_does_not_create_or_mutate_state(tmp_path):
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    page = input_dir / "page.png"
+    page.write_bytes(b"legacy discovery bytes")
+    discovered = discover_book(input_dir)
+    workspace = tmp_path / "legacy-workspace"
+    workspace.mkdir()
+    # This is the old loose discovery snapshot without a v2 marker.  It is
+    # readable migration input, not permission to publish a new snapshot.
+    (workspace / DISCOVERY_FILENAME).write_text(json.dumps({
+        "schema_version": "book-discovery-v1",
+        "book": discovered.book.to_dict(),
+        "known_pages": [item.page.to_dict() for item in discovered.pages],
+        "placements": [{
+            "page_id": item.page.page_id,
+            "raw_file_sha256": item.page.raw_file_sha256,
+            "relative_path": item.placement.relative_path,
+            "placement_id": item.placement.placement_id,
+            "reconciliation": item.reconciliation,
+        } for item in discovered.pages],
+        "finding_ids": [],
+    }))
+
+    def snapshot(root):
+        return {
+            path.relative_to(root).as_posix(): (path.read_bytes(), path.stat().st_mtime_ns)
+            for path in root.rglob("*") if path.is_file()
+        }
+
+    before_workspace = snapshot(workspace)
+    before_input = snapshot(input_dir)
+    result = discover_book(input_dir, workspace)
+    assert result.succeeded
+    assert snapshot(workspace) == before_workspace
+    assert snapshot(input_dir) == before_input
+    assert not (workspace / "state-v2.sqlite3").exists()
 
 
 def test_legacy_selected_closure_read_does_not_create_or_mutate_state(tmp_path, monkeypatch):
